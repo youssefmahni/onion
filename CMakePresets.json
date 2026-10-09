@@ -1,0 +1,104 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "linux-debug",
+      "displayName": "Linux Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/macos-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0"
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows MSVC",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/windows-msvc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug"
+    },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release"
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release"
+    },
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
