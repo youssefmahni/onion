@@ -85,4 +85,5 @@ jobs:
       - name: Test
         run: ctest --test-dir legacy/build --output-on-failure
       - name: Test controller
-        run: python3 -m unittest legacy/test_controller.py
+        working-directory: legacy
+        run: python3 -m unittest test_controller.py
