@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# onion-tui — open the terminal dashboard for a running Onion supervisor.
+#
+#   onion-tui                 # poll the local controller (port $ONION_PORT or 8080)
+#   onion-tui --port 8090     # controller on a custom port
+#   onion-tui --url http://10.8.0.72:8090/api/state
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+PY=python3
+if [ -x .venv/bin/python ]; then
+  PY=.venv/bin/python
+elif ! python3 -c "import textual" >/dev/null 2>&1; then
+  echo "textual is not installed. Run:"
+  echo "  python3 -m venv .venv && .venv/bin/pip install textual"
+  exit 1
+fi
+
+# default port from ONION_PORT unless --port/--url is given
+ARGS=("$@")
+if [ -n "${ONION_PORT:-}" ] && [[ " $* " != *" --port "* ]] && [[ " $* " != *" --url "* ]]; then
+  ARGS=(--port "$ONION_PORT" ${ARGS[@]+"${ARGS[@]}"})
+fi
+
+exec "$PY" tui.py ${ARGS[@]+"${ARGS[@]}"}

@@ -1,0 +1,12 @@
+build/
+backups/
+data/
+.onion_key
+*.onion_key*
+control/
+state.json
+funnel_run*.log
+Onion.json
+Onion_Review.html
+*.tar.gz
+__pycache__/

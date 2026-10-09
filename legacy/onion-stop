@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# onion-stop — stop the Onion supervisor and any funnel it spawned.
+# The run resumes from funnel_state.tsv the next time you onion-start.
+# Also clears paused/stopped flags so the next start isn't born "stopped".
+set -uo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+found=0
+for pat in 'controller\.py' 'build/data_depot funnel' 'data_depot funnel'; do
+  pids=$(pgrep -f "$pat" || true)
+  if [ -n "$pids" ]; then
+    echo "killing $pat: $pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    found=1
+  fi
+done
+sleep 1
+# force-kill anything that ignored SIGTERM
+for pat in 'controller\.py' 'build/data_depot funnel' 'data_depot funnel'; do
+  pids=$(pgrep -f "$pat" || true)
+  [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+done
+
+# clear control flags so the next onion-start starts fresh (not "stopped")
+for f in control/paused control/stopped control/start.txt; do
+  rm -f "$f"
+done
+
+if [ "$found" = "1" ]; then
+  echo "onion supervisor stopped (run resumes on next onion-start)"
+else
+  echo "nothing to stop"
+fi

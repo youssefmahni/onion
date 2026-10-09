@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# onion-start — launch the Onion supervisor (controller + funnel + dashboard).
+#
+#   onion-start P01-IN03-T30              # seed a NODE, 10 loops (default)
+#   onion-start P01-IN01-                 # a BRANCH (trailing dash)
+#   onion-start P01-IN01- --limit 50      # custom budget
+#   onion-start P01-IN03-T30 --port 8090  # custom dashboard port
+#   onion-start P01-IN01- --bind 0.0.0.0  # expose the dashboard on the LAN
+#
+# API key: uses $OPENROUTER_API_KEY (legacy: $DEEPSEEK_API_KEY), else a
+# .onion_key file next to this script.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+# one pipe fd per in-flight API call (popen); the default 1024 breaks >~1000 threads
+ulimit -n 65535 2>/dev/null || ulimit -n 16384 2>/dev/null || true
+
+usage() {
+  echo "usage: onion-start <node|branch> [options] [controller flags...]"
+  echo
+  echo "  target:  node   e.g. P01-IN03-T30   (start at this item, then descend)"
+  echo "           branch e.g. P01-IN01-      (trailing dash: all task details under it)"
+  echo
+  echo "  --limit N    loop budget                    (default 10)"
+  echo "  --threads N  pin worker count, 1-5000       (default: adaptive policy)"
+  echo "  --model M    model id (default: follows key — OpenRouter sk-or-* -> google/gemini-2.5-flash-lite, else deepseek-flash)"
+  echo "  --port N     dashboard port                 (default: \$ONION_PORT or 8080)"
+  echo
+  echo "  env: ONION_PORT  ONION_BIND  ONION_LIMIT  ONION_THREADS  ONION_MODEL"
+  echo "       API key from OPENROUTER_API_KEY (legacy: DEEPSEEK_API_KEY) or a"
+  echo "       .onion_key file next to the script"
+  echo "  --deep       depth-first run: descend each new chain (fast to L9), settle once"
+  echo "  extra controller flags pass through as --flag=value (e.g. --interval=1, --dry)"
+  echo
+  echo "  -h, --help   this text"
+}
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+TARGET=""
+LIMIT="${ONION_LIMIT:-10}"
+PORT="${ONION_PORT:-8080}"
+BIND="${ONION_BIND:-127.0.0.1}"
+THREADS="${ONION_THREADS:-}"
+MODEL="${ONION_MODEL:-}"
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit)   LIMIT="$2"; shift 2;;
+    --port)    PORT="$2"; shift 2;;
+    --bind)    BIND="$2"; shift 2;;
+    --threads) THREADS="$2"; shift 2;;
+    --model)   MODEL="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --*)       ARGS+=("$1"); shift;;
+    *)         TARGET="$1"; shift;;
+  esac
+done
+[ -n "$TARGET" ] || { echo "error: give a node or branch"; exit 2; }
+
+API_KEY="${OPENROUTER_API_KEY:-}"
+if [ -z "$API_KEY" ] && [ -f .onion_key ]; then
+  API_KEY="$(cat .onion_key)"
+fi
+# legacy env-name fallback (older deployments)
+if [ -z "$API_KEY" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+  API_KEY="$DEEPSEEK_API_KEY"
+fi
+if [ -z "$API_KEY" ]; then
+  echo "error: no API key — export OPENROUTER_API_KEY or create .onion_key"; exit 2
+fi
+export OPENROUTER_API_KEY="$API_KEY"
+# default model follows the key's provider (sk-or- = OpenRouter, else DeepSeek)
+if [ -z "$MODEL" ]; then
+  if [[ "$API_KEY" == sk-or-* ]]; then
+    MODEL="google/gemini-2.5-flash-lite"
+  else
+    MODEL="deepseek-flash"
+  fi
+  MODEL_ARGS=(--model "$MODEL")
+elif [ -n "$MODEL" ]; then
+  MODEL_ARGS=(--model "$MODEL")
+fi
+
+if pgrep -f 'controller\.py' >/dev/null 2>&1; then
+  echo "error: a controller is already running (use onion-stop first)"; exit 2
+fi
+
+case "$TARGET" in
+  *-) SEED_ARGS=(--branch "$TARGET");;
+  *)  SEED_ARGS=(--seed "$TARGET");;
+esac
+
+THREADS_ARGS=()
+if [ -n "$THREADS" ]; then
+  THREADS_ARGS=(--threads "$THREADS")
+fi
+
+# macOS has no setsid; nohup alone is enough there
+LAUNCH=(nohup)
+command -v setsid >/dev/null 2>&1 && LAUNCH=(nohup setsid)
+"${LAUNCH[@]}" python3 controller.py "${SEED_ARGS[@]}" \
+      --limit "$LIMIT" --port "$PORT" --bind "$BIND" ${THREADS_ARGS[@]+"${THREADS_ARGS[@]}"} ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} ${ARGS[@]+"${ARGS[@]}"} \
+      > controller.log 2>&1 < /dev/null &
+sleep 3
+if pgrep -f 'controller\.py' >/dev/null 2>&1; then
+  echo "onion supervisor started"
+  echo "  target : $TARGET ($LIMIT loops${THREADS:+, $THREADS threads pinned})"
+  echo "  model  : ${MODEL:-(follows key)}"
+  echo "  dashboard: http://127.0.0.1:${PORT}/dashboard.html"
+  echo "  log    : $(pwd)/controller.log"
+else
+  echo "failed to start — last log lines:"; tail -5 controller.log; exit 1
+fi

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# onion-gl — native OpenGL view of a running Onion supervisor (local desktop).
+#
+#   onion-gl                              # local controller (ONION_PORT or 8080)
+#   onion-gl --url http://10.8.0.72:8090/api/state
+#   onion-gl --port 8090
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+BIN=build/onion_gl
+if [ ! -x "$BIN" ]; then
+  echo "onion_gl is not built — run:  cmake --build build -j"
+  exit 1
+fi
+
+ARGS=("$@")
+if [ -n "${ONION_PORT:-}" ] && [[ " $* " != *" --port "* ]] && [[ " $* " != *" --url "* ]]; then
+  ARGS=(--port "$ONION_PORT" ${ARGS[@]+"${ARGS[@]}"})
+fi
+
+exec "$BIN" ${ARGS[@]+"${ARGS[@]}"}

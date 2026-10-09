@@ -1,0 +1,12 @@
+[
+ {"td": "Map current processes", "title": "Order Processing"},
+ {"td": "Map current processes", "title": "E-Commerce"},
+ {"td": "Map current processes", "title": "Return Merchandise Authorization"},
+ {"td": "Inventory current systems", "title": "Store Inventory Tracker",
+  "subs": ["Stock Levels", "Cycle Counts", "Adjustments", "Threshold Alerts"]},
+ {"td": "Assess risk likelihood", "title": "Probability Rating"},
+ {"td": "Classify system type", "title": "Follow Up"},
+ {"td": "Map current processes", "title": "Approved with Conditions"},
+ {"td": "Document problem frame", "title": "Fishbone Results"},
+ {"td": "Nonexistent TD", "title": "Whatever"}
+]

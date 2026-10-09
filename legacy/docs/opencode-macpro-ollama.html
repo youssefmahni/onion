@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac Pro Ollama + OpenCode</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 0; background: #0f1115; color: #d7dce2;
+         font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 48px 24px 80px; }
+  h1 { font-size: 1.9em; border-bottom: 1px solid #2a2f3a; padding-bottom: .3em; }
+  h2 { font-size: 1.35em; margin-top: 1.8em; }
+  h3 { font-size: 1.1em; }
+  a { color: #6cb2ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { background: #1a1e27; border: 1px solid #2a2f3a; border-radius: 4px;
+         padding: 1px 6px; font-size: .9em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: #1a1e27; border: 1px solid #2a2f3a; border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #2a2f3a; padding: 8px 12px; text-align: left; }
+  th { background: #1a1e27; }
+  blockquote { border-left: 3px solid #3b4455; margin: 1em 0; padding: .2em 1em; color: #9aa4b2; }
+  li { margin: .3em 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>Mac Pro Ollama Server + OpenCode</h1>
+<p>How to connect OpenCode to the local LLM server running on the Mac Pro
+(<code>Mac-Pro-de-mac</code>, macOS 12.7.6, headless, CPU-only).</p>
+<h2>1. The server</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VPN</td>
+<td><code>http://10.8.0.91:11434</code></td>
+</tr>
+<tr>
+<td>LAN</td>
+<td><code>http://192.168.1.57:11434</code></td>
+</tr>
+<tr>
+<td>OpenAI API</td>
+<td><code>http://10.8.0.91:11434/v1</code> (or <code>...:57/v1</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>Models available (all Q4, CPU inference):</p>
+<table>
+<thead>
+<tr>
+<th>Model ID</th>
+<th>Use</th>
+<th>Speed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>qwen2.5-coder-agent:latest</code></td>
+<td>coding / tools</td>
+<td>~4.7 tok/s</td>
+</tr>
+<tr>
+<td><code>llama3.1-agent:latest</code></td>
+<td>general</td>
+<td>~4.5 tok/s</td>
+</tr>
+<tr>
+<td><code>llama3.2-agent:latest</code></td>
+<td>fast, weak</td>
+<td>~10.3 tok/s</td>
+</tr>
+<tr>
+<td><code>nomic-embed-text:latest</code></td>
+<td>embeddings</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>-agent</code> tags are the base models wrapped with <code>num_ctx 16384</code> so
+OpenCode's tool schemas and system prompts fit in context.</p>
+<h2>2. Add the provider to OpenCode</h2>
+<p>Global config: <code>~/.config/opencode/opencode.json</code>
+(or project-level: <code>opencode.json</code> in your project root)</p>
+<pre><code class="language-json">{
+  &quot;$schema&quot;: &quot;https://opencode.ai/config.json&quot;,
+  &quot;provider&quot;: {
+    &quot;ollama&quot;: {
+      &quot;npm&quot;: &quot;@ai-sdk/openai-compatible&quot;,
+      &quot;name&quot;: &quot;Mac Pro (Ollama)&quot;,
+      &quot;options&quot;: {
+        &quot;baseURL&quot;: &quot;http://10.8.0.91:11434/v1&quot;,
+        &quot;apiKey&quot;: &quot;ollama&quot;,
+        &quot;timeout&quot;: false,
+        &quot;chunkTimeout&quot;: false
+      },
+      &quot;models&quot;: {
+        &quot;qwen2.5-coder-agent:latest&quot;: { &quot;name&quot;: &quot;Qwen2.5-Coder 7B (Mac Pro)&quot; },
+        &quot;llama3.1-agent:latest&quot;: { &quot;name&quot;: &quot;Llama 3.1 8B (Mac Pro)&quot; },
+        &quot;llama3.2-agent:latest&quot;: { &quot;name&quot;: &quot;Llama 3.2 3B (Mac Pro)&quot; }
+      }
+    }
+  }
+}
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li><code>baseURL</code> uses the VPN IP — works from any VPN client. On the LAN only,
+  use <code>http://192.168.1.57:11434/v1</code>.</li>
+<li><code>apiKey</code> is required by the SDK but ignored by Ollama.</li>
+<li><code>timeout</code>/<code>chunkTimeout</code> are disabled on purpose: prompt evaluation on
+  this CPU takes minutes for large prompts, and the default timeouts
+  (~5 min) would abort every request before the first token.</li>
+</ul>
+<h2>3. Use it</h2>
+<ol>
+<li>Restart OpenCode (config is not hot-reloaded).</li>
+<li>Run <code>/models</code> and pick one of the "Mac Pro" models.</li>
+<li>The provider ID is <code>ollama</code>, so full references look like
+   <code>ollama/qwen2.5-coder-agent:latest</code>.</li>
+</ol>
+<h2>4. Optional: dedicated agent on the local model</h2>
+<p><code>.opencode/agent/local-mac.md</code>:</p>
+<pre><code class="language-markdown">---
+description: Fast local agent running on the Mac Pro Ollama server
+mode: primary
+model: ollama/qwen2.5-coder-agent:latest
+---
+
+You are a concise coding assistant running on a local CPU server.
+Prefer short replies and small diffs.
+</code></pre>
+<p>Then select it from the agent list or set
+<code>"default_agent": "local-mac"</code> in <code>opencode.json</code>.</p>
+<h2>5. Creating more <code>-agent</code> tags (bigger context)</h2>
+<p>On the Mac (<code>ssh mac@10.8.0.91</code>), to wrap any pulled model with a larger
+context window:</p>
+<pre><code class="language-bash">printf 'FROM llama3.1:8b\nPARAMETER num_ctx 16384\n' &gt; /tmp/mf
+/usr/local/bin/ollama create llama3.1-agent -f /tmp/mf
+</code></pre>
+<p>No re-download happens — the new tag reuses the existing blobs.</p>
+<h2>6. Expectations</h2>
+<ul>
+<li><strong>It works, but it's slow for agentic use.</strong> The bottleneck is prompt
+  processing (~6.5 tok/s on the 8B): OpenCode sends a large system prompt
+  plus tool schemas on every turn, so expect minutes before the first
+  token, then ~4.5 tok/s generation.</li>
+<li>7–8B tool calling is mediocre — <code>qwen2.5-coder-agent</code> is the most
+  reliable of the three.</li>
+<li>The server keeps one model resident (<code>OLLAMA_KEEP_ALIVE=-1</code>,
+  <code>OLLAMA_MAX_LOADED_MODELS=1</code>); switching models costs a few seconds of
+  load time.</li>
+<li>Ollama is pinned to v0.4.7 (last release supporting macOS 12). Newer
+  models (Qwen3, etc.) need manual GGUF import via <code>ollama create</code> with a
+  Modelfile pointing at a downloaded GGUF.</li>
+</ul>
+</main>
+</body>
+</html>
