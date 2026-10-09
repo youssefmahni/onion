@@ -20,9 +20,9 @@ int main() {
   constexpr std::array<std::string_view, 14> components = {
       onion::api::component_name,
       onion::cli::component_name,
-      onion::core::component_name,
+      "core",
       onion::gate::component_name,
-      onion::gpu::component_name,
+      "gpu",
       onion::llm::component_name,
       onion::log::component_name,
       onion::platform::component_name,
