@@ -62,4 +62,6 @@ target_link_libraries(onion_smoke PRIVATE onion::cli)
 
 if(BUILD_TESTING)
   add_test(NAME onion.smoke COMMAND onion_smoke)
+  set_tests_properties(onion.smoke PROPERTIES
+    ENVIRONMENT "POCL_CACHE_DIR=${CMAKE_BINARY_DIR}/pocl-cache")
 endif()

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  new-tree:
+    name: New tree (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            preset: linux-debug
+          - name: macOS arm64
+            os: macos-latest
+            preset: macos-release
+          - name: Windows
+            os: windows-latest
+            preset: windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  macos-x86_64-compat:
+    name: macOS x86_64 / 12.0 compatibility build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure for Intel macOS 12
+        run: >-
+          cmake --preset macos-release
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+      - name: Build
+        run: cmake --build --preset macos-release
+
+  legacy:
+    name: Legacy (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            cmake_args: ''
+            install_pocl: true
+          - name: macOS
+            os: macos-latest
+            cmake_args: -DDEPOT_OPENCL=OFF
+            install_pocl: false
+    env:
+      POCL_CACHE_DIR: ${{ github.workspace }}/legacy/build/pocl-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore CMake download cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache
+            legacy/build/_deps
+          key: legacy-cmake-${{ runner.os }}-${{ hashFiles('legacy/CMakeLists.txt') }}
+      - name: Install Linux OpenCL runtime
+        if: matrix.install_pocl
+        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev
+      - name: Configure
+        run: cmake -S legacy -B legacy/build -G Ninja ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build legacy/build
+      - name: Test
+        run: ctest --test-dir legacy/build --output-on-failure
+      - name: Test controller
+        run: python3 -m unittest legacy/test_controller.py
