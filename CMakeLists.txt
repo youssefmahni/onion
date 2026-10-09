@@ -56,7 +56,10 @@ else()
   message(STATUS "onion_gpu: skipped (OpenCL loader or headers not found)")
 endif()
 
-onion_add_module(platform)
+onion_add_compiled_module(platform src/platform/platform.cpp)
+if(WIN32)
+  target_link_libraries(platform PRIVATE Crypt32 Iphlpapi)
+endif()
 
 # Data layer
 onion_add_module(log)
@@ -108,6 +111,10 @@ if(BUILD_TESTING)
   target_link_libraries(onion_core_test PRIVATE onion::core GTest::gtest_main)
   include(GoogleTest)
   gtest_discover_tests(onion_core_test)
+
+  add_executable(onion_platform_test tests/unit/platform_test.cpp)
+  target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
+  gtest_discover_tests(onion_platform_test)
   if(ONION_GPU_AVAILABLE)
     add_executable(onion_gpu_test tests/unit/gpu_test.cpp)
     target_link_libraries(onion_gpu_test PRIVATE onion::gpu GTest::gtest_main)
