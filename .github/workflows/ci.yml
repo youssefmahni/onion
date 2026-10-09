@@ -48,6 +48,10 @@ jobs:
           -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
       - name: Build
         run: cmake --build --preset macos-release
+      - name: Verify Intel macOS 12 target
+        run: |
+          test "$(lipo -archs build/macos-release/onion_smoke)" = "x86_64"
+          otool -l build/macos-release/onion_smoke | grep -A4 LC_BUILD_VERSION | grep -E '^[[:space:]]+minos 12\.0$'
 
   legacy:
     name: Legacy (${{ matrix.name }})
