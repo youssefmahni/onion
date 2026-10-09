@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cerrno>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -380,6 +382,8 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
         "Onion - level_08.csv","Onion - level_09.csv"};
 
     std::unordered_map<string, FunnelNode> by_path;
+    struct DupPath { string path, layer, dropped, kept; };
+    vector<DupPath> dup_paths;
     for (size_t li = 0; li < files.size(); ++li) {
         std::ifstream f(join_path(root, files[li]));
         string line;
@@ -392,7 +396,31 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
             n.layer = "L" + std::to_string(li);
             if (li == 0) { n.path = depot::trim(c[0]); n.title = depot::trim(c[1]); }
             else { if (c.size() < 3) continue; n.path = depot::trim(c[1]); n.title = depot::trim(c[2]); }
-            if (!n.path.empty()) by_path[n.path] = n;
+            if (n.path.empty()) continue;
+            // P3: a repeated path used to overwrite silently (last row wins).
+            // It still does, so today's corpus keeps running, but every
+            // duplicate is now reported and DEPOT_STRICT_PATHS=1 refuses to run.
+            auto ex = by_path.find(n.path);
+            if (ex != by_path.end())
+                dup_paths.push_back({n.path, n.layer, ex->second.title, n.title});
+            by_path[n.path] = n;
+        }
+    }
+    if (!dup_paths.empty()) {
+        std::cout << "DUP_PATHS\t" << dup_paths.size()
+                  << "\tlast row wins; details in duplicate_paths.tsv" << std::endl;
+        if (!dry) {
+            std::ofstream df(join_path(root, "duplicate_paths.tsv"));
+            df << "path\tlayer\tdropped_title\tkept_title\n";
+            for (const auto& d : dup_paths)
+                df << d.path << "\t" << d.layer << "\t" << depot::sanitize_tsv(d.dropped)
+                   << "\t" << depot::sanitize_tsv(d.kept) << "\n";
+        }
+        const char* strict = std::getenv("DEPOT_STRICT_PATHS");
+        if (strict && *strict && string(strict) != "0") {
+            std::cout << "refusing to run: duplicate paths found (DEPOT_STRICT_PATHS is set)"
+                      << std::endl;
+            return 2;
         }
     }
     std::unordered_map<string, vector<string>> children_of;
@@ -446,36 +474,64 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
 
     std::mutex m;
     std::unordered_map<string, string> retry_issues;
+    struct Attempt {
+        double score;
+        vector<depot::FunnelItem> items;
+        depot::FunnelCritique crit;
+    };
+    std::unordered_map<string, Attempt> best_attempt;  // P7: first attempt of a retried node
     std::unordered_map<string, int> retry_count;
     std::atomic<int> funneled{0}, kept_total{0}, atomic_total{0}, call_total{0}, retried{0}, errors{0};
     int budget = limit > 0 ? limit : std::numeric_limits<int>::max();
     const double RETRY_SCORE = 0.7;
 
-    auto body_failed = [](const string& body) {
-        // A valid chat-completions body always carries "choices"; anything
-        // without it (proxy 502/503 HTML pages, auth errors, malformed JSON)
-        // must not masquerade as success.
-        return body.empty() || body.find("\"choices\"") == string::npos;
+    // Every reply is classified: 0 = usable, 1 = transport failure (empty,
+    // proxy error page, auth error: no "choices"), 2 = cut off at max_tokens
+    // (P4: finish_reason "length" means the JSON is truncated, never usable).
+    // P6: consecutive transport failures across all workers open a circuit
+    // breaker that stops the run instead of burning through the queue.
+    std::atomic<int> consecutive_fail{0};
+    std::atomic<bool> breaker_open{false};
+    int breaker_limit = 20;
+    if (const char* e = std::getenv("DEPOT_BREAKER_FAILS")) {
+        int v = std::atoi(e);
+        if (v >= 1) breaker_limit = v;
+    }
+    auto check_body = [&](const string& body) -> int {
+        if (body.empty() || body.find("\"choices\"") == string::npos) {
+            int n = ++consecutive_fail;
+            if (n >= breaker_limit && !breaker_open.exchange(true)) {
+                std::lock_guard<std::mutex> lk(m);
+                std::cout << "BREAKER_OPEN\tconsecutive_failures=" << n
+                          << "\tstopping; nodes stay unsettled, fix the provider or key and restart"
+                          << std::endl;
+            }
+            return 1;
+        }
+        consecutive_fail.store(0);
+        return depot::reply_truncated(body) ? 2 : 0;
     };
     auto agent_log = [&](const string& path, const string& stage, const string& ev) {
         std::lock_guard<std::mutex> lk(m);
         std::cout << "AGENT\t" << path << "\t" << stage << "\t" << ev << std::endl;
     };
-    auto on_failure = [&](const string& path, int kept, int atom, const string& stage) {
+    // A failed node is retried once in this run; after that it is left
+    // UNSETTLED (no funnel_state row), so the next run picks it up again.
+    // Settling it at score 0.0, as before, poisoned the ledger on outages.
+    auto on_failure = [&](const string& path, const string& stage, int code) {
         std::lock_guard<std::mutex> lk(m);
         errors++;
         std::cout << "AGENT\t" << path << "\t" << stage << "\tFAIL" << std::endl;
-        std::cout << "NODE_FAIL\t" << path << "\tempty-or-error API body" << std::endl;
+        std::cout << "NODE_FAIL\t" << path << "\t"
+                  << (code == 2 ? "reply cut off at max_tokens" : "empty-or-error API body")
+                  << std::endl;
+        if (breaker_open.load()) return;  // provider down: leave it for the next run
         if (retry_count[path] < 1) {
             retry_count[path]++;
             queue.push_back(path);
         } else {
-            int retries = 1;
-            auto ri = state_retries.find(path);
-            if (ri != state_retries.end()) retries = ri->second + retry_count[path];
-            append_funnel_state(join_path(root, "funnel_state.tsv"), path, kept, atom,
-                                retries, 0.0, dry);
-            done.insert(path);
+            std::cout << "NODE_GIVEUP\t" << path << "\tleft unsettled; the next run retries it"
+                      << std::endl;
         }
     };
 
@@ -531,7 +587,7 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
         agent_log(path, "PLANNER", "START");
         call_total++;
         string p_body = ask(funnel_payload(model, p_user, 6000, key));
-        if (body_failed(p_body)) { on_failure(path, 0, 0, "PLANNER"); return; }
+        if (int f = check_body(p_body)) { on_failure(path, "PLANNER", f); return; }
         auto aspects = depot::parse_funnel_r1(p_body);
         if (aspects.size() > 8) aspects.resize(8);
         if (aspects.empty()) aspects.push_back("General coverage");
@@ -553,7 +609,9 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
                         "no duplicates, no questions, no emoji. "
                         "Return JSON {\"items\": [ ... up to 100 ... ]}.");
                     call_total++;
-                    aspect_cands[ai] = depot::parse_funnel_r1(ask(funnel_payload(model, w_user, 6000, key)));
+                    string w_body = ask(funnel_payload(model, w_user, 6000, key));
+                    if (check_body(w_body) == 0)  // a failed or cut-off list adds nothing
+                        aspect_cands[ai] = depot::parse_funnel_r1(w_body);
                     agent_log(path, "WORKER", "DONE " + depot::sanitize_tsv(aspects[ai]) +
                               " items=" + std::to_string(aspect_cands[ai].size()));
                 }));
@@ -583,7 +641,7 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
             agent_log(path, "TRIMMER", "START " + std::to_string(keep));
             call_total++;
             string t_body = ask(funnel_payload(model, u, 6000, key));
-            if (body_failed(t_body)) {
+            if (check_body(t_body) != 0) {
                 trim_failures++;
                 agent_log(path, "TRIMMER", "FAIL " + std::to_string(keep));
                 return;  // keep the old list; both rounds failing = node failure below
@@ -638,7 +696,7 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
 
         trim_round(cands, 400);
         trim_round(cands, 300);
-        if (trim_failures >= 2) { on_failure(path, 0, 0, "TRIMMER"); return; }
+        if (trim_failures >= 2) { on_failure(path, "TRIMMER", 1); return; }
 
         string joined;
         for (size_t i = 0; i < cands.size(); ++i) joined += (i ? "|" : "") + cands[i];
@@ -656,7 +714,7 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
         agent_log(path, "CRITIQUE", "START");
         call_total++;
         string c_body = ask(funnel_payload(model, c_user, 6000, key));
-        if (body_failed(c_body)) { on_failure(path, 0, 0, "CRITIQUE"); return; }
+        if (int f = check_body(c_body)) { on_failure(path, "CRITIQUE", f); return; }
         auto crit = depot::parse_funnel_c(c_body);
         agent_log(path, "CRITIQUE", "DONE score=" + std::to_string(crit.score) +
                   " bodylen=" + std::to_string(c_body.size()));
@@ -677,22 +735,52 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
         agent_log(path, "SYNTHESIZER", "START");
         call_total++;
         string s_body = ask(funnel_payload(model, s_user, 6000, key));
-        if (body_failed(s_body)) { on_failure(path, 0, 0, "SYNTHESIZER"); return; }
+        if (int f = check_body(s_body)) { on_failure(path, "SYNTHESIZER", f); return; }
         auto items = depot::parse_funnel_r4(s_body);
         if (items.size() > 100) items.resize(100);
         agent_log(path, "SYNTHESIZER", "DONE items=" + std::to_string(items.size()) +
                   " bodylen=" + std::to_string(s_body.size()));
 
+        // P7: decide BEFORE committing. A low-score pass that will be retried
+        // writes nothing (no children, no critique row, no queued children).
+        // When the node is finally settled, the better of its attempts is the
+        // one committed. Before this fix the failed attempt's children were
+        // written and expanded, and the retry added more on top.
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (crit.score < RETRY_SCORE && retry_count[path] < 1 && !deep) {
+                best_attempt[path] = Attempt{crit.score, items, crit};
+                retry_issues[path] = crit.issues;
+                retry_count[path]++;
+                retried++;
+                queue.push_back(path);
+                std::cout << "NODE_DONE\t" << path << "\t0\t0\t" << crit.score
+                          << "\tRETRY-QUEUED\tcalls=" << call_total.load() << std::endl;
+                return;
+            }
+            auto bi = best_attempt.find(path);
+            if (bi != best_attempt.end()) {
+                if (bi->second.score > crit.score) {
+                    items = bi->second.items;
+                    crit = bi->second.crit;
+                }
+                best_attempt.erase(bi);
+            }
+        }
+
         std::unordered_set<string> seen;
         seen.insert(depot::canonical(node.title));  // never a child of itself
-        for (auto& t : existing) seen.insert(depot::canonical(t));
+        {
+            // re-read the children now: another worker may have added some
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& c : children_of[path]) seen.insert(depot::canonical(by_path[c].title));
+        }
         vector<depot::FunnelItem> keep;
         for (auto& itm : items) {
             if (!seen.insert(depot::canonical(itm.title)).second) continue;
             keep.push_back(itm);
         }
 
-        bool low = crit.score < RETRY_SCORE;
         int kept = (int)keep.size(), atom = 0;
         vector<std::pair<string, bool>> added;
         {
@@ -725,21 +813,20 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
                         if (pr.second) at << pr.first << "\t1\n";
                 }
             }
-            if (!low) {
-                int retries = 0;
-                auto ri = state_retries.find(path);
-                if (ri != state_retries.end()) retries = ri->second;
-                append_funnel_state(join_path(root, "funnel_state.tsv"), path, kept, atom,
-                                    retries, crit.score, dry);
-                done.insert(path);
-            }
+            // settle exactly once, with the retries this node has used so far
+            int retries = retry_count[path];
+            auto ri = state_retries.find(path);
+            if (ri != state_retries.end()) retries += ri->second;
+            append_funnel_state(join_path(root, "funnel_state.tsv"), path, kept, atom,
+                                retries, crit.score, dry);
+            done.insert(path);
         }
         kept_total += kept;
         atomic_total += atom;
         {
             std::lock_guard<std::mutex> lk(m);
             std::cout << "NODE_DONE\t" << path << "\t" << kept << "\t" << atom
-                      << "\t" << crit.score << (low ? "\tRETRY-QUEUED" : "\tFINAL")
+                      << "\t" << crit.score << "\tFINAL"
                       << "\tcalls=" << call_total.load() << std::endl;
         }
         for (auto& pr : added) {
@@ -750,25 +837,6 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
                     queue.push_front(cpath);   // depth-first: descend the new chain
                 else
                     queue.push_back(cpath);
-            }
-        }
-        if (low) {
-            // next round can fix what this one missed (max 1 retry per node);
-            // --deep skips retries entirely so every loop settles a new node
-            std::lock_guard<std::mutex> lk(m);
-            if (retry_count[path] < 1 && !deep) {
-                retry_issues[path] = crit.issues;
-                retry_count[path]++;
-                retried++;
-                queue.push_back(path);
-            } else {
-                // budget spent on this node; settle it so later rounds don't re-run it
-                int retries = 1;
-                auto ri = state_retries.find(path);
-                if (ri != state_retries.end()) retries = ri->second + retry_count[path];
-                append_funnel_state(join_path(root, "funnel_state.tsv"), path, kept, atom,
-                                    retries, crit.score, dry);
-                done.insert(path);
             }
         }
     };
@@ -813,9 +881,11 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
                 };
                 cv.wait(lk, [&] {
                     return !queue.empty() || shutdown.load() || w->retire.load() ||
-                           budget_full();
+                           budget_full() || breaker_open.load();
                 });
-                if (shutdown.load() || w->retire.load() || budget_full()) return;
+                if (shutdown.load() || w->retire.load() || budget_full() ||
+                    breaker_open.load())
+                    return;
                 path = queue.front();
                 queue.pop_front();
                 in_flight++;
@@ -840,17 +910,14 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
                         errors++;
                         std::cout << "NODE_FAIL\t" << path << "\texception: "
                                   << e.what() << std::endl;
+                        // same rule as API failures: retry once, then leave the
+                        // node unsettled for the next run (never settle at 0.0)
                         if (retry_count[path] < 1) {
                             retry_count[path]++;
                             queue.push_back(path);
                         } else {
-                            int retries = 1;
-                            auto ri = state_retries.find(path);
-                            if (ri != state_retries.end())
-                                retries = ri->second + retry_count[path];
-                            append_funnel_state(join_path(root, "funnel_state.tsv"),
-                                                path, 0, 0, retries, 0.0, dry);
-                            done.insert(path);
+                            std::cout << "NODE_GIVEUP\t" << path
+                                      << "\tleft unsettled; the next run retries it" << std::endl;
                         }
                     }
                 }
@@ -909,6 +976,13 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
     };
 
     while (!shutdown.load()) {
+        // P6: an open breaker ends the run; in-flight nodes finish or fail
+        // without being settled, and the exit code tells the supervisor why
+        if (breaker_open.load()) {
+            shutdown.store(true);
+            cv.notify_all();
+            break;
+        }
         // round seeding: when drained and rounds remain and budget not reached
         if (drained() && round_idx < rounds && funneled.load() < budget) {
             {
@@ -970,19 +1044,30 @@ int depot::run_funnel(const string& branch, int limit, int concurrency, bool dry
     std::cout << "funneled=" << funneled.load() << " kept=" << kept_total.load()
               << " atomic=" << atomic_total.load() << " calls=" << call_total.load()
               << " retried=" << retried.load() << " errors=" << errors.load() << "\n";
-    return 0;
+    // 3 = circuit breaker opened: the provider or key failed repeatedly. The
+    // supervisor pauses instead of restarting into the same failure.
+    return breaker_open.load() ? 3 : 0;
 }
 
 // ---------------- llm command ----------------
 static string curl_post(const string& payload, const string& key) {
     // mkstemp: unique names + 0600 from creation — no predictable path, no
     // symlink planting, no chmod-after-write window for the API key.
+    // P1: mkstemp() requires the template to END in XXXXXX and rejects a
+    // suffix with EINVAL, which made every real call return "". mkstemps()
+    // takes the suffix length explicitly (".json" = 5, ".hdr" = 4).
     char tmp[] = "/tmp/depot_llm_XXXXXX.json";
     char hdr[] = "/tmp/depot_llm_XXXXXX.hdr";
-    int tfd = mkstemp(tmp);
-    if (tfd < 0) return "";
-    int hfd = mkstemp(hdr);
-    if (hfd < 0) { close(tfd); unlink(tmp); return ""; }
+    int tfd = mkstemps(tmp, 5);
+    if (tfd < 0) {
+        std::cerr << "curl_post: cannot create temp file: " << std::strerror(errno) << std::endl;
+        return "";
+    }
+    int hfd = mkstemps(hdr, 4);
+    if (hfd < 0) {
+        std::cerr << "curl_post: cannot create temp file: " << std::strerror(errno) << std::endl;
+        close(tfd); unlink(tmp); return "";
+    }
     {
         std::string hp = "Content-Type: application/json\nAuthorization: Bearer " + key + "\n";
         const char* p = payload.data(); size_t n = payload.size();
@@ -992,7 +1077,14 @@ static string curl_post(const string& payload, const string& key) {
     }
     close(tfd);
     close(hfd);
-    string cmd = "curl -4 -s --max-time 120 " + api_url_for(key) + " -H @" + hdr + " --data-binary @" + tmp;
+    // P5: the timeout is configurable (DEPOT_LLM_TIMEOUT_S, default 120 s).
+    int timeout_s = 120;
+    if (const char* e = std::getenv("DEPOT_LLM_TIMEOUT_S")) {
+        int v = std::atoi(e);
+        if (v >= 5 && v <= 3600) timeout_s = v;
+    }
+    string cmd = "curl -4 -s --max-time " + std::to_string(timeout_s) + " " + api_url_for(key) +
+                 " -H @" + hdr + " --data-binary @" + tmp;
     FILE* p = popen(cmd.c_str(), "r");
     string out;
     int rc = -1;

@@ -925,7 +925,10 @@ TEST_F(FunnelFixture, LowScoreNodeIsRetriedAndFixed) {
     EXPECT_NE(out.find("retried=1"), std::string::npos);   // the miss was re-funneled
     EXPECT_NE(out.find("funneled=2"), std::string::npos);  // TD1 twice, no children (all atomic)
     auto l5 = load_file("Onion - level_05.csv");
-    ASSERT_EQ(l5.size(), 3u);  // Existing + Alpha (1st pass) + Beta (fixed retry)
+    // P7: the failed first attempt commits nothing, so only Existing + Beta.
+    // (This test used to expect Alpha too, which encoded the bug.)
+    ASSERT_EQ(l5.size(), 2u);
+    for (const auto& r : l5) EXPECT_NE(r.title, "Alpha");
     // only the final (score>=0.7) pass is recorded in state
     std::ifstream st(dir_ / "funnel_state.tsv");
     std::string line;
@@ -1022,3 +1025,148 @@ TEST_F(LlmTraversalFixture, WritesHeaderOnlyReport) {
 }
 
 }  // namespace
+
+// ---------------- M0 stabilization regressions ----------------
+static std::string ok_body(const std::string& inner_escaped) {
+    return "{\"choices\":[{\"message\":{\"content\":\"" + inner_escaped +
+           "\"},\"finish_reason\":\"stop\"}]}";
+}
+
+TEST(ReplyTruncated, DetectsLengthFinishReason) {  // P4
+    EXPECT_TRUE(depot::reply_truncated(
+        R"({"choices":[{"message":{"content":"{\"items\": [\"A\""},"finish_reason":"length"}]})"));
+    EXPECT_TRUE(depot::reply_truncated(
+        "{\"choices\":[{\"finish_reason\" : \"length\"}]}"));
+    EXPECT_FALSE(depot::reply_truncated(
+        R"({"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]})"));
+    EXPECT_FALSE(depot::reply_truncated(R"({"choices":[{"message":{"content":"{}"}}]})"));
+    // the words inside escaped message content are not the envelope's field
+    EXPECT_FALSE(depot::reply_truncated(
+        R"({"choices":[{"message":{"content":"{\"finish_reason\":\"length\"}"},"finish_reason":"stop"}]})"));
+}
+
+TEST_F(FunnelFixture, TruncatedReplyIsAFailedAttempt) {  // P4
+    std::atomic<int> synth_calls{0};
+    depot::AskFn fake = [&](const std::string& payload) -> std::string {
+        if (payload.find("Plan the knowledge coverage") != std::string::npos)
+            return ok_body("{\\\"items\\\": [\\\"Solo\\\"]}");
+        if (payload.find("Aspect:") != std::string::npos)
+            return ok_body("{\\\"items\\\": [\\\"Alpha\\\", \\\"Beta\\\"]}");
+        if (payload.find("Critique this candidate set") != std::string::npos)
+            return ok_body("{\\\"score\\\": 0.9, \\\"remove\\\": [], \\\"add\\\": [], \\\"issues\\\": \\\"\\\"}");
+        if (payload.find("select the final children set") != std::string::npos) {
+            if (synth_calls.fetch_add(1) == 0)  // first reply cut off mid-list
+                return R"({"choices":[{"message":{"content":"{\"items\": [{\"title\": \"Alpha\", \"atomic\": true}"},"finish_reason":"length"}]})";
+            return ok_body("{\\\"items\\\": [{\\\"title\\\": \\\"Alpha\\\", \\\"atomic\\\": true}, {\\\"title\\\": \\\"Beta\\\", \\\"atomic\\\": true}]}");
+        }
+        return ok_body("{\\\"items\\\": []}");
+    };
+    testing::internal::CaptureStdout();
+    int rc = depot::run_funnel("P01-IN01-", 10, 1, false, false, "deepseek-flash",
+                               "sk-fake", dir_.string(), fake);
+    std::string out = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(rc, 0);
+    EXPECT_NE(out.find("reply cut off at max_tokens"), std::string::npos);
+    auto l5 = load_file("Onion - level_05.csv");
+    EXPECT_EQ(l5.size(), 3u);  // Existing + Alpha + Beta, only from the complete reply
+}
+
+TEST_F(FunnelFixture, RetryCommitsOnlyTheBetterAttempt) {  // P7
+    depot::AskFn fake = [&](const std::string& payload) -> std::string {
+        bool retry = payload.find("Previous critique issues") != std::string::npos;
+        bool is_td = payload.find("Title: Define business domain") != std::string::npos;
+        if (payload.find("Plan the knowledge coverage") != std::string::npos)
+            return ok_body("{\\\"items\\\": [\\\"Ops\\\"]}");
+        if (payload.find("Aspect:") != std::string::npos)
+            return retry ? ok_body("{\\\"items\\\": [\\\"Beta\\\"]}")
+                         : ok_body("{\\\"items\\\": [\\\"Alpha\\\"]}");
+        bool has_beta = payload.find("Beta") != std::string::npos;
+        if (payload.find("Critique this candidate set") != std::string::npos) {
+            if (!is_td) return ok_body("{\\\"score\\\": 0.9, \\\"remove\\\": [], \\\"add\\\": [], \\\"issues\\\": \\\"\\\"}");
+            // first attempt 0.6, the retry is WORSE at 0.4
+            return has_beta ? ok_body("{\\\"score\\\": 0.4, \\\"remove\\\": [], \\\"add\\\": [], \\\"issues\\\": \\\"worse\\\"}")
+                            : ok_body("{\\\"score\\\": 0.6, \\\"remove\\\": [], \\\"add\\\": [], \\\"issues\\\": \\\"weak\\\"}");
+        }
+        if (payload.find("select the final children set") != std::string::npos)
+            return has_beta ? ok_body("{\\\"items\\\": [{\\\"title\\\": \\\"Beta\\\", \\\"atomic\\\": true}]}")
+                            : ok_body("{\\\"items\\\": [{\\\"title\\\": \\\"Alpha\\\", \\\"atomic\\\": true}]}");
+        return ok_body("{\\\"items\\\": []}");
+    };
+    testing::internal::CaptureStdout();
+    int rc = depot::run_funnel("P01-IN01-", 10, 1, false, false, "deepseek-flash",
+                               "sk-fake", dir_.string(), fake);
+    std::string out = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(rc, 0);
+    EXPECT_NE(out.find("retried=1"), std::string::npos);
+    auto l5 = load_file("Onion - level_05.csv");
+    bool alpha = false, beta = false;
+    for (const auto& r : l5) {
+        if (r.title == "Alpha") alpha = true;
+        if (r.title == "Beta") beta = true;
+    }
+    EXPECT_TRUE(alpha);   // the better (0.6) attempt is committed
+    EXPECT_FALSE(beta);   // the worse retry is discarded
+    std::ifstream st(dir_ / "funnel_state.tsv");
+    std::string line;
+    ASSERT_TRUE(static_cast<bool>(std::getline(st, line)));
+    EXPECT_NE(line.find("\t0.6\t"), std::string::npos);  // settled with the kept score
+    EXPECT_FALSE(static_cast<bool>(std::getline(st, line)));  // exactly one row
+    std::ifstream cr(dir_ / "funnel_critique.tsv");
+    int crit_rows = 0;
+    while (std::getline(cr, line)) crit_rows++;
+    EXPECT_EQ(crit_rows, 1);  // the discarded attempt left no critique row
+}
+
+TEST_F(FunnelFixture, TransportFailuresNeverSettleNodes) {  // P6
+    depot::AskFn fake = [](const std::string&) { return std::string(); };
+    testing::internal::CaptureStdout();
+    int rc = depot::run_funnel("P01-IN01-", 10, 1, false, false, "deepseek-flash",
+                               "sk-fake", dir_.string(), fake);
+    std::string out = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(rc, 0);  // 2 failures stay below the default breaker limit of 20
+    EXPECT_NE(out.find("NODE_GIVEUP\tP01-IN01-T01-ST01-TD1"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(dir_ / "funnel_state.tsv"));  // nothing settled at 0.0
+}
+
+TEST_F(FunnelFixture, CircuitBreakerStopsTheRun) {  // P6
+    setenv("DEPOT_BREAKER_FAILS", "2", 1);
+    depot::AskFn fake = [](const std::string&) {
+        return std::string(R"({"error":{"message":"invalid api key"}})");
+    };
+    testing::internal::CaptureStdout();
+    int rc = depot::run_funnel("P01-IN01-", 10, 1, false, false, "deepseek-flash",
+                               "sk-fake", dir_.string(), fake);
+    std::string out = testing::internal::GetCapturedStdout();
+    unsetenv("DEPOT_BREAKER_FAILS");
+    EXPECT_EQ(rc, 3);
+    EXPECT_NE(out.find("BREAKER_OPEN"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(dir_ / "funnel_state.tsv"));
+}
+
+TEST_F(FunnelFixture, DuplicatePathsAreReported) {  // P3
+    write_file("Onion - level_05.csv",
+               "ID,ID-L5,Title\n"
+               "TK0001,P01-IN01-T01-ST01-TD1-TK0001,Existing Item\n"
+               "TK0001,P01-IN01-T01-ST01-TD1-TK0001,Conflicting Title\n");
+    depot::AskFn fake = [](const std::string&) { return ok_body("{\\\"items\\\": []}"); };
+    testing::internal::CaptureStdout();
+    int rc = depot::run_funnel("P01-IN01-", 1, 1, false, false, "deepseek-flash",
+                               "sk-fake", dir_.string(), fake);
+    std::string out = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(rc, 0);  // default: report and keep running, as today
+    EXPECT_NE(out.find("DUP_PATHS\t1"), std::string::npos);
+    std::ifstream df(dir_ / "duplicate_paths.tsv");
+    std::string header, row;
+    ASSERT_TRUE(static_cast<bool>(std::getline(df, header)));
+    ASSERT_TRUE(static_cast<bool>(std::getline(df, row)));
+    EXPECT_NE(row.find("Existing Item"), std::string::npos);
+    EXPECT_NE(row.find("Conflicting Title"), std::string::npos);
+
+    setenv("DEPOT_STRICT_PATHS", "1", 1);
+    testing::internal::CaptureStdout();
+    rc = depot::run_funnel("P01-IN01-", 1, 1, false, false, "deepseek-flash",
+                           "sk-fake", dir_.string(), fake);
+    testing::internal::GetCapturedStdout();
+    unsetenv("DEPOT_STRICT_PATHS");
+    EXPECT_EQ(rc, 2);  // strict mode refuses to run on duplicates
+}

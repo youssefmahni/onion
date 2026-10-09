@@ -67,4 +67,9 @@ struct LlmAnswer {
 };
 LlmAnswer parse_llm(const std::string& body);
 
+// P4: true when a chat-completions body says the reply stopped at max_tokens
+// ("finish_reason":"length"). Its JSON is cut off, so the attempt must count
+// as failed instead of being parsed into a smaller child set.
+bool reply_truncated(const std::string& body);
+
 }  // namespace depot

@@ -450,6 +450,24 @@ LlmAnswer parse_llm(const std::string& body) {
     return a;
 }
 
+bool reply_truncated(const std::string& body) {
+    static const std::string key = "\"finish_reason\"";
+    size_t p = 0;
+    while ((p = body.find(key, p)) != std::string::npos) {
+        // an escaped occurrence (\"finish_reason\") lives inside message
+        // content, not in the envelope: ignore it
+        if (p > 0 && body[p - 1] == '\\') { p += key.size(); continue; }
+        size_t q = p + key.size();
+        while (q < body.size() &&
+               (body[q] == ' ' || body[q] == ':' || body[q] == '\t' ||
+                body[q] == '\n' || body[q] == '\r'))
+            ++q;
+        if (body.compare(q, 8, "\"length\"") == 0) return true;
+        p = q;
+    }
+    return false;
+}
+
 }  // namespace depot
 
 #ifdef __EMSCRIPTEN__

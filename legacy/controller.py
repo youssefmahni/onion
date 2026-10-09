@@ -16,7 +16,11 @@ Usage:
   python3 controller.py --seed P01-IN03-T30 --limit 10 --port 8080
   python3 controller.py --no-server --dry
 """
-import argparse, json, os, re, signal, subprocess, sys, threading, time
+import argparse, json, os, platform, re, signal, subprocess, sys, threading, time
+try:
+    import psutil          # optional: best cross-platform source when installed
+except ImportError:
+    psutil = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -26,6 +30,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 class Sampler:
     def __init__(self):
         self.cores = os.cpu_count() or 1
+        self.os = platform.system()
         self.prev_stat = None
         self.prev_net = None
         self.gpu = None
@@ -43,6 +48,10 @@ class Sampler:
             except OSError:
                 pass
 
+    # P2: every reading has a Linux /proc path, then psutil, then a native
+    # macOS / Windows fallback. A reading that cannot be taken is None
+    # ("unknown"), never a made-up value: the old fallbacks returned load 0 and
+    # 99 GB of RAM on macOS, so the policy grew forever and never backed off.
     def _cpu_busy(self):
         try:
             parts = open("/proc/stat").readline().split()[1:]
@@ -53,14 +62,29 @@ class Sampler:
                 pt, pi = self.prev_stat
                 d_total = total - pt
                 d_idle = idle - pi
+                self.prev_stat = (total, idle)
                 if d_total > 0:
                     return 100.0 * (1.0 - d_idle / d_total)
             self.prev_stat = (total, idle)
             return 0.0
-        except OSError:
-            return 0.0
+        except (OSError, ValueError, IndexError):
+            pass
+        if psutil:
+            try:
+                return float(psutil.cpu_percent(interval=None))
+            except Exception:
+                pass
+        if self.os == "Darwin":
+            try:  # sum of per-process CPU %, scaled to the machine's cores
+                out = subprocess.run(["ps", "-A", "-o", "%cpu="], capture_output=True,
+                                     text=True, timeout=5).stdout.split()
+                return min(100.0, sum(float(v) for v in out) / max(1, self.cores))
+            except Exception:
+                pass
+        return None
 
-    def _net_mbps(self):
+    def _net_counters(self):
+        """Total (rx_bytes, tx_bytes) over non-loopback interfaces, or None."""
         try:
             rx = tx = 0
             for line in open("/proc/net/dev").readlines()[2:]:
@@ -70,16 +94,53 @@ class Sampler:
                         continue
                     f = line.split(":")[1].split()
                     rx += int(f[0]); tx += int(f[8])
-            now = time.time()
-            if self.prev_net:
-                prx, ptx, pt = self.prev_net
-                dt = now - pt
-                if dt > 0:
-                    return (rx - prx) * 8 / dt / 1e6, (tx - ptx) * 8 / dt / 1e6
-            self.prev_net = (rx, tx, now)
-            return 0.0, 0.0
+            return rx, tx
         except (OSError, ValueError, IndexError):
-            return 0.0, 0.0
+            pass
+        if psutil:
+            try:
+                rx = tx = 0
+                for name, c in psutil.net_io_counters(pernic=True).items():
+                    if name.startswith(("lo", "Loopback")):
+                        continue
+                    rx += c.bytes_recv; tx += c.bytes_sent
+                return rx, tx
+            except Exception:
+                pass
+        if self.os == "Darwin":
+            try:  # netstat -ib lists each interface once per address: keep one row each
+                out = subprocess.run(["netstat", "-ib"], capture_output=True, text=True,
+                                     timeout=5).stdout.splitlines()
+                head = out[0].split()
+                i_in, i_out = head.index("Ibytes"), head.index("Obytes")
+                per = {}
+                for line in out[1:]:
+                    f = line.split()
+                    if len(f) <= max(i_in, i_out) or f[0].startswith("lo"):
+                        continue
+                    try:
+                        per[f[0]] = (int(f[i_in]), int(f[i_out]))
+                    except ValueError:
+                        continue  # rows without byte counts
+                return sum(v[0] for v in per.values()), sum(v[1] for v in per.values())
+            except Exception:
+                pass
+        return None
+
+    def _net_mbps(self):
+        c = self._net_counters()
+        if c is None:
+            return None, None
+        rx, tx = c
+        now = time.time()
+        if self.prev_net:
+            prx, ptx, pt = self.prev_net
+            dt = now - pt
+            self.prev_net = (rx, tx, now)
+            if dt > 0:
+                return (rx - prx) * 8 / dt / 1e6, (tx - ptx) * 8 / dt / 1e6
+        self.prev_net = (rx, tx, now)
+        return 0.0, 0.0
 
     def _ram_avail_gb(self):
         try:
@@ -88,14 +149,52 @@ class Sampler:
                     return int(line.split()[1]) / 1024 / 1024  # kB -> GB
         except OSError:
             pass
-        return 99.0
+        if psutil:
+            try:
+                return psutil.virtual_memory().available / 1024 ** 3
+            except Exception:
+                pass
+        if self.os == "Darwin":
+            try:  # free + inactive + speculative pages are reclaimable
+                out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                                     timeout=5).stdout
+                page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+                pages = 0
+                for key in ("Pages free", "Pages inactive", "Pages speculative"):
+                    m = re.search(key + r":\s+(\d+)", out)
+                    if m:
+                        pages += int(m.group(1))
+                return pages * page / 1024 ** 3
+            except Exception:
+                pass
+        if self.os == "Windows":
+            try:
+                import ctypes
+                class MEMSTAT(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                st = MEMSTAT(); st.dwLength = ctypes.sizeof(MEMSTAT)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                    return st.ullAvailPhys / 1024 ** 3
+            except Exception:
+                pass
+        return None
 
     def _load(self):
         try:
             l = open("/proc/loadavg").read().split()
             return float(l[0]), float(l[1])
-        except (OSError, ValueError):
-            return 0.0, 0.0
+        except (OSError, ValueError, IndexError):
+            pass
+        try:  # macOS and other Unix
+            l1, l5, _ = os.getloadavg()
+            return l1, l5
+        except (OSError, AttributeError):
+            pass
+        return None, None  # Windows has no load average; the policy treats it as unknown
 
     def _gpu_pct(self):
         """GPU busy % from the best available source, or None.
@@ -210,14 +309,18 @@ def compute_target(s, prev):
     cores = s["cores"]
     base = min(16, max(2, cores))
     t = prev
-    if s["load1"] > 0.8 * cores:
-        t = max(1, t - 2)          # user busy -> back off
-    elif s["load1"] < 0.3 * cores:
-        t = min(base, t + 2)       # idle -> use more workers
-    if s["ram_avail_gb"] < 1.0:
+    load1 = s.get("load1")
+    if load1 is not None:          # unknown load (Windows, broken probe): hold
+        if load1 > 0.8 * cores:
+            t = max(1, t - 2)      # user busy -> back off
+        elif load1 < 0.3 * cores:
+            t = min(base, t + 2)   # idle -> use more workers
+    ram = s.get("ram_avail_gb")
+    if ram is not None and ram < 1.0:
         t = max(1, t // 2)         # memory pressure
     link = s.get("link_mbps")
-    if link and (s["net_rx_mbps"] + s["net_tx_mbps"]) > 0.7 * link:
+    rx, tx = s.get("net_rx_mbps"), s.get("net_tx_mbps")
+    if link and rx is not None and tx is not None and (rx + tx) > 0.7 * link:
         t = min(t, 4)              # NIC saturated (API-bound) -> cap
     if s.get("gpu_pct") is not None and s["gpu_pct"] > 90:
         t = min(t, 2)              # GPU busy (e.g. user rendering)
@@ -692,18 +795,24 @@ def main():
             if not a.dry:
                 write_control()   # only commit changes — the funnel reconciles this file
             why = []
-            if s["load1"] > 0.8 * s["cores"]: why.append("busy")
-            elif s["load1"] < 0.3 * s["cores"]: why.append("idle")
-            if s["ram_avail_gb"] < 1.0: why.append("low-ram")
-            if s.get("link_mbps") and s["net_rx_mbps"] + s["net_tx_mbps"] > 0.7 * s["link_mbps"]:
+            l1, ram = s.get("load1"), s.get("ram_avail_gb")
+            rx, tx = s.get("net_rx_mbps"), s.get("net_tx_mbps")
+            if l1 is not None and l1 > 0.8 * s["cores"]: why.append("busy")
+            elif l1 is not None and l1 < 0.3 * s["cores"]: why.append("idle")
+            if ram is not None and ram < 1.0: why.append("low-ram")
+            if (s.get("link_mbps") and rx is not None and tx is not None
+                    and rx + tx > 0.7 * s["link_mbps"]):
                 why.append("nic-sat")
             policy.append({"t": time.strftime("%H:%M:%S"),
                            "event": f"threads {prev} -> {target} ({','.join(why) or 'policy'})"})
             print(f"[policy] threads {prev} -> {target} ({','.join(why) or 'policy'})")
 
-        history.append({"t": time.strftime("%H:%M:%S"), "load": round(s["load1"], 2),
-                        "cpu": round(s["cpu_busy"], 1), "ram": round(s["ram_avail_gb"], 1),
-                        "net": round(s["net_rx_mbps"] + s["net_tx_mbps"], 1),
+        def _r(v, n):  # unknown readings stay None in the history (dashboards show "?")
+            return None if v is None else round(v, n)
+        rx, tx = s.get("net_rx_mbps"), s.get("net_tx_mbps")
+        history.append({"t": time.strftime("%H:%M:%S"), "load": _r(s.get("load1"), 2),
+                        "cpu": _r(s.get("cpu_busy"), 1), "ram": _r(s.get("ram_avail_gb"), 1),
+                        "net": None if rx is None or tx is None else round(rx + tx, 1),
                         "threads": target})
 
         # manage the funnel process
@@ -735,6 +844,20 @@ def main():
                     finished = True   # clean finish -> do NOT restart
                     crash_count = 0
                     print("[controller] funnel finished cleanly (rc=0) — idle until re-seeded", flush=True)
+                elif rc == 3:
+                    # circuit breaker: the provider or key failed repeatedly.
+                    # Pause instead of restarting into the same failure; nodes
+                    # were left unsettled, so resuming later loses nothing.
+                    try:
+                        open(os.path.join(root, "control/paused"), "w").write("breaker\n")
+                    except OSError:
+                        pass
+                    paused = True
+                    crash_count = 0
+                    policy.append({"t": time.strftime("%H:%M:%S"),
+                                   "event": "circuit breaker open — paused; fix the provider or key, then resume"})
+                    print("[controller] circuit breaker open (rc=3) — paused; resume after fixing "
+                          "the provider or API key", flush=True)
                 else:
                     crash_count += 1
                     if crash_count >= 5:
