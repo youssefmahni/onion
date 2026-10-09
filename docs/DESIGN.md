@@ -112,8 +112,8 @@ One C++17 codebase builds with CMake on macOS, Linux and Windows. Everything the
 | Atomic file replace | `rename` | `rename` | `MoveFileExW` with replace + write-through |
 | Run as a service | launchd | systemd | Windows Service |
 | Load, RAM, network sampling | `getloadavg`, `host_statistics64`, `getifaddrs` | `/proc` | `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetIfTable2` |
-| Private key storage | Keychain, or a 0600 file | 0600 file | DPAPI-encrypted file |
-| Data directory | `~/Library/Application Support/Onion` | `$XDG_DATA_HOME/onion` or `/var/lib/onion` | `%LOCALAPPDATA%\Onion` |
+| Private key storage | Keychain (from M5); 0600 file in a 0700 directory before then | 0600 file in a 0700 directory | DPAPI-encrypted file |
+| Data directory | `~/Library/Application Support/Onion` | `$XDG_DATA_HOME/onion`, falling back to `~/.local/share/onion` | `%LOCALAPPDATA%\Onion` |
 | Firewall | Allow prompt on first listen | ufw or firewalld rule | Defender Firewall rule at install, Private network profile only |
 | GPU (optional) | Apple OpenCL 1.2 | OpenCL ICD | OpenCL ICD from the GPU vendor |
 
@@ -124,6 +124,10 @@ One C++17 codebase builds with CMake on macOS, Linux and Windows. Everything the
 - File paths use `std::filesystem`; tree paths (`P01-IN01-…`) are data and never become file names.
 - The bash scripts `onion-start` and `onion-stop` become subcommands, `data_depot node start | stop | status`, identical on all OSes.
 - Scope is the home LAN for now. Devices on other networks can join later through an overlay such as WireGuard, which runs on all three OSes; nothing in the design depends on the LAN except discovery.
+
+**Data-directory precedence.** Every OS resolves the data directory in this order: an explicit `--data-dir` flag; `ONION_DATA_DIR`; on Linux only, `STATE_DIRECTORY` (set by systemd `StateDirectory=onion` in service mode); then the per-OS user default in the table. The choice never depends on the user id. The flag and environment variable support tests and several local instances.
+
+**Key-store staging.** M1 provides the `KeyStore` interface, a 0600-file backend in a 0700 directory on Linux and macOS, and a DPAPI backend on Windows. M5 adds the macOS Keychain backend and verifies DPAPI under the Windows service account. Device keys are first needed in M4; the DeepSeek key remains in the environment until M5.
 
 ## Device identity and ID slots
 
@@ -295,7 +299,7 @@ Every state change is a record. All records of one commit go into one signed, ha
 | `RESERVE` | campaign, attempts reserved | A device taking its next chunk of a campaign's loop budget |
 | `CLAIM` | path, lease length, renewal count | A device stealing a ticket from another lane |
 | `REEXPAND` | path, reason | A review retry or forced re-run of a settled node |
-| `ATTEMPT` | path, attempt number, score, checks passed, input / cached / output tokens, cost, campaign | Every attempt, kept or discarded |
+| `ATTEMPT` | path, attempt number, score, checks passed, input / cached / output tokens, cost, campaign, issues (at most 1,000 characters) | Every attempt, kept or discarded |
 | `ADD_NODE` | path, layer, title, legacy? | Commit of the accepted attempt, ingest, genesis import |
 | `CRITIQUE` | path, score, issues, remove[], add[] | Commit of the accepted attempt |
 | `ATOMIC` | path, verified | Commit of the accepted attempt |
@@ -361,10 +365,12 @@ A device can be switched off at any instant: it loses at most the node it was wo
 
 **Commit order (what makes power loss safe)**
 
-1. While a node is being worked on, attempts live in memory only; each one adds just an `ATTEMPT` record to the next batch.
-2. When the gate decides, the accepted attempt's records (`ADD_NODE` children, `CRITIQUE`, `ATOMIC`, then `SETTLE` last) form one batch, or the batch holds a single `NEEDS_REVIEW`.
-3. One durable write for the batch (platform layer).
-4. Only then is the SQLite store updated, and new children are pushed to their lane owners.
+1. When an attempt finishes, its `ATTEMPT` audit record is made durable without children. The state writer may group pending `ATTEMPT` records with other writes, but flushes at least once per second.
+2. When the gate decides, only the accepted attempt's children, `CRITIQUE`, `ATOMIC`, and `SETTLE` (last) form the terminal batch, or the terminal batch holds `NEEDS_REVIEW`. No children are committed before this decision.
+3. One durable write for every terminal batch (platform layer).
+4. Only after the terminal batch is durable is the SQLite store updated and are new children pushed to their lane owners.
+
+After a restart, durable attempts resume at attempt number +1 using their stored issues. Their spent budget and attempt number still count toward the three-attempt limit, but their lost children cannot be committed; best-of-three considers only attempts still in memory.
 
 **Restart after a sudden shutdown**
 
@@ -459,7 +465,7 @@ The `+ 0.5` keeps `h` strictly between 0 and 1, so the logarithm is always defin
 A node's children are kept only after they pass a gate. A worker tries up to 3 times, keeps the best attempt, and sends the node to review if even the best is poor.
 
 1. **Pre-check.** A short call (at most 400 tokens) asks whether the node splits into at least 3 distinct parts. A clear no makes it a leaf at once (end = cannot split), without running the funnel. This keeps leaves cheap; without it, every leaf would cost 3 full attempts.
-2. **Attempt.** Run the funnel for the node: planner, workers, dedup, trims, critique, synthesizer. From the campaign's light-funnel depth onward, a lighter funnel runs (2 to 3 aspects, one trim). Nothing is committed yet; only an `ATTEMPT` record is written.
+2. **Attempt.** Run the funnel for the node: planner, workers, dedup, trims, critique, synthesizer. From the campaign's light-funnel depth onward, a lighter funnel runs (2 to 3 aspects, one trim). Its durable `ATTEMPT` audit record contains no children; children are committed only in the terminal batch after the gate decides.
 3. **Checks that do not depend on the model's judgement.** The reply is complete (`finish_reason` = `stop`) and valid JSON; 3 to 100 children; no child repeats the node, an ancestor, a sibling or an existing child (canonical title); every title passes the style gates.
 4. **Score.** The critique score of the attempt, from the campaign's critic model.
 5. **Decide.**
@@ -721,7 +727,9 @@ The acceptance test is convergence: after any mix of joins, leaves, power cuts a
 
 **Build matrix (CI on every commit)**
 
-- macOS, Linux, Windows 10 and Windows 11 builds of the same tree; the existing 92 tests plus the new ones must pass on all three.
+- The legacy suite is 98 tests: 90 core and 8 GPU. M1 copies 67 pure-core tests and all 8 GPU tests into the new tree (75 copied regression tests); the remaining 23 core tests stay in `legacy/`, which remains unchanged and continues to run all 98 tests.
+- Hosted CI runs Linux, native arm64 macOS, and Windows builds and tests. It also performs an Intel Mac compatibility build with `CMAKE_OSX_ARCHITECTURES=x86_64` and `CMAKE_OSX_DEPLOYMENT_TARGET=12.0`; native tests run on arm64 until a self-hosted Mac Pro runner is available. Windows 10 and 11 fleet validation is owner-run in M9.
+- Linux CI installs `pocl-opencl-icd` and sets `POCL_CACHE_DIR` inside the build tree through CTest's `ENVIRONMENT` property, so GPU tests execute there. Where no OpenCL runtime is available on hosted macOS or Windows, GPU tests report as skipped rather than passed.
 - A cross-OS golden test: the same op batch is canonicalized, hashed and signed on each OS, and the bytes must be identical.
 
 **Unit (gtest)**
