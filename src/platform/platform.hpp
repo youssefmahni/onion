@@ -48,6 +48,7 @@ Sample sample();
 // returns the usable number of simultaneous outbound requests (64 descriptors
 // remain reserved for logs, listeners, and other engine resources).
 std::size_t outbound_request_ceiling();
+std::size_t effective_open_file_limit();
 
 class KeyStore {
  public:

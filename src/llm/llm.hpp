@@ -123,9 +123,14 @@ class Client {
   void submit(Request request, std::function<void(Result)> done);
   std::size_t in_flight() const;
   std::size_t peak_in_flight() const;
+  std::size_t connections_opened() const;
+  long negotiated_http_version() const;
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+bool curl_supports_http2();
+std::string curl_version();
 }

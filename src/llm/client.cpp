@@ -176,7 +176,10 @@ struct Client::Impl {
     Clock::time_point started;
     curl_slist* headers{};
   };
-  explicit Impl(Options opts) : options(std::move(opts)), multi(curl_multi_init()), worker(&Impl::run, this) {}
+  explicit Impl(Options opts) : options(std::move(opts)), multi(curl_multi_init()) {
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    worker = std::thread(&Impl::run, this);
+  }
   ~Impl() { { std::lock_guard<std::mutex> lock(mutex); stopping = true; } cv.notify_all(); worker.join(); curl_multi_cleanup(multi); }
   // The worker must be declared after every member it reads: C++ initializes
   // members in declaration order, not initializer-list order.
@@ -189,6 +192,8 @@ struct Client::Impl {
   bool stopping{};
   std::atomic<std::size_t> flight{};
   std::atomic<std::size_t> peak{};
+  std::atomic<std::size_t> connections{};
+  std::atomic<long> http_version{};
   std::thread worker;
   void submit(Request request, std::function<void(Result)> done) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -216,11 +221,18 @@ struct Client::Impl {
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_body); curl_easy_setopt(easy, CURLOPT_WRITEDATA, &item.body);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, read_header); curl_easy_setopt(easy, CURLOPT_HEADERDATA, &item.retry_after);
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, options.timeout_s); curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
     curl_easy_setopt(easy, CURLOPT_PRIVATE, easy); curl_multi_add_handle(multi, easy);
   }
   void finish(CURL* easy, CURLcode code) {
     auto found = active.find(easy); if (found == active.end()) return; Active item = std::move(*found->second); active.erase(found);
-    long status = 0; curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status); curl_multi_remove_handle(multi, easy); curl_slist_free_all(item.headers); curl_easy_cleanup(easy);
+    long status = 0; long opened = 0; long version = 0;
+    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &opened);
+    curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &version);
+    connections.fetch_add(static_cast<std::size_t>(std::max(0L, opened)));
+    http_version.store(version);
+    curl_multi_remove_handle(multi, easy); curl_slist_free_all(item.headers); curl_easy_cleanup(easy);
     Result result; result.http_status = static_cast<int>(status); result.retry_after_s = item.retry_after;
     result.latency_s = std::chrono::duration<double>(Clock::now() - item.started).count();
     if (code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
@@ -268,4 +280,14 @@ Client::~Client() = default;
 void Client::submit(Request request, std::function<void(Result)> done) { impl_->submit(std::move(request), std::move(done)); }
 std::size_t Client::in_flight() const { return impl_->flight.load(); }
 std::size_t Client::peak_in_flight() const { return impl_->peak.load(); }
+std::size_t Client::connections_opened() const { return impl_->connections.load(); }
+long Client::negotiated_http_version() const { return impl_->http_version.load(); }
+bool curl_supports_http2() {
+  const auto* info = curl_version_info(CURLVERSION_NOW);
+  return info != nullptr && (info->features & CURL_VERSION_HTTP2) != 0;
+}
+std::string curl_version() {
+  const auto* info = curl_version_info(CURLVERSION_NOW);
+  return info != nullptr && info->version != nullptr ? info->version : "unknown";
+}
 }  // namespace onion::llm

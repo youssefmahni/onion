@@ -115,4 +115,10 @@ TEST(PlatformSampleTest, OSValuesArePresent) {
 TEST(PlatformFileLimits, ReservesDescriptorsForEngineResources) {
   EXPECT_GE(onion::platform::outbound_request_ceiling(), 1U);
 }
+#if defined(__APPLE__)
+TEST(PlatformFileLimits, RaisesMacOSSoftLimitToAtLeast4096) {
+  (void)onion::platform::outbound_request_ceiling();
+  EXPECT_GE(onion::platform::effective_open_file_limit(), 4096U);
+}
+#endif
 }  // namespace

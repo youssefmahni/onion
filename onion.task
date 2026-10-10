@@ -53,6 +53,9 @@ the technical progress log in `docs/agent/PROGRESS.md`.
 - Verified the normal and ASan/UBSan 1,000-request benchmarks after both
   repairs: 1,149.14 req/s normal and 307.235 req/s instrumented, each with
   1,000 peak requests and no sanitizer report.
+- Added benchmark reporting for latency percentiles, curl connection reuse,
+  negotiated HTTP version, runtime HTTP/2 support, process thread count and
+  budget reservation/settlement totals.
 
 ## Next approved task
 

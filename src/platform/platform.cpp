@@ -26,6 +26,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <limits.h>
 #include <mach/mach.h>
 #include <net/if.h>
 #include <net/route.h>
@@ -315,17 +316,41 @@ std::size_t outbound_request_ceiling() {
 #else
   rlimit limits{};
   if (::getrlimit(RLIMIT_NOFILE, &limits) != 0) return 1;
+#if defined(__APPLE__)
+  std::uint64_t per_process = 0;
+  std::size_t bytes = sizeof(per_process);
+  if (::sysctlbyname("kern.maxfilesperproc", &per_process, &bytes, nullptr, 0) != 0) per_process = limits.rlim_max;
+  const rlim_t cap = static_cast<rlim_t>(std::min<std::uint64_t>(
+      {static_cast<std::uint64_t>(limits.rlim_max), per_process, static_cast<std::uint64_t>(OPEN_MAX)}));
+  if (limits.rlim_cur < cap) {
+    rlimit raised = limits;
+    raised.rlim_cur = cap;
+    (void)::setrlimit(RLIMIT_NOFILE, &raised);
+    (void)::getrlimit(RLIMIT_NOFILE, &limits);
+  }
+#else
   if (limits.rlim_cur < limits.rlim_max) {
     rlimit raised = limits;
     raised.rlim_cur = raised.rlim_max;
     (void)::setrlimit(RLIMIT_NOFILE, &raised);
     (void)::getrlimit(RLIMIT_NOFILE, &limits);
   }
+#endif
   if (limits.rlim_cur <= 64) return 1;
   const auto usable = limits.rlim_cur - 64;
   return usable > static_cast<rlim_t>(std::numeric_limits<std::size_t>::max())
       ? std::numeric_limits<std::size_t>::max()
       : static_cast<std::size_t>(usable);
+#endif
+}
+
+std::size_t effective_open_file_limit() {
+#ifdef _WIN32
+  return std::numeric_limits<std::size_t>::max();
+#else
+  rlimit limits{};
+  return ::getrlimit(RLIMIT_NOFILE, &limits) == 0
+      ? static_cast<std::size_t>(limits.rlim_cur) : 0;
 #endif
 }
 
