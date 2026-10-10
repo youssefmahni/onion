@@ -99,7 +99,7 @@ if(WIN32)
   FetchContent_Declare(
     curl
     URL https://github.com/curl/curl/releases/download/curl-8_11_1/curl-8.11.1.tar.xz
-    URL_HASH SHA256=782f8aca6786c4654ff59de728c57e205bedc66eda5ac5f619ab3713b326001b
+    URL_HASH SHA256=c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   FetchContent_MakeAvailable(curl)
   set(ONION_CURL_TARGET libcurl_static)

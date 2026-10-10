@@ -178,8 +178,18 @@ struct Client::Impl {
   };
   explicit Impl(Options opts) : options(std::move(opts)), multi(curl_multi_init()), worker(&Impl::run, this) {}
   ~Impl() { { std::lock_guard<std::mutex> lock(mutex); stopping = true; } cv.notify_all(); worker.join(); curl_multi_cleanup(multi); }
-  Options options; CURLM* multi{}; std::thread worker; std::mutex mutex; std::condition_variable cv;
-  std::deque<Task> queued; std::unordered_map<CURL*, std::unique_ptr<Active>> active; bool stopping{}; std::atomic<std::size_t> flight{}; std::atomic<std::size_t> peak{};
+  // The worker must be declared after every member it reads: C++ initializes
+  // members in declaration order, not initializer-list order.
+  Options options;
+  CURLM* multi{};
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<Task> queued;
+  std::unordered_map<CURL*, std::unique_ptr<Active>> active;
+  bool stopping{};
+  std::atomic<std::size_t> flight{};
+  std::atomic<std::size_t> peak{};
+  std::thread worker;
   void submit(Request request, std::function<void(Result)> done) {
     std::lock_guard<std::mutex> lock(mutex);
     queued.push_back({std::move(request), std::move(done), 0, Clock::now()});

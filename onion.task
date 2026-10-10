@@ -47,6 +47,9 @@ the technical progress log in `docs/agent/PROGRESS.md`.
 - Added stable per-request curl storage, curl_multi_poll-only driving, Unix
   descriptor-limit raising with a 64-descriptor reserve, and 1,000-request
   closed-port/reset-connection regressions.
+- Added Linux ASan/UBSan and TSan CI jobs. TSan then found and verified the
+  fix for a second client construction-order race; the ASan job excludes the
+  external POCL runtime so its leak reports cannot mask engine diagnostics.
 
 ## Next approved task
 

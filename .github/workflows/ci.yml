@@ -76,7 +76,7 @@ jobs:
       - name: Configure
         run: >-
           cmake -S . -B build/linux-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug
-          -DONION_ENABLE_ASAN=ON -DONION_ENABLE_UBSAN=ON
+          -DONION_ENABLE_OPENCL=OFF -DONION_ENABLE_ASAN=ON -DONION_ENABLE_UBSAN=ON
       - name: Build
         run: cmake --build build/linux-asan
       - name: Test
