@@ -88,3 +88,10 @@ Evidence:
 
 Next step: merge PR #4 with a merge commit, tag `m2-rc`, fast-forward main, create `m3-engine` from main.
 
+
+## 2026-10-10T18:4xZ · m4 · start; process lapse recorded
+
+Result: in progress
+Evidence: -
+Lapse: the "record the merge" memory-docs commit landed on main (before branching) — §6.1 says never commit to main. Docs-only and harmless, but recorded. All code commits from here land on m4-signed-log only.
+Next step: DeviceKey + Ed25519Signer in src/log with golden determinism, then verify() with every rejection case.
