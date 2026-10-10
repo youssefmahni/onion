@@ -39,3 +39,32 @@ Cost projections display both peak and off-peak totals.
 Metering is reproducible from the recorded configuration and never guesses a
 price. Tests use explicit fixture prices only. A live `/models` request was
 not made because M0 was already tagged and its allowed call step was skipped.
+
+## Update 2026-10-10 — live validation findings (M2 real-call validation, 5 completions + free GET /models)
+
+Performed by the agent on 2026-10-10 with a real key (env `DEEPSEEK_API_KEY`,
+never printed). Findings:
+
+- `GET /models` (free) over HTTPS negotiates **HTTP/2** and lists
+  `deepseek-flash` (DeepSeek-V4.1-Flash, context 1,048,576, max output
+  393,216) and `deepseek-v4-pro`. The decision's model id is confirmed.
+- The request shape with `reasoning_effort: "none"` is **accepted** (200 OK),
+  although the models list advertises supported effort levels `low`, `high`
+  and `max` with default `high`. No rejection observed; keep `"none"` until a
+  rejection or behaviour change is observed.
+- The usage field names the client parses are the real ones:
+  `prompt_cache_hit_tokens`, `prompt_cache_miss_tokens`,
+  `completion_tokens`.
+- Repeating the same short prefix (17 input tokens) produced **no cache-hit
+  tokens** (`prompt_cache_hit_tokens=0` on the repeat). DeepSeek's automatic
+  prompt cache did not engage for this short prefix. The client reports hits
+  whenever the provider reports them; M3's real campaign (long fixed
+  instruction text first) is where hits are expected to appear.
+- `max_tokens: 1` returned `finish_reason: "length"`, classified by the
+  client as Truncated (failed attempt).
+- A deliberately invalid key returned **401** and opened the breaker with
+  reason `authentication` after three consecutive responses, as specified.
+
+Cost of the four billed completions: 68 cache-miss input + 4 output tokens,
+all in off-peak hours (Saturday) → 68 × $0.15/M + 4 × $0.60/M = $0.0000126.
+The 401 call is not billed.
