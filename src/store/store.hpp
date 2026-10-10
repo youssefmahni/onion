@@ -128,22 +128,22 @@ class Db {
   // Plain SQL with no results.
   bool exec(std::string_view sql, std::string* error);
   // Prepare a statement for reuse.
-  std::optional<Statement> prepare(std::string_view sql, std::string* error);
+  std::optional<Statement> prepare(std::string_view sql, std::string* error) const;
 
   // Typed helpers.
-  std::optional<Node> node_by_path(std::string_view path, std::string* error);
-  std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error);
-  std::vector<Node> nodes_at_layer(int layer, std::string* error);
+  std::optional<Node> node_by_path(std::string_view path, std::string* error) const;
+  std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error) const;
+  std::vector<Node> nodes_at_layer(int layer, std::string* error) const;
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
-                                           std::string* error);
-  std::vector<Review> open_reviews(std::string* error);
-  std::vector<Campaign> campaigns(std::string* error);
-  std::vector<Settle> settles(std::string* error);
-  std::int64_t max_node_id(std::string* error);
-  std::string spend_usd(std::string* error);  // sum of attempt cost (M3: own origin)
+                                           std::string* error) const;
+  std::vector<Review> open_reviews(std::string* error) const;
+  std::vector<Campaign> campaigns(std::string* error) const;
+  std::vector<Settle> settles(std::string* error) const;
+  std::int64_t max_node_id(std::string* error) const;
+  std::string spend_usd(std::string* error) const;
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,
-                  std::string* error);
+                  std::string* error) const;
 
   std::filesystem::path path() const { return path_; }
 

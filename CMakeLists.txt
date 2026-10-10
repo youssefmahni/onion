@@ -166,10 +166,10 @@ target_link_libraries(profile INTERFACE onion::core onion::gpu onion::platform)
 # Engine layer
 onion_add_module(gate)
 onion_add_module(sched)
-onion_add_module(state)
+onion_add_compiled_module(state src/state/state.cpp)
+target_link_libraries(state PUBLIC onion::core onion::log onion::store)
 target_link_libraries(gate INTERFACE onion::core onion::llm)
 target_link_libraries(sched INTERFACE onion::core onion::profile)
-target_link_libraries(state INTERFACE onion::core onion::log onion::store)
 
 # Interface layer
 onion_add_module(api)
@@ -209,6 +209,10 @@ if(BUILD_TESTING)
   add_executable(onion_store_test tests/unit/store_test.cpp)
   target_link_libraries(onion_store_test PRIVATE onion::store GTest::gtest_main)
   gtest_discover_tests(onion_store_test)
+
+  add_executable(onion_state_test tests/unit/state_test.cpp)
+  target_link_libraries(onion_state_test PRIVATE onion::state GTest::gtest_main)
+  gtest_discover_tests(onion_state_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)

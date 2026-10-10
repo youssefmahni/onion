@@ -220,7 +220,7 @@ bool Db::exec(std::string_view sql, std::string* error) {
   return true;
 }
 
-std::optional<Statement> Db::prepare(std::string_view sql, std::string* error) {
+std::optional<Statement> Db::prepare(std::string_view sql, std::string* error) const {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(handle_, std::string(sql).c_str(), -1, &stmt, nullptr) !=
       SQLITE_OK) {
@@ -251,7 +251,7 @@ constexpr const char* kNodeColumns =
 
 }  // namespace
 
-std::optional<Node> Db::node_by_path(std::string_view path, std::string* error) {
+std::optional<Node> Db::node_by_path(std::string_view path, std::string* error) const {
   std::optional<Statement> stmt = prepare(
       std::string("SELECT ") + kNodeColumns + " FROM nodes WHERE path = ?1;",
       error);
@@ -265,7 +265,7 @@ std::optional<Node> Db::node_by_path(std::string_view path, std::string* error) 
   return node;
 }
 
-std::vector<Node> Db::nodes_in_subtree(std::string_view path, std::string* error) {
+std::vector<Node> Db::nodes_in_subtree(std::string_view path, std::string* error) const {
   std::optional<Statement> stmt = prepare(
       std::string("SELECT ") + kNodeColumns +
           " FROM nodes WHERE path = ?1 OR (path >= ?2 AND path < ?3) "
@@ -288,7 +288,7 @@ std::vector<Node> Db::nodes_in_subtree(std::string_view path, std::string* error
   return nodes;
 }
 
-std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) {
+std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) const {
   std::optional<Statement> stmt = prepare(
       std::string("SELECT ") + kNodeColumns +
           " FROM nodes WHERE layer = ?1 AND tombstone = 0 ORDER BY path;",
@@ -306,7 +306,7 @@ std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) {
 }
 
 std::vector<Node> Db::nodes_with_path_prefix(std::string_view prefix,
-                                             std::string* error) {
+                                             std::string* error) const {
   std::optional<Statement> stmt = prepare(
       std::string("SELECT ") + kNodeColumns +
           " FROM nodes WHERE path >= ?1 AND path < ?2 ORDER BY path;",
@@ -326,7 +326,7 @@ std::vector<Node> Db::nodes_with_path_prefix(std::string_view prefix,
   return nodes;
 }
 
-std::vector<Review> Db::open_reviews(std::string* error) {
+std::vector<Review> Db::open_reviews(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT path, reason, state, note, hlc, origin FROM reviews ORDER BY path;",
       error);
@@ -347,7 +347,7 @@ std::vector<Review> Db::open_reviews(std::string* error) {
   return reviews;
 }
 
-std::vector<Campaign> Db::campaigns(std::string* error) {
+std::vector<Campaign> Db::campaigns(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT id, spec, state, hlc, origin FROM campaigns ORDER BY id;", error);
   if (!stmt) return {};
@@ -366,7 +366,7 @@ std::vector<Campaign> Db::campaigns(std::string* error) {
   return campaigns;
 }
 
-std::vector<Settle> Db::settles(std::string* error) {
+std::vector<Settle> Db::settles(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT path, kept, atomic, attempts, score, campaign, hlc, origin "
       "FROM settles ORDER BY path;",
@@ -390,7 +390,7 @@ std::vector<Settle> Db::settles(std::string* error) {
   return settles;
 }
 
-std::int64_t Db::max_node_id(std::string* error) {
+std::int64_t Db::max_node_id(std::string* error) const {
   std::optional<Statement> stmt =
       prepare("SELECT COALESCE(MAX(id), 0) FROM nodes;", error);
   if (!stmt) return 0;
@@ -399,7 +399,7 @@ std::int64_t Db::max_node_id(std::string* error) {
   return stmt->integer(0);
 }
 
-std::string Db::spend_usd(std::string* error) {
+std::string Db::spend_usd(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT COALESCE(SUM(CAST(cost AS REAL)), 0.0) FROM attempts;", error);
   if (!stmt) return "0";
@@ -415,7 +415,7 @@ std::string Db::spend_usd(std::string* error) {
 }
 
 bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
-                    std::string* error) {
+                    std::string* error) const {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
