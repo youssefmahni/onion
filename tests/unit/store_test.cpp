@@ -200,9 +200,12 @@ TEST(CheckpointTest, WritesSnapshotManifestAndKeepsThree) {
   EXPECT_EQ(snapshots[2], "checkpoint-4004.db");
 
   // The manifest carries the merkle root and the snapshot hash.
-  std::ifstream manifest(dir / "checkpoint-4004.db.manifest");
-  std::string content((std::istreambuf_iterator<char>(manifest)),
-                      std::istreambuf_iterator<char>());
+  std::string content;
+  {
+    std::ifstream manifest(dir / "checkpoint-4004.db.manifest");
+    content.assign((std::istreambuf_iterator<char>(manifest)),
+                   std::istreambuf_iterator<char>());
+  }  // close before remove_all (Windows keeps open files locked)
   auto json = nlohmann::json::parse(content);
   EXPECT_EQ(json["merkle_root"].get<std::string>().size(), 64u);
   EXPECT_EQ(json["vector"]["dev0000000000000001"].get<int>(), 17);
