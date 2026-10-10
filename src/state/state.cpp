@@ -414,6 +414,8 @@ void StateWriter::rebuild_index() {
   }
   for (const store::Campaign& campaign : db_.campaigns(&error))
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
+  reserved_by_campaign_.clear();
+  seen_reserve_keys_.clear();
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -811,6 +813,12 @@ std::optional<CampaignInfo> StateWriter::campaign(std::string_view id) const {
 std::vector<CampaignInfo> StateWriter::campaigns() const {
   std::shared_lock lock(index_mutex_);
   return campaigns_;
+}
+
+std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = reserved_by_campaign_.find(std::string(campaign));
+  return found == reserved_by_campaign_.end() ? 0 : found->second;
 }
 
 std::uint64_t StateWriter::next_seq() const { return next_seq_.load(); }

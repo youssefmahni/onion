@@ -106,6 +106,9 @@ class StateWriter {
   bool leaf(std::string_view path) const;         // settled, cannot split
   bool needs_review(std::string_view path) const;
   std::optional<CampaignInfo> campaign(std::string_view id) const;
+  // Fleet-wide RESERVE totals per campaign (folded from every synced log,
+  // replay-safe and deduplicated by origin + hlc).
+  std::int64_t reserved_total(std::string_view campaign) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
@@ -161,6 +164,8 @@ class StateWriter {
   std::unordered_set<std::string> leaf_paths_;    // settled with end != children
   std::unordered_set<std::string> review_paths_;  // needs_review, state open
   std::vector<CampaignInfo> campaigns_;
+  std::map<std::string, std::int64_t> reserved_by_campaign_;
+  std::unordered_set<std::string> seen_reserve_keys_;  // origin:hlc
 };
 
 }  // namespace onion::state
