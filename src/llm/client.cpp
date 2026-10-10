@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
+#include <future>
 #include <iomanip>
 #include <mutex>
 #include <queue>
@@ -111,6 +112,71 @@ size_t read_header(char* data, size_t size, size_t count, void* opaque) {
   }
   return size * count;
 }
+
+class CpuPool {
+ public:
+  explicit CpuPool(std::size_t workers) {
+    workers = std::max<std::size_t>(1, workers);
+    workers_.reserve(workers);
+    for (std::size_t index = 0; index < workers; ++index)
+      workers_.emplace_back([this] { run(); });
+  }
+  ~CpuPool() {
+    { std::lock_guard<std::mutex> lock(mutex_); stopping_ = true; }
+    cv_.notify_all();
+    for (auto& worker : workers_) worker.join();
+  }
+  void submit(std::function<void()> job) {
+    { std::lock_guard<std::mutex> lock(mutex_); jobs_.push_back(std::move(job)); }
+    cv_.notify_one();
+  }
+ private:
+  void run() {
+    while (true) {
+      std::function<void()> job;
+      { std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+        if (stopping_ && jobs_.empty()) return;
+        job = std::move(jobs_.front()); jobs_.pop_front();
+      }
+      job();
+    }
+  }
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> jobs_;
+  bool stopping_{};
+  std::vector<std::thread> workers_;
+};
+
+Result parse_result(CURLcode code, long status, long retry_after,
+                    std::string body, double latency_s) {
+  Result result;
+  result.http_status = static_cast<int>(status);
+  result.retry_after_s = retry_after;
+  result.latency_s = latency_s;
+  if (code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
+  else if (code != CURLE_OK) result.kind = Kind::Transport;
+  else if (status == 429) result.kind = Kind::RateLimited;
+  else if (status == 401) result.kind = Kind::AuthError;
+  else if (status == 402) result.kind = Kind::BalanceError;
+  else if (status == 400 || status == 422) result.kind = Kind::ClientError;
+  else if (status == 503 || status >= 500) result.kind = Kind::ServerError;
+  else if (status < 200 || status >= 300) result.kind = Kind::Transport;
+  else {
+    result.finish_reason = json_string(body, "finish_reason");
+    result.content = json_string(body, "content");
+    const auto hit = json_uint(body, "prompt_cache_hit_tokens");
+    const auto miss = json_uint(body, "prompt_cache_miss_tokens");
+    const auto output = json_uint(body, "completion_tokens");
+    if (!hit || !miss || !output || result.finish_reason.empty()) result.kind = Kind::Malformed;
+    else {
+      result.in_hit = *hit; result.in_miss = *miss; result.out = *output;
+      result.kind = result.finish_reason == "length" ? Kind::Truncated : Kind::Ok;
+    }
+  }
+  return result;
+}
 }  // namespace
 
 std::string meter_cost(std::uint64_t cache_hit, std::uint64_t cache_miss,
@@ -184,7 +250,9 @@ struct Client::Impl {
     Clock::time_point started;
     curl_slist* headers{};
   };
-  explicit Impl(Options opts) : options(std::move(opts)), multi(curl_multi_init()) {
+  explicit Impl(Options opts)
+      : options(std::move(opts)), multi(curl_multi_init()),
+        parser_pool(std::thread::hardware_concurrency()) {
     curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
     worker = std::thread(&Impl::run, this);
   }
@@ -200,8 +268,10 @@ struct Client::Impl {
   bool stopping{};
   std::atomic<std::size_t> flight{};
   std::atomic<std::size_t> peak{};
+  std::atomic<std::size_t> active_peak{};
   std::atomic<std::size_t> connections{};
   std::atomic<long> http_version{};
+  CpuPool parser_pool;
   std::thread worker;
   void submit(Request request, std::function<void(Result)> done) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -231,6 +301,9 @@ struct Client::Impl {
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, options.timeout_s); curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
     curl_easy_setopt(easy, CURLOPT_PRIVATE, easy); curl_multi_add_handle(multi, easy);
+    const auto now = active.size();
+    auto observed = active_peak.load();
+    while (observed < now && !active_peak.compare_exchange_weak(observed, now)) {}
   }
   void finish(CURL* easy, CURLcode code) {
     auto found = active.find(easy); if (found == active.end()) return; Active item = std::move(*found->second); active.erase(found);
@@ -241,21 +314,14 @@ struct Client::Impl {
     connections.fetch_add(static_cast<std::size_t>(std::max(0L, opened)));
     http_version.store(version);
     curl_multi_remove_handle(multi, easy); curl_slist_free_all(item.headers); curl_easy_cleanup(easy);
-    Result result; result.http_status = static_cast<int>(status); result.retry_after_s = item.retry_after;
-    result.latency_s = std::chrono::duration<double>(Clock::now() - item.started).count();
-    if (code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
-    else if (code != CURLE_OK) result.kind = Kind::Transport;
-    else if (status == 429) result.kind = Kind::RateLimited;
-    else if (status == 401) result.kind = Kind::AuthError;
-    else if (status == 402) result.kind = Kind::BalanceError;
-    else if (status == 400 || status == 422) result.kind = Kind::ClientError;
-    else if (status == 503 || status >= 500) result.kind = Kind::ServerError;
-    else if (status < 200 || status >= 300) result.kind = Kind::Transport;
-    else { result.finish_reason = json_string(item.body, "finish_reason"); result.content = json_string(item.body, "content");
-      auto hit = json_uint(item.body, "prompt_cache_hit_tokens"); auto miss = json_uint(item.body, "prompt_cache_miss_tokens"); auto output = json_uint(item.body, "completion_tokens");
-      if (!hit || !miss || !output || result.finish_reason.empty()) result.kind = Kind::Malformed;
-      else { result.in_hit=*hit; result.in_miss=*miss; result.out=*output; result.kind = result.finish_reason == "length" ? Kind::Truncated : Kind::Ok; }
-    }
+    auto parsed = std::make_shared<std::promise<Result>>();
+    auto future = parsed->get_future();
+    parser_pool.submit([promise = std::move(parsed), code, status, retry_after = item.retry_after,
+                        body = std::move(item.body),
+                        latency = std::chrono::duration<double>(Clock::now() - item.started).count()]() mutable {
+      promise->set_value(parse_result(code, status, retry_after, std::move(body), latency));
+    });
+    Result result = future.get();
     if ((result.kind == Kind::RateLimited || result.kind == Kind::ServerError) && item.task.attempts < 3) {
       item.task.attempts++; item.task.ready = Clock::now() + std::chrono::seconds(std::max(1L, result.retry_after_s));
       std::lock_guard<std::mutex> lock(mutex); queued.push_back(std::move(item.task)); cv.notify_all(); return;
@@ -291,6 +357,7 @@ Client::~Client() = default;
 void Client::submit(Request request, std::function<void(Result)> done) { impl_->submit(std::move(request), std::move(done)); }
 std::size_t Client::in_flight() const { return impl_->flight.load(); }
 std::size_t Client::peak_in_flight() const { return impl_->peak.load(); }
+std::size_t Client::peak_active_requests() const { return impl_->active_peak.load(); }
 std::size_t Client::connections_opened() const { return impl_->connections.load(); }
 long Client::negotiated_http_version() const { return impl_->http_version.load(); }
 bool curl_supports_http2() {

@@ -31,7 +31,12 @@ void Limiter::on_window(const LimitWindow& window) {
     return;
   }
 
-  if (successful && !baseline_s_ && limit_ == starting_limit_) baseline_s_ = window.median_latency_s;
+  if (successful && !baseline_s_ && limit_ == starting_limit_) {
+    baseline_s_ = window.median_latency_s;
+    // The first low-load sample anchors the first hourly probe at t=3600,
+    // rather than accidentally treating the next 30-second window as due.
+    last_probe_started_s_ = 0;
+  }
   if (transport_pressure) {
     limit_ = std::max(1, limit_ / 2);
     hold_next_window_ = true;

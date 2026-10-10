@@ -60,8 +60,12 @@ the technical progress log in `docs/agent/PROGRESS.md`.
   reservation as uncertain spend and is marked in the benchmark metering log.
 - Added a 1,000-request accept-without-response regression: every request
   times out at one second and the circuit breaker opens after 20 failures.
+- Added the CPU parsing pool, sized to available cores, and verified that
+  process thread count is unchanged at 100 and 1,000 simultaneous requests.
+- Added capacity, fixed-limit connection-reuse, half-budget, and compressed
+  adaptive-limiter trace benchmark modes and their automated contracts.
 
 ## Next approved task
 
-- Await owner approval before starting the M2 1,000-request benchmark or any
-  real DeepSeek call.
+- Run final M2 sanitizer/full-suite/CI verification and prepare the M2 gate
+  report. Do not make real DeepSeek calls.

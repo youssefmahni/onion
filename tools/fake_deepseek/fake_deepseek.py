@@ -45,6 +45,8 @@ class FakeDeepSeek:
 
 def handler_for(fake):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *_args):
             return
 
@@ -92,7 +94,9 @@ def handler_for(fake):
                     return
                 route = fake.route(prompt)
                 errors = fake.scenario.get("errors", {})
-                status = 429 if random.random() < errors.get("rate_429", 0.0) else 503 if random.random() < errors.get("rate_503", 0.0) else 200
+                status = errors.get("status", 0)
+                if not status:
+                    status = 429 if random.random() < errors.get("rate_429", 0.0) else 503 if random.random() < errors.get("rate_503", 0.0) else 200
                 if status != 200:
                     self.send_json(status, {"error": {"message": "scripted error"}}, {"Retry-After": errors.get("retry_after_s", 1)})
                     return

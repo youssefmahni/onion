@@ -126,6 +126,7 @@ class Client {
   void submit(Request request, std::function<void(Result)> done);
   std::size_t in_flight() const;
   std::size_t peak_in_flight() const;
+  std::size_t peak_active_requests() const;
   std::size_t connections_opened() const;
   long negotiated_http_version() const;
 

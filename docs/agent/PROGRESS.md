@@ -6,6 +6,14 @@
 - Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
 
 ## Log (newest first)
+- 2026-10-10: Added core-sized CPU reply-parsing pool and fixed-limit bench
+  controls · local fake-server capacity run completed 1,000 requests at limit
+  1,000; the limit-100 reuse run opened 100 connections for 1,000 requests;
+  half-budget run started 500 and refused 500 · no real calls
+- 2026-10-10: Added compressed 30-second adaptive traces for healthy,
+  rate-limited and slow-under-load observations · corrected first-baseline
+  scheduling so the initial probe is one hour later, not in the next window ·
+  no real calls
 - 2026-10-10: M2 timeout accounting: timed-out requests now retain their full
   reservation as uncertain spend; added a 1,000-request one-second
   accept-without-response regression that verifies Timeout classification and
