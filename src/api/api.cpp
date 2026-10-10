@@ -22,7 +22,8 @@ struct Server::Impl {
 namespace {
 
 bool authorized(const httplib::Request& request,
-                const Server::Options& options, httplib::Response& response) {
+                const Server::Options& options, int bound_port,
+                httplib::Response& response) {
   // Token: X-Onion-Token header or ?token= query parameter.
   std::string token;
   if (request.has_header("X-Onion-Token"))
@@ -40,7 +41,7 @@ bool authorized(const httplib::Request& request,
   if (request.has_header("Origin"))
     origin = request.get_header_value("Origin");
   const std::string expected =
-      "http://127.0.0.1:" + std::to_string(options.port);
+      "http://127.0.0.1:" + std::to_string(bound_port);
   if (origin != expected) {
     response.status = 403;
     response.set_content("{\"error\":\"foreign origin\"}", "application/json");
@@ -97,7 +98,9 @@ bool Server::start(std::string* error) {
     impl_->server->Post(
         path, [this, action](const httplib::Request& request,
                              httplib::Response& response) {
-          if (!authorized(request, impl_->options, response)) return;
+          if (!authorized(request, impl_->options, impl_->port.load(),
+                           response))
+            return;
           auto json = body_or_error(request, response);
           if (json.is_discarded()) return;
           const std::string id = json.value("id", std::string{});
@@ -137,10 +140,15 @@ bool Server::start(std::string* error) {
 
   impl_->running.store(true);
   impl_->thread = std::thread([this] {
-    const int bound =
-        impl_->server->bind_to_port("127.0.0.1", impl_->options.port);
-    impl_->port.store(bound);
-    if (bound == 0) impl_->running.store(false);
+    if (impl_->options.port == 0) {
+      const int bound = impl_->server->bind_to_any_port("127.0.0.1");
+      impl_->port.store(bound);
+      if (bound < 0) impl_->running.store(false);
+    } else {
+      impl_->port.store(impl_->options.port);
+      if (!impl_->server->bind_to_port("127.0.0.1", impl_->options.port))
+        impl_->running.store(false);
+    }
     while (impl_->running.load()) {
       if (!impl_->server->listen_after_bind()) break;
     }
