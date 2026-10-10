@@ -254,10 +254,10 @@ void StateWriter::rebuild_index() {
   review_paths_.clear();
   campaigns_.clear();
   for (const store::Settle& settle : db_.settles(&error))
-    settled_paths_.push_back(settle.path);
+    settled_paths_.insert(settle.path);
   for (const store::Review& review : db_.open_reviews(&error)) {
     if (review.state == "open" || review.state.empty())
-      review_paths_.push_back(review.path);
+      review_paths_.insert(review.path);
   }
   for (const store::Campaign& campaign : db_.campaigns(&error))
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
@@ -280,10 +280,7 @@ void StateWriter::rebuild_index() {
         if (!payload.contains("path")) continue;
         const std::string path = payload["path"].get<std::string>();
         const std::string end = payload.value("end", std::string{"children"});
-        if (end != "children" &&
-            std::find(leaf_paths_.begin(), leaf_paths_.end(), path) ==
-                leaf_paths_.end())
-          leaf_paths_.push_back(path);
+        if (end != "children") leaf_paths_.insert(path);
       }
     }
   }
@@ -308,6 +305,15 @@ void StateWriter::fold(const log::Record& record, std::string* error) {
       statement->bind(2, payload.value("note", std::string{}), &bind_error);
       statement->step(&bind_error);
     }
+  } else if (type == "TOMBSTONE") {
+    const auto& payload = record.payload;
+    auto statement = db_.prepare(
+        "UPDATE nodes SET tombstone=1 WHERE path=?1;", error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, payload.at("path").get<std::string>(), &bind_error);
+      statement->step(&bind_error);
+    }
   }
   // ATOMIC, RESERVE, CLAIM, REEXPAND, RETITLE, TOMBSTONE, membership and
   // CHECKPOINT records are append-only in M3; their store effects arrive
@@ -317,23 +323,15 @@ void StateWriter::fold(const log::Record& record, std::string* error) {
   std::unique_lock lock(index_mutex_);
   if (type == "SETTLE") {
     const std::string path = record.payload.at("path").get<std::string>();
-    if (std::find(settled_paths_.begin(), settled_paths_.end(), path) ==
-        settled_paths_.end())
-      settled_paths_.push_back(path);
+    settled_paths_.insert(path);
     const std::string end = record.payload.value("end", std::string{"children"});
-    if (end != "children" &&
-        std::find(leaf_paths_.begin(), leaf_paths_.end(), path) == leaf_paths_.end())
-      leaf_paths_.push_back(path);
+    if (end != "children") leaf_paths_.insert(path);
   } else if (type == "NEEDS_REVIEW") {
     const std::string path = record.payload.at("path").get<std::string>();
-    if (std::find(review_paths_.begin(), review_paths_.end(), path) ==
-        review_paths_.end())
-      review_paths_.push_back(path);
+    review_paths_.insert(path);
   } else if (type == "REVIEW") {
     const std::string path = record.payload.at("path").get<std::string>();
-    review_paths_.erase(std::remove(review_paths_.begin(), review_paths_.end(),
-                                    path),
-                        review_paths_.end());
+    review_paths_.erase(path);
   } else if (type == "CAMPAIGN") {
     const auto& payload = record.payload;
     const std::string id = payload.at("id").get<std::string>();
@@ -526,20 +524,17 @@ log::Segments& StateWriter::segments() { return *segments_; }
 
 bool StateWriter::settled(std::string_view path) const {
   std::shared_lock lock(index_mutex_);
-  return std::find(settled_paths_.begin(), settled_paths_.end(),
-                   std::string(path)) != settled_paths_.end();
+  return settled_paths_.count(std::string(path)) != 0;
 }
 
 bool StateWriter::leaf(std::string_view path) const {
   std::shared_lock lock(index_mutex_);
-  return std::find(leaf_paths_.begin(), leaf_paths_.end(), std::string(path)) !=
-         leaf_paths_.end();
+  return leaf_paths_.count(std::string(path)) != 0;
 }
 
 bool StateWriter::needs_review(std::string_view path) const {
   std::shared_lock lock(index_mutex_);
-  return std::find(review_paths_.begin(), review_paths_.end(),
-                   std::string(path)) != review_paths_.end();
+  return review_paths_.count(std::string(path)) != 0;
 }
 
 std::optional<CampaignInfo> StateWriter::campaign(std::string_view id) const {

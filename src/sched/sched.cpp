@@ -212,8 +212,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                    {"spec", {{"scope", spec.scope},
                              {"loop_budget", spec.loop_budget},
                              {"mode", spec.mode},
-                             {"gate", spec.gate},
-                             {"floor", spec.floor},
+                             // Records never contain floats (decision 0003):
+                             // scores are exact decimal strings.
+                             {"gate", std::to_string(spec.gate)},
+                             {"floor", std::to_string(spec.floor)},
                              {"chunk", spec.chunk},
                              {"model", spec.model}}},
                    {"state", "running"}})}});
@@ -238,24 +240,34 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     return campaign && campaign->state != "running";
   };
 
+  // Local node cache: the engine is the only writer of new nodes, so the
+  // cache is refreshed from SQLite only when the snapshot drains; commits
+  // append their children directly. This keeps the ticket index O(n log n)
+  // instead of one full store query per ticket.
+  std::vector<store::Node> node_cache;
+  std::vector<std::string> review_cache;
+  bool cache_valid = false;
   const auto refresh_tickets = [&]() {
     std::string error;
-    std::vector<store::Node> all_nodes;
-    if (spec.scope.empty())
-      all_nodes = writer.db().all_nodes(&error);
-    else
-      for (const std::string& prefix : spec.scope)
-        for (const store::Node& node :
-             writer.db().nodes_with_path_prefix(prefix, &error))
-          all_nodes.push_back(node);
-    std::vector<std::string> reviews;
-    for (const store::Review& review : writer.db().open_reviews(&error))
-      if (review.state == "open" || review.state.empty())
-        reviews.push_back(review.path);
-    return order_tickets(all_nodes,
+    if (!cache_valid) {
+      node_cache.clear();
+      if (spec.scope.empty())
+        node_cache = writer.db().all_nodes(&error);
+      else
+        for (const std::string& prefix : spec.scope)
+          for (const store::Node& node :
+               writer.db().nodes_with_path_prefix(prefix, &error))
+            node_cache.push_back(node);
+      review_cache.clear();
+      for (const store::Review& review : writer.db().open_reviews(&error))
+        if (review.state == "open" || review.state.empty())
+          review_cache.push_back(review.path);
+      cache_valid = true;
+    }
+    return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
                          [&](std::string_view path) { return writer.leaf(path); },
-                         reviews, spec);
+                         review_cache, spec);
   };
 
   for (;;) {
@@ -273,6 +285,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     }
 
     std::vector<Ticket> tickets = refresh_tickets();
+    if (tickets.empty() && waiting.empty()) cache_valid = false;
     if (tickets.empty() && waiting.empty()) {
       result.end_reason = "drained";
       break;
@@ -386,6 +399,18 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"end", "children"},
                        {"campaign", spec.id}}));
         writer.submit(state::CommitTerminal{std::move(records)});
+        if (cache_valid) {
+          int counter = 0;
+          for (const gate::Child& child : chosen.children) {
+            char id[24];
+            std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+            store::Node child_node;
+            child_node.path = ticket.path + "-" + id;
+            child_node.layer = ticket.layer + 1;
+            child_node.title = child.title;
+            node_cache.push_back(std::move(child_node));
+          }
+        }
         result.settled++;
         result.atomic += atomic;
         settled_samples.push_back(SettledSample{atomic > 0 ? 1 : 0,
@@ -416,6 +441,19 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                              {"attempts", funnel_result.attempts.size()},
                              {"score", std::to_string(chosen.score)}}));
         writer.submit(state::CommitTerminal{std::move(records)});
+        if (cache_valid) {
+          review_cache.push_back(ticket.path);  // pause the subtree now
+          int counter = 0;
+          for (const gate::Child& child : chosen.children) {
+            char id[24];
+            std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+            store::Node child_node;
+            child_node.path = ticket.path + "-" + id;
+            child_node.layer = ticket.layer + 1;
+            child_node.title = child.title;
+            node_cache.push_back(std::move(child_node));
+          }
+        }
         result.reviews++;
         break;
       }

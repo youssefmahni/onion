@@ -231,6 +231,10 @@ if(BUILD_TESTING)
   target_link_libraries(onion_sched_test PRIVATE onion::sched GTest::gtest_main)
   gtest_discover_tests(onion_sched_test)
 
+  add_executable(onion_engine_test tests/unit/engine_test.cpp)
+  target_link_libraries(onion_engine_test PRIVATE onion::sched GTest::gtest_main)
+  gtest_discover_tests(onion_engine_test)
+
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
   gtest_discover_tests(onion_limiter_test)

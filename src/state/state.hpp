@@ -10,6 +10,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -131,9 +132,9 @@ class StateWriter {
 
   // Shared read index, rebuilt by replay and kept current by the fold.
   mutable std::shared_mutex index_mutex_;
-  std::vector<std::string> settled_paths_;
-  std::vector<std::string> leaf_paths_;      // settled with end != children
-  std::vector<std::string> review_paths_;    // needs_review with state open
+  std::unordered_set<std::string> settled_paths_;
+  std::unordered_set<std::string> leaf_paths_;    // settled with end != children
+  std::unordered_set<std::string> review_paths_;  // needs_review, state open
   std::vector<CampaignInfo> campaigns_;
 };
 
