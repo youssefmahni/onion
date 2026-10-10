@@ -363,6 +363,29 @@ std::size_t Client::peak_in_flight() const { return impl_->peak.load(); }
 std::size_t Client::peak_active_requests() const { return impl_->active_peak.load(); }
 std::size_t Client::connections_opened() const { return impl_->connections.load(); }
 long Client::negotiated_http_version() const { return impl_->http_version.load(); }
+std::string http_get(const std::string& url, const std::string& api_key,
+                    long& http_status, long& http_version) {
+  CURL* easy = curl_easy_init();
+  std::string body;
+  curl_slist* headers = nullptr;
+  if (!api_key.empty())
+    headers = curl_slist_append(headers, ("Authorization: Bearer " + api_key).c_str());
+  curl_easy_setopt(easy, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_body);
+  curl_easy_setopt(easy, CURLOPT_WRITEDATA, &body);
+  curl_easy_setopt(easy, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+  curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_perform(easy);
+  curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_status);
+  curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &http_version);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(easy);
+  return body;
+}
+
 bool curl_supports_http2() {
   const auto* info = curl_version_info(CURLVERSION_NOW);
   return info != nullptr && (info->features & CURL_VERSION_HTTP2) != 0;

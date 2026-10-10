@@ -138,4 +138,7 @@ class Client {
 
 bool curl_supports_http2();
 std::string curl_version();
+// Blocking GET used by the developer CLI (free /models check).
+std::string http_get(const std::string& url, const std::string& api_key,
+                    long& http_status, long& http_version);
 }
