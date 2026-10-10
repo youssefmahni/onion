@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onion — node</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 60rem; }
+  h1 { font-size: 1.25rem; }
+  section { border: 1px solid #ccc; border-radius: 6px; padding: .75rem 1rem; margin: 1rem 0; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid #ddd; }
+  button { margin-right: .4rem; }
+  .error { color: #c33; }
+</style>
+</head>
+<body>
+<h1>Onion — local node</h1>
+<div id="token-error" class="error"></div>
+
+<section>
+  <h2>Campaigns</h2>
+  <table id="campaigns"><tr><th>id</th><th>state</th><th>model</th><th>loop budget</th><th>actions</th></tr></table>
+</section>
+
+<section>
+  <h2>Review queue</h2>
+  <table id="reviews"><tr><th>path</th><th>reason</th><th>actions</th></tr></table>
+</section>
+
+<section>
+  <h2>Node</h2>
+  <table>
+    <tr><td>running</td><td id="node-running"></td></tr>
+    <tr><td>spend (USD)</td><td id="spend"></td></tr>
+    <tr><td>settled nodes</td><td id="settled"></td></tr>
+    <tr><td>lanes</td><td id="lanes"></td></tr>
+  </table>
+  <p><button id="stop">stop node</button></p>
+</section>
+
+<script>
+"use strict";
+const token = new URLSearchParams(location.search).get("token") ||
+              localStorage.getItem("onion-token") || "";
+if (!token) {
+  document.getElementById("token-error").textContent =
+    "No token: open this page with ?token=<api-token>, then it is remembered.";
+}
+if (token) localStorage.setItem("onion-token", token);
+
+const headers = () => ({
+  "X-Onion-Token": token,
+  "Content-Type": "application/json",
+});
+
+async function post(path, body) {
+  const response = await fetch(path, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  return response.ok;
+}
+
+function render(state) {
+  const campaigns = document.getElementById("campaigns");
+  campaigns.innerHTML = "<tr><th>id</th><th>state</th><th>model</th><th>loop budget</th><th>actions</th></tr>";
+  for (const campaign of state.campaigns || []) {
+    const row = campaigns.insertRow();
+    row.insertCell().textContent = campaign.id;
+    row.insertCell().textContent = campaign.state;
+    row.insertCell().textContent = (campaign.spec && campaign.spec.model) || "";
+    row.insertCell().textContent = (campaign.spec && campaign.spec.loop_budget) || "";
+    const actions = row.insertCell();
+    if (campaign.state === "running") {
+      const pause = document.createElement("button");
+      pause.textContent = "pause";
+      pause.onclick = () => post("/api/campaign/pause", { id: campaign.id }).then(refresh);
+      actions.appendChild(pause);
+    }
+    if (campaign.state === "paused") {
+      const resume = document.createElement("button");
+      resume.textContent = "resume";
+      resume.onclick = () => post("/api/campaign/resume", { id: campaign.id }).then(refresh);
+      actions.appendChild(resume);
+    }
+    if (campaign.state !== "stopped") {
+      const stop = document.createElement("button");
+      stop.textContent = "stop";
+      stop.onclick = () => post("/api/campaign/stop", { id: campaign.id }).then(refresh);
+      actions.appendChild(stop);
+    }
+  }
+
+  const reviews = document.getElementById("reviews");
+  reviews.innerHTML = "<tr><th>path</th><th>reason</th><th>actions</th></tr>";
+  for (const review of state.reviews || []) {
+    const row = reviews.insertRow();
+    row.insertCell().textContent = review.path;
+    row.insertCell().textContent = review.reason;
+    const actions = row.insertCell();
+    const accept = document.createElement("button");
+    accept.textContent = "accept";
+    accept.onclick = () => post("/api/review/accept", { path: review.path }).then(refresh);
+    const retry = document.createElement("button");
+    retry.textContent = "retry";
+    retry.onclick = () => post("/api/review/retry", { path: review.path }).then(refresh);
+    const reject = document.createElement("button");
+    reject.textContent = "reject";
+    reject.onclick = () => post("/api/review/reject", { path: review.path }).then(refresh);
+    actions.append(accept, retry, reject);
+  }
+
+  document.getElementById("node-running").textContent =
+    state.node && state.node.running ? "yes" : "no";
+  document.getElementById("spend").textContent = state.spend_usd || "0";
+  document.getElementById("settled").textContent = state.settled_nodes || 0;
+  document.getElementById("lanes").textContent = (state.lanes || []).join(", ");
+}
+
+async function refresh() {
+  const response = await fetch("/api/state");
+  if (response.ok) render(await response.json());
+}
+
+document.getElementById("stop").onclick = () => post("/api/stop", {}).then(refresh);
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

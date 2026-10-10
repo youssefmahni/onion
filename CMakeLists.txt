@@ -85,9 +85,44 @@ if(WIN32)
     WIN32_LEAN_AND_MEAN)
 endif()
 
+# Monocypher (BLAKE2b, Ed25519) and nlohmann/json are production dependencies
+# of the data layer: records are hashed and canonicalized by the engine.
+FetchContent_Declare(
+  monocypher
+  URL https://monocypher.org/download/monocypher-4.0.2.tar.gz
+  URL_HASH SHA256=38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(monocypher)
+add_library(onion_monocypher STATIC
+  "${monocypher_SOURCE_DIR}/src/monocypher.c"
+  "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
+target_include_directories(onion_monocypher PUBLIC
+  "${monocypher_SOURCE_DIR}/src"
+  "${monocypher_SOURCE_DIR}/src/optional")
+
+FetchContent_Declare(
+  nlohmann_json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
+
+FetchContent_Declare(
+  sqlite
+  URL https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip
+  URL_HASH SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(sqlite)
+add_library(onion_sqlite STATIC "${sqlite_SOURCE_DIR}/sqlite3.c")
+target_include_directories(onion_sqlite PUBLIC "${sqlite_SOURCE_DIR}")
+
 # Data layer
-onion_add_module(log)
-onion_add_module(store)
+onion_add_compiled_module(log src/log/log.cpp)
+target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json)
+target_link_libraries(log PUBLIC onion::core onion::platform)
+onion_add_compiled_module(store src/store/store.cpp)
+target_link_libraries(store PUBLIC onion_sqlite)
+target_link_libraries(store PUBLIC onion::core onion::platform)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
   # keeps certificate validation on the Windows trust store.
@@ -112,7 +147,8 @@ else()
 endif()
 find_package(Threads REQUIRED)
 onion_add_compiled_module(llm src/llm/limiter.cpp src/llm/client.cpp)
-target_link_libraries(llm PUBLIC ${ONION_CURL_TARGET} Threads::Threads)
+target_link_libraries(llm PUBLIC ${ONION_CURL_TARGET} Threads::Threads
+  nlohmann_json::nlohmann_json)
 if(WIN32)
   target_compile_definitions(llm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
@@ -129,36 +165,40 @@ target_link_libraries(swim INTERFACE onion::core onion::platform)
 target_link_libraries(profile INTERFACE onion::core onion::gpu onion::platform)
 
 # Engine layer
-onion_add_module(gate)
-onion_add_module(sched)
-onion_add_module(state)
-target_link_libraries(gate INTERFACE onion::core onion::llm)
-target_link_libraries(sched INTERFACE onion::core onion::profile)
-target_link_libraries(state INTERFACE onion::core onion::log onion::store)
+onion_add_compiled_module(gate src/gate/gate.cpp)
+target_link_libraries(gate PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(gate PUBLIC onion::core onion::llm)
+onion_add_compiled_module(sched src/sched/sched.cpp)
+target_link_libraries(sched PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(sched PUBLIC onion::core onion::gate onion::state)
+onion_add_compiled_module(state src/state/state.cpp)
+target_link_libraries(state PUBLIC onion::core onion::log onion::store)
 
 # Interface layer
-onion_add_module(api)
+FetchContent_Declare(
+  httplib
+  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
+  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(httplib)
+onion_add_compiled_module(api src/api/api.cpp)
+# The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
+# httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
+# httplib::httplib CMake target would pull a Homebrew OpenSSL that cannot
+# link the Intel macOS 12 compatibility build.
+target_include_directories(api PUBLIC "${httplib_SOURCE_DIR}")
+target_link_libraries(api PUBLIC nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(api PUBLIC ws2_32)
+endif()
+target_link_libraries(api PUBLIC onion::state)
 onion_add_module(cli)
-target_link_libraries(api INTERFACE onion::state)
 target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
 
 add_executable(onion_smoke tests/unit/smoke_test.cpp)
 target_link_libraries(onion_smoke PRIVATE onion::cli)
 
 if(BUILD_TESTING)
-  FetchContent_Declare(
-    monocypher
-    URL https://monocypher.org/download/monocypher-4.0.2.tar.gz
-    URL_HASH SHA256=38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-  FetchContent_MakeAvailable(monocypher)
-  add_library(monocypher STATIC
-    "${monocypher_SOURCE_DIR}/src/monocypher.c"
-    "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
-  target_include_directories(monocypher PUBLIC
-    "${monocypher_SOURCE_DIR}/src"
-    "${monocypher_SOURCE_DIR}/src/optional")
-
   FetchContent_Declare(
     googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
@@ -179,6 +219,34 @@ if(BUILD_TESTING)
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
   gtest_discover_tests(onion_platform_test)
+
+  add_executable(onion_log_test tests/unit/log_test.cpp)
+  target_link_libraries(onion_log_test PRIVATE onion::log GTest::gtest_main)
+  gtest_discover_tests(onion_log_test)
+
+  add_executable(onion_store_test tests/unit/store_test.cpp)
+  target_link_libraries(onion_store_test PRIVATE onion::store GTest::gtest_main)
+  gtest_discover_tests(onion_store_test)
+
+  add_executable(onion_state_test tests/unit/state_test.cpp)
+  target_link_libraries(onion_state_test PRIVATE onion::state GTest::gtest_main)
+  gtest_discover_tests(onion_state_test)
+
+  add_executable(onion_gate_test tests/unit/gate_test.cpp)
+  target_link_libraries(onion_gate_test PRIVATE onion::gate GTest::gtest_main)
+  gtest_discover_tests(onion_gate_test)
+
+  add_executable(onion_sched_test tests/unit/sched_test.cpp)
+  target_link_libraries(onion_sched_test PRIVATE onion::sched GTest::gtest_main)
+  gtest_discover_tests(onion_sched_test)
+
+  add_executable(onion_engine_test tests/unit/engine_test.cpp)
+  target_link_libraries(onion_engine_test PRIVATE onion::sched GTest::gtest_main)
+  gtest_discover_tests(onion_engine_test)
+
+  add_executable(onion_api_test tests/unit/api_test.cpp)
+  target_link_libraries(onion_api_test PRIVATE onion::api GTest::gtest_main)
+  gtest_discover_tests(onion_api_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
@@ -204,7 +272,7 @@ if(BUILD_TESTING)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
   add_executable(onion_golden_test tests/golden/golden_test.cpp)
-  target_link_libraries(onion_golden_test PRIVATE monocypher GTest::gtest_main)
+  target_link_libraries(onion_golden_test PRIVATE onion_monocypher GTest::gtest_main)
   target_compile_definitions(onion_golden_test PRIVATE
     ONION_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/expected")
   gtest_discover_tests(onion_golden_test)
@@ -223,5 +291,7 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-add_executable(data_depot src/cli/main.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm)
+add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store)
+target_compile_definitions(data_depot PRIVATE
+  ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")

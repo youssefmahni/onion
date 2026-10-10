@@ -70,3 +70,25 @@ Cost / duration: ~30 minutes, no money.
 ## Decision records awaiting the owner (Proposed)
 
 - None yet.
+
+---
+
+### OA-8 · Decide review-children storage (decision 0008 §3) · M3 · status: open
+
+Why: The engine stores a NEEDS_REVIEW node's children (with the review) so `review accept` settles without spending more, preserving "spend nothing more on this node". The alternative is re-running the node on accept.
+
+Steps: read docs/decisions/0008-campaign-file-stop-rule-review-children.md §3 and reply with one of: "keep stored children" (record becomes Accepted) or "re-run on accept" (the agent changes the fold for REVIEW/NEEDS_REVIEW).
+
+Cost / duration: none.
+
+---
+
+### OA-9 · M3 real campaign on the corpus copy (optional) · M3 · status: open
+
+Why: The M3 real campaign ran on a synthetic root ("Order Processing") because the corpus copy is pending (OA-2). Running one real TD from the corpus would confirm the gate behaviour on production-shaped nodes.
+
+Prerequisites: OA-2 resolved; `~/onion-data` populated.
+
+Steps: the agent provides a runbook once OA-2 is done; expected cost ≈ $0.02 for 10 nodes at light settings.
+
+Cost / duration: ≤ 150 calls, ≈ $0.02, ~20 minutes.

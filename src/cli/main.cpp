@@ -249,14 +249,16 @@ int adaptive_bench(int argc, char** argv) {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
-  if (argc < 2 || std::string(argv[1]) != "llm") {
+#include "commands.hpp"
+
+int llm_main(int argc, char** argv) {
+  if (argc < 3) {
     std::cerr << "usage: data_depot llm bench --url <fake-server-url> --requests N\n";
     return 2;
   }
-  if (argc >= 3 && std::string(argv[2]) == "limiter-trace") return limiter_trace(argc, argv);
-  if (argc >= 3 && std::string(argv[2]) == "models") return llm_models(argc, argv);
-  if (argc >= 3 && std::string(argv[2]) == "probe") return llm_probe(argc, argv);
+  if (std::string(argv[2]) == "limiter-trace") return limiter_trace(argc, argv);
+  if (std::string(argv[2]) == "models") return llm_models(argc, argv);
+  if (std::string(argv[2]) == "probe") return llm_probe(argc, argv);
   std::string url;
   int requests = 0;
   int timeout_s = 120;
@@ -332,4 +334,21 @@ int main(int argc, char** argv) {
   std::cout << "breaker_open=" << (breaker.open() ? "true" : "false")
             << " breaker_reason=" << breaker.reason() << "\n";
   return failed == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::cerr
+        << "usage: data_depot llm|node|campaign|review|dev-import|export-csv ...\n";
+    return 2;
+  }
+  const std::string command(argv[1]);
+  if (command == "llm") return llm_main(argc, argv);
+  if (command == "node") return node_cmd(argc, argv);
+  if (command == "campaign") return campaign_cmd(argc, argv);
+  if (command == "review") return review_cmd(argc, argv);
+  if (command == "dev-import") return dev_import_cmd(argc, argv);
+  if (command == "export-csv") return export_csv_cmd(argc, argv);
+  std::cerr << "unknown command: " << command << "\n";
+  return 2;
 }
