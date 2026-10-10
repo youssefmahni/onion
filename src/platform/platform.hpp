@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -42,6 +43,11 @@ struct Sample {
   std::optional<bool> on_battery;
 };
 Sample sample();
+
+// Raises the Unix soft descriptor limit to the hard limit where permitted, then
+// returns the usable number of simultaneous outbound requests (64 descriptors
+// remain reserved for logs, listeners, and other engine resources).
+std::size_t outbound_request_ceiling();
 
 class KeyStore {
  public:

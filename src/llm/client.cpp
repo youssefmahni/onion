@@ -1,4 +1,5 @@
 #include "llm/llm.hpp"
+#include "platform/platform.hpp"
 
 #include <curl/curl.h>
 
@@ -16,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace onion::llm {
 namespace {
@@ -163,12 +165,29 @@ int CircuitBreaker::consecutive_transport_failures() const { return failures_; }
 
 struct Client::Impl {
   struct Task { Request request; std::function<void(Result)> done; int attempts{}; Clock::time_point ready{}; };
-  struct Active { Task task; std::string payload; std::string body; long retry_after{}; Clock::time_point started; curl_slist* headers{}; };
+  struct Active {
+    Task task;
+    // These members are individually heap-owned by Active.  An Active stays
+    // alive until libcurl has removed the easy handle from the multi handle.
+    std::string url;
+    std::string payload;
+    std::string body;
+    long retry_after{};
+    Clock::time_point started;
+    curl_slist* headers{};
+  };
   explicit Impl(Options opts) : options(std::move(opts)), multi(curl_multi_init()), worker(&Impl::run, this) {}
   ~Impl() { { std::lock_guard<std::mutex> lock(mutex); stopping = true; } cv.notify_all(); worker.join(); curl_multi_cleanup(multi); }
   Options options; CURLM* multi{}; std::thread worker; std::mutex mutex; std::condition_variable cv;
-  std::deque<Task> queued; std::unordered_map<CURL*, std::unique_ptr<Active>> active; bool stopping{}; std::atomic<std::size_t> flight{};
-  void submit(Request request, std::function<void(Result)> done) { std::lock_guard<std::mutex> lock(mutex); queued.push_back({std::move(request), std::move(done), 0, Clock::now()}); flight++; cv.notify_all(); }
+  std::deque<Task> queued; std::unordered_map<CURL*, std::unique_ptr<Active>> active; bool stopping{}; std::atomic<std::size_t> flight{}; std::atomic<std::size_t> peak{};
+  void submit(Request request, std::function<void(Result)> done) {
+    std::lock_guard<std::mutex> lock(mutex);
+    queued.push_back({std::move(request), std::move(done), 0, Clock::now()});
+    const auto now = flight.fetch_add(1) + 1;
+    auto observed = peak.load();
+    while (observed < now && !peak.compare_exchange_weak(observed, now)) {}
+    cv.notify_all();
+  }
   void add(Task task) {
     CURL* easy = curl_easy_init();
     auto item_ptr = std::make_unique<Active>();
@@ -176,10 +195,11 @@ struct Client::Impl {
     active.emplace(easy, std::move(item_ptr));
     item.task = std::move(task); item.started = Clock::now();
     const auto& request = item.task.request;
+    item.url = options.base_url + "/chat/completions";
     item.payload = "{\"model\":\"" + json_escape(request.model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(request.system) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(request.user) + "\"}],\"max_tokens\":" + std::to_string(request.max_tokens) + ",\"temperature\":" + std::to_string(request.temperature) + ",\"stream\":false,\"reasoning_effort\":\"none\"}";
     item.headers = curl_slist_append(item.headers, "Content-Type: application/json");
     if (!options.api_key.empty()) item.headers = curl_slist_append(item.headers, ("Authorization: Bearer " + options.api_key).c_str());
-    curl_easy_setopt(easy, CURLOPT_URL, (options.base_url + "/chat/completions").c_str());
+    curl_easy_setopt(easy, CURLOPT_URL, item.url.c_str());
     curl_easy_setopt(easy, CURLOPT_POSTFIELDS, item.payload.c_str());
     curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, static_cast<long>(item.payload.size()));
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, item.headers);
@@ -211,10 +231,16 @@ struct Client::Impl {
   }
   void run() {
     while (true) {
+      std::vector<Task> ready;
       { std::unique_lock<std::mutex> lock(mutex); cv.wait_for(lock, std::chrono::milliseconds(10), [&] { return stopping || !queued.empty(); });
-        auto now = Clock::now(); for (auto it = queued.begin(); it != queued.end();) { if (it->ready <= now) { Task task=std::move(*it); it=queued.erase(it); lock.unlock(); add(std::move(task)); lock.lock(); } else ++it; }
+        const auto now = Clock::now();
+        for (auto it = queued.begin(); it != queued.end() && active.size() + ready.size() < options.max_in_flight;) {
+          if (it->ready <= now) { ready.push_back(std::move(*it)); it = queued.erase(it); }
+          else ++it;
+        }
         if (stopping && queued.empty() && active.empty()) break;
       }
+      for (auto& task : ready) add(std::move(task));
       int running = 0; curl_multi_perform(multi, &running); curl_multi_poll(multi, nullptr, 0, 10, nullptr);
       int messages = 0; while (CURLMsg* message = curl_multi_info_read(multi, &messages)) if (message->msg == CURLMSG_DONE) finish(message->easy_handle, message->data.result);
     }
@@ -224,9 +250,12 @@ struct Client::Impl {
 Client::Client(Options options) {
   static std::once_flag curl_once;
   std::call_once(curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+  options.max_in_flight = std::max<std::size_t>(1, std::min(options.max_in_flight,
+      platform::outbound_request_ceiling()));
   impl_ = std::make_unique<Impl>(std::move(options));
 }
 Client::~Client() = default;
 void Client::submit(Request request, std::function<void(Result)> done) { impl_->submit(std::move(request), std::move(done)); }
 std::size_t Client::in_flight() const { return impl_->flight.load(); }
+std::size_t Client::peak_in_flight() const { return impl_->peak.load(); }
 }  // namespace onion::llm

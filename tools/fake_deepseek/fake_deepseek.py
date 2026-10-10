@@ -80,6 +80,9 @@ def handler_for(fake):
                 fake.in_flight += 1
             try:
                 fake.delay()
+                if random.random() < fake.scenario.get("reset_connection_rate", 0.0):
+                    self.connection.close()
+                    return
                 route = fake.route(prompt)
                 errors = fake.scenario.get("errors", {})
                 status = 429 if random.random() < errors.get("rate_429", 0.0) else 503 if random.random() < errors.get("rate_503", 0.0) else 200
@@ -103,6 +106,13 @@ def handler_for(fake):
     return Handler
 
 
+class ConcurrentFakeServer(ThreadingHTTPServer):
+    """A deliberately deep, daemon-threaded accept queue for load tests."""
+    daemon_threads = True
+    request_queue_size = 2048
+    allow_reuse_address = True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", required=True, type=Path)
@@ -112,7 +122,7 @@ def main():
     arguments = parser.parse_args()
     scenario = json.loads(arguments.scenario.read_text(encoding="utf-8"))
     arguments.record.parent.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((arguments.host, arguments.port), handler_for(FakeDeepSeek(scenario, arguments.record)))
+    server = ConcurrentFakeServer((arguments.host, arguments.port), handler_for(FakeDeepSeek(scenario, arguments.record)))
     print(server.server_address[1], flush=True)
     server.serve_forever()
 

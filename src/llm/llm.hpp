@@ -114,6 +114,7 @@ class Client {
     std::string api_key;
     int timeout_s{120};
     int worker_threads{1};
+    std::size_t max_in_flight{1000};
   };
   explicit Client(Options options);
   ~Client();
@@ -121,6 +122,7 @@ class Client {
   Client& operator=(const Client&) = delete;
   void submit(Request request, std::function<void(Result)> done);
   std::size_t in_flight() const;
+  std::size_t peak_in_flight() const;
 
  private:
   struct Impl;

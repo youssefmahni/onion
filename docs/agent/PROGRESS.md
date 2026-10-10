@@ -6,6 +6,7 @@
 - Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
 
 ## Log (newest first)
+- 2026-10-10: Diagnosed the 1,000-request client crash with ASan/UBSan as a queued-deque iterator use-after-free; fixed by draining ready tasks under the mutex before curl work · normal and sanitizer benchmarks now complete 1,000/1,000 against the fake server · added fake-server concurrency and transport-failure regression coverage · no real calls
 
 - 2026-10-10: M2 checkpoint: added standard-library fake DeepSeek server, scenarios and adaptive limiter tests · CI 56aa921 green on Linux, macOS arm64, macOS Intel compatibility build and Windows · no real calls; 1,000-request benchmark not started
 - 2026-10-10: M2 started from merged M1; no real DeepSeek completions approved or used · pricing source recorded in decision 0004

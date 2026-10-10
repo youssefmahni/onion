@@ -38,6 +38,15 @@ the technical progress log in `docs/agent/PROGRESS.md`.
   20-repeat local verification passed.
 - CI checkpoint passed on all jobs for `35c2cf5`:
   https://github.com/youssefmahni/onion/actions/runs/38020639289
+- Diagnosed the 1,000-request crash with ASan/UBSan: a worker held an iterator
+  into its submission deque after releasing the mutex, allowing a concurrent
+  submission to reallocate the deque. The worker now drains ready work while
+  locked before handing it to libcurl.
+- Switched the fake service to a daemon-threaded HTTP server with an accept
+  queue of 2,048, and added a 1,000-concurrent-request load test.
+- Added stable per-request curl storage, curl_multi_poll-only driving, Unix
+  descriptor-limit raising with a 64-descriptor reserve, and 1,000-request
+  closed-port/reset-connection regressions.
 
 ## Next approved task
 

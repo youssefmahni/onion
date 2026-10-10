@@ -112,4 +112,7 @@ TEST(PlatformSampleTest, OSValuesArePresent) {
 #endif
   EXPECT_GE(*value.net_rx_mbps, 0.0);
 }
+TEST(PlatformFileLimits, ReservesDescriptorsForEngineResources) {
+  EXPECT_GE(onion::platform::outbound_request_ceiling(), 1U);
+}
 }  // namespace

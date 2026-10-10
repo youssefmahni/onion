@@ -66,6 +66,38 @@ jobs:
           printf '%s\n' "$build_version"
           printf '%s\n' "$build_version" | grep -E '^[[:space:]]+minos 12\.0$'
 
+  new-tree-asan-ubsan:
+    name: New tree (Linux ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux OpenCL runtime
+        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build/linux-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DONION_ENABLE_ASAN=ON -DONION_ENABLE_UBSAN=ON
+      - name: Build
+        run: cmake --build build/linux-asan
+      - name: Test
+        run: ctest --test-dir build/linux-asan --output-on-failure
+
+  llm-tsan:
+    name: LLM client (Linux TSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build/linux-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DONION_ENABLE_OPENCL=OFF -DONION_ENABLE_TSAN=ON
+      - name: Build
+        run: cmake --build build/linux-tsan
+      - name: LLM client tests
+        run: >-
+          ctest --test-dir build/linux-tsan --output-on-failure
+          -R '^(Budget|Metering|CircuitBreaker|llm\.)'
+
   legacy:
     name: Legacy (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

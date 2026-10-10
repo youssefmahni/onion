@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -304,6 +305,28 @@ Sample sample() {
   const auto now = std::chrono::steady_clock::now(); if (previous_net && rx >= previous_net->rx && tx >= previous_net->tx) { const double seconds = std::chrono::duration<double>(now - previous_net->at).count(); if (seconds > 0) { result.net_rx_mbps = 8.0 * (rx - previous_net->rx) / seconds / 1'000'000.0; result.net_tx_mbps = 8.0 * (tx - previous_net->tx) / seconds / 1'000'000.0; } } previous_net = Net{rx, tx, now};
 #endif
   return result;
+}
+
+std::size_t outbound_request_ceiling() {
+#ifdef _WIN32
+  // Windows does not expose an RLIMIT_NOFILE equivalent for Winsock sockets.
+  // The caller's configured ceiling is therefore left unchanged.
+  return std::numeric_limits<std::size_t>::max();
+#else
+  rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) != 0) return 1;
+  if (limits.rlim_cur < limits.rlim_max) {
+    rlimit raised = limits;
+    raised.rlim_cur = raised.rlim_max;
+    (void)::setrlimit(RLIMIT_NOFILE, &raised);
+    (void)::getrlimit(RLIMIT_NOFILE, &limits);
+  }
+  if (limits.rlim_cur <= 64) return 1;
+  const auto usable = limits.rlim_cur - 64;
+  return usable > static_cast<rlim_t>(std::numeric_limits<std::size_t>::max())
+      ? std::numeric_limits<std::size_t>::max()
+      : static_cast<std::size_t>(usable);
+#endif
 }
 
 KeyStore::KeyStore(std::filesystem::path directory) : directory_(std::move(directory)) {}
