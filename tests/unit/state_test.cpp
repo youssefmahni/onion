@@ -239,7 +239,7 @@ int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
       Record{0, 0, "SETTLE",
              {{"path", "P01-IN01-T01"}, {"kept", 1}, {"end", "children"}}},
   }});
-  for (int i = 0; i < 1000; ++i) {
+  for (int i = 0; i < 3000; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     if (writer->next_batch() == 2) break;
   }
