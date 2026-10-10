@@ -174,9 +174,16 @@ onion_add_compiled_module(state src/state/state.cpp)
 target_link_libraries(state PUBLIC onion::core onion::log onion::store)
 
 # Interface layer
-onion_add_module(api)
+FetchContent_Declare(
+  httplib
+  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
+  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(httplib)
+onion_add_compiled_module(api src/api/api.cpp)
+target_link_libraries(api PUBLIC httplib::httplib nlohmann_json::nlohmann_json)
+target_link_libraries(api PUBLIC onion::state)
 onion_add_module(cli)
-target_link_libraries(api INTERFACE onion::state)
 target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
 
 add_executable(onion_smoke tests/unit/smoke_test.cpp)
@@ -267,5 +274,7 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-add_executable(data_depot src/cli/main.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm)
+add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store)
+target_compile_definitions(data_depot PRIVATE
+  ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
