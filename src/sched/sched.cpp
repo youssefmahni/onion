@@ -131,6 +131,32 @@ std::string project_cost_usd(std::int64_t loop_budget,
   return text.substr(0, text.size() - 9) + "." + text.substr(text.size() - 9);
 }
 
+// ------------------------------------------------------------------ ids
+
+NodeIdAllocator::NodeIdAllocator(std::int64_t slot, std::int64_t next_counter)
+    : slot_(slot), counter_(next_counter) {}
+
+std::int64_t NodeIdAllocator::id_value(std::int64_t slot, std::int64_t counter) {
+  return (slot << 40) + counter;
+}
+
+std::string NodeIdAllocator::allocate() {
+  const std::int64_t value = id_value(slot_, counter_++);
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "TK%05lld", static_cast<long long>(value));
+  return buffer;
+}
+
+std::int64_t NodeIdAllocator::counter_from_code(std::string_view code) {
+  if (code.size() < 3 || code.substr(0, 2) != "TK") return 0;
+  std::int64_t value = 0;
+  for (const char c : code.substr(2)) {
+    if (c < '0' || c > '9') return 0;
+    value = value * 10 + (c - '0');
+  }
+  return value;
+}
+
 // ----------------------------------------------------------------- engine
 
 struct Engine::Impl {
@@ -230,6 +256,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
 
   std::vector<SettledSample> settled_samples;
   std::deque<Ticket> waiting;
+  std::unique_ptr<NodeIdAllocator> node_ids_;
   std::int64_t reserved_attempts = 0;
   std::int64_t used_in_chunk = 0;
 
@@ -239,6 +266,23 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     const auto campaign = writer.campaign(spec.id);
     return campaign && campaign->state != "running";
   };
+
+  // Child ids come from the device's slot (slot × 2^40 + counter).
+  {
+    std::string id_error;
+    const std::int64_t max_tk = writer.db().max_tk_value(&id_error);
+    std::int64_t next_counter = 0;
+    if (impl_->options.slot > 0) {
+      next_counter =
+          max_tk >= (impl_->options.slot << 40)
+              ? max_tk - (impl_->options.slot << 40) + 1
+              : 0;
+    } else {
+      next_counter = max_tk + 1;  // slot 0: keep allocating the legacy way
+    }
+    node_ids_ = std::make_unique<NodeIdAllocator>(impl_->options.slot,
+                                                  next_counter);
+  }
 
   // Local node cache: the engine is the only writer of new nodes, so the
   // cache is refreshed from SQLite only when the snapshot drains; commits
@@ -378,10 +422,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         for (const gate::Child& child : chosen.children)
           if (child.atomic) atomic++;
         std::vector<log::Record> records;
-        int counter = 0;
+        std::vector<std::string> new_ids;
         for (const gate::Child& child : chosen.children) {
-          char id[24];
-          std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+          const std::string id = node_ids_->allocate();
+          new_ids.push_back(id);
           records.push_back(make_record(
               "ADD_NODE", {{"path", ticket.path + "-" + id},
                            {"layer", ticket.layer + 1},
@@ -405,14 +449,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"campaign", spec.id}}));
         writer.submit(state::CommitTerminal{std::move(records)});
         if (cache_valid) {
-          int counter = 0;
-          for (const gate::Child& child : chosen.children) {
-            char id[24];
-            std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+          for (std::size_t i = 0; i < chosen.children.size(); ++i) {
             store::Node child_node;
-            child_node.path = ticket.path + "-" + id;
+            child_node.path = ticket.path + "-" + new_ids[i];
             child_node.layer = ticket.layer + 1;
-            child_node.title = child.title;
+            child_node.title = chosen.children[i].title;
             node_cache.push_back(std::move(child_node));
           }
         }
@@ -427,10 +468,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         // Children are stored with the review so accept can settle without
         // spending more (decision 0008).
         std::vector<log::Record> records;
-        int counter = 0;
+        std::vector<std::string> new_ids;
         for (const gate::Child& child : chosen.children) {
-          char id[24];
-          std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+          const std::string id = node_ids_->allocate();
+          new_ids.push_back(id);
           records.push_back(make_record(
               "ADD_NODE", {{"path", ticket.path + "-" + id},
                            {"layer", ticket.layer + 1},
@@ -448,14 +489,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         writer.submit(state::CommitTerminal{std::move(records)});
         if (cache_valid) {
           review_cache.push_back(ticket.path);  // pause the subtree now
-          int counter = 0;
-          for (const gate::Child& child : chosen.children) {
-            char id[24];
-            std::snprintf(id, sizeof(id), "TK%05d", ++counter);
+          for (std::size_t i = 0; i < chosen.children.size(); ++i) {
             store::Node child_node;
-            child_node.path = ticket.path + "-" + id;
+            child_node.path = ticket.path + "-" + new_ids[i];
             child_node.layer = ticket.layer + 1;
-            child_node.title = child.title;
+            child_node.title = chosen.children[i].title;
             node_cache.push_back(std::move(child_node));
           }
         }
