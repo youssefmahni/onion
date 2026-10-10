@@ -88,10 +88,28 @@ endif()
 # Data layer
 onion_add_module(log)
 onion_add_module(store)
-find_package(CURL 7.66 REQUIRED)
+if(WIN32)
+  # Windows is the sole platform that builds the pinned curl source.  Schannel
+  # keeps certificate validation on the Windows trust store.
+  set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
+  set(CURL_USE_OPENSSL OFF CACHE BOOL "" FORCE)
+  set(CURL_USE_SECTRANSP OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    curl
+    URL https://github.com/curl/curl/releases/download/curl-8_11_1/curl-8.11.1.tar.xz
+    URL_HASH SHA256=782f8aca6786c4654ff59de728c57e205bedc66eda5ac5f619ab3713b326001b
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(curl)
+  set(ONION_CURL_TARGET libcurl_static)
+else()
+  find_package(CURL 7.66 REQUIRED)
+  set(ONION_CURL_TARGET CURL::libcurl)
+endif()
 find_package(Threads REQUIRED)
 onion_add_compiled_module(llm src/llm/limiter.cpp src/llm/client.cpp)
-target_link_libraries(llm PUBLIC CURL::libcurl Threads::Threads)
+target_link_libraries(llm PUBLIC ${ONION_CURL_TARGET} Threads::Threads)
 target_link_libraries(log INTERFACE onion::core onion::platform)
 target_link_libraries(store INTERFACE onion::core onion::platform)
 target_link_libraries(llm INTERFACE onion::core onion::platform)

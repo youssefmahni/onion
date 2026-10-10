@@ -37,7 +37,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       - name: Install Linux OpenCL runtime
         if: matrix.install_pocl
-        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev
+        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev libcurl4-openssl-dev
       - name: Configure
         run: cmake ${{ matrix.cmake_args }} --preset ${{ matrix.preset }}
       - name: Build
@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux OpenCL runtime
-        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev
+        run: sudo apt-get update && sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev libcurl4-openssl-dev
       - name: Configure
         run: >-
           cmake -S . -B build/linux-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -87,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux libcurl
+        run: sudo apt-get update && sudo apt-get install --yes libcurl4-openssl-dev
       - name: Configure
         run: >-
           cmake -S . -B build/linux-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug
