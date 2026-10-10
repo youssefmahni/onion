@@ -433,7 +433,11 @@ TEST_F(StateWriterTest, SealedSegmentsReplayAcrossRestart) {
     writer->stop();
   }
   {
+#ifdef _WIN32
+    _putenv_s("ONION_REPLAY_DEBUG", "1");
+#else
     setenv("ONION_REPLAY_DEBUG", "1", 1);
+#endif
     auto writer = open_signed();
     std::string error;
     ASSERT_TRUE(writer->start(&error)) << error;
