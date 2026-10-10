@@ -433,20 +433,9 @@ TEST_F(StateWriterTest, SealedSegmentsReplayAcrossRestart) {
     writer->stop();
   }
   {
-#ifdef _WIN32
-    _putenv_s("ONION_REPLAY_DEBUG", "1");
-#else
-    setenv("ONION_REPLAY_DEBUG", "1", 1);
-#endif
     auto writer = open_signed();
     std::string error;
     ASSERT_TRUE(writer->start(&error)) << error;
-    std::fprintf(stderr, "reopened: next_batch=%llu sealed=%zu\n",
-                 static_cast<unsigned long long>(writer->next_batch()),
-                 writer->segments().sealed_first_seqs().size());
-    std::string qerror;
-    for (const auto& n : writer->db().settles(&qerror))
-      std::fprintf(stderr, "settled in store: %s\n", n.path.c_str());
     EXPECT_TRUE(writer->settled("P01-IN01"));
     EXPECT_TRUE(writer->settled("P01-IN02"));
     EXPECT_EQ(writer->next_batch(), 3u);
