@@ -11,6 +11,9 @@
 #include <thread>
 #ifndef _WIN32
 #include <sys/stat.h>
+#include <cstdlib>
+#else
+#include <cstdlib>
 #endif
 
 namespace {
@@ -39,9 +42,49 @@ TEST_F(PlatformTest, AtomicReplaceReplacesDestination) {
   std::ifstream input(target, std::ios::binary);
   EXPECT_EQ(std::string(std::istreambuf_iterator<char>(input), {}), "new");
 }
+TEST_F(PlatformTest, DurableOperationsSyncFileAndDirectory) {
+  onion::platform::reset_sync_counts_for_test();
+  const auto source = root_ / "source";
+  { onion::platform::AppendFile file; ASSERT_TRUE(file.open(source)); ASSERT_TRUE(file.append("x")); ASSERT_TRUE(file.sync()); }
+  const auto destination = root_ / "destination";
+  ASSERT_TRUE(onion::platform::atomic_replace(source, destination));
+  const auto counts = onion::platform::sync_counts_for_test();
+  EXPECT_GE(counts.file, 2U);
+#ifndef _WIN32
+  EXPECT_GE(counts.directory, 2U);
+#endif
+}
 TEST(DataDirTest, FlagOverrideWins) {
   const std::filesystem::path expected = "instance-data";
   EXPECT_EQ(onion::platform::data_dir(expected), expected);
+}
+TEST(DataDirTest, EnvironmentPrecedence) {
+#ifdef _WIN32
+  _putenv_s("ONION_DATA_DIR", "onion-env");
+  _putenv_s("LOCALAPPDATA", "local-app-data");
+#else
+  setenv("ONION_DATA_DIR", "onion-env", 1);
+  setenv("HOME", "home-dir", 1);
+  setenv("XDG_DATA_HOME", "xdg-data", 1);
+#if defined(__linux__)
+  setenv("STATE_DIRECTORY", "state-dir", 1);
+#endif
+#endif
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("onion-env"));
+#ifdef _WIN32
+  _putenv_s("ONION_DATA_DIR", "");
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("local-app-data") / "Onion");
+#elif defined(__linux__)
+  unsetenv("ONION_DATA_DIR");
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("state-dir"));
+  unsetenv("STATE_DIRECTORY");
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("xdg-data") / "onion");
+  unsetenv("XDG_DATA_HOME");
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("home-dir") / ".local" / "share" / "onion");
+#else
+  unsetenv("ONION_DATA_DIR");
+  EXPECT_EQ(onion::platform::data_dir(), std::filesystem::path("home-dir") / "Library" / "Application Support" / "Onion");
+#endif
 }
 TEST_F(PlatformTest, KeyStoreRoundTripsAndRejectsTraversal) {
   onion::platform::KeyStore store(root_ / "keys");
