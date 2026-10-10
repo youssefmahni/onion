@@ -285,6 +285,8 @@ if(BUILD_TESTING)
   add_test(NAME llm.limiter_traces COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/limiter_trace_test.py" "$<TARGET_FILE:data_depot>")
   add_test(NAME llm.truncating_20 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "truncating" "$<TARGET_FILE:data_depot>")
   add_test(NAME llm.client_error_400 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "client-error" "$<TARGET_FILE:data_depot>")
+  add_test(NAME genesis_import.verify COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/genesis_import_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(genesis_import.verify PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
@@ -308,7 +310,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp)
+add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
+  src/cli/genesis_import.cpp)
 target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")

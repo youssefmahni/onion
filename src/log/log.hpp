@@ -120,6 +120,14 @@ struct VerifyContext {
 
 Verify verify(const Batch& batch, const VerifyContext& context);
 
+// A MEMBER_EVICT record is valid when it carries the offline admin key's
+// signature over its payload, or signatures from a majority of members.
+// Each signature is an Ed25519 signature over the canonical payload JSON
+// with the "sigs" key removed.
+bool eviction_valid(const Record& record,
+                    const std::vector<std::string>& member_public_keys_hex,
+                    std::string_view admin_public_key_hex);
+
 // Builds a batch: canonicalizes the records, hashes them, signs prev ‖ hash.
 Batch make_batch(std::string origin, std::uint64_t number,
                  std::string prev_hex, std::vector<Record> records,

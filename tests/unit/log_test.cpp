@@ -344,3 +344,61 @@ TEST_F(VerifyTest, ChainAcrossBatches) {
   second_context.expected_first_seq = 2;
   EXPECT_EQ(onion::log::verify(second, second_context), onion::log::Verify::Ok);
 }
+
+// ------------------------------------------------------------- evictions
+
+TEST(EvictionValid, LoneMemberSignatureIsRejected) {
+  const std::vector<std::uint8_t> seed_a = unhex_vec(
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  const std::vector<std::uint8_t> seed_b = unhex_vec(
+      "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
+  const std::vector<std::uint8_t> seed_admin = unhex_vec(
+      "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+  const auto key_a = onion::log::DeviceKey::from_seed(seed_a);
+  const auto key_b = onion::log::DeviceKey::from_seed(seed_b);
+  const auto key_admin = onion::log::DeviceKey::from_seed(seed_admin);
+  const auto pub = [](const onion::log::DeviceKey& key) {
+    std::string hex;
+    for (const std::uint8_t byte : key.public_key) {
+      hex += "0123456789abcdef"[byte >> 4];
+      hex += "0123456789abcdef"[byte & 0x0f];
+    }
+    return hex;
+  };
+  const std::vector<std::string> members = {pub(key_a), pub(key_b)};
+
+  // One member signing alone: rejected (needs a majority of 2, or admin).
+  onion::log::Record record;
+  record.type = "MEMBER_EVICT";
+  record.payload = {{"device_id", "deadbeefdeadbeef"},
+                    {"accept_until_seq", 10},
+                    {"sigs", json::array()},
+                    {"kind", "majority"}};
+  const nlohmann::json unsigned_payload = record.payload;
+  nlohmann::json cleaned = unsigned_payload;
+  cleaned.erase("sigs");
+  const std::string bytes = onion::log::canonical_json(cleaned);
+  onion::log::Ed25519Signer signer_a(key_a);
+  record.payload["sigs"] = json::array({signer_a.sign(bytes)});
+  EXPECT_FALSE(onion::log::eviction_valid(record, members, pub(key_admin)));
+
+  // Both members: a majority.
+  onion::log::Ed25519Signer signer_b(key_b);
+  record.payload["sigs"] = json::array({signer_a.sign(bytes), signer_b.sign(bytes)});
+  EXPECT_TRUE(onion::log::eviction_valid(record, members, pub(key_admin)));
+
+  // A single admin signature: accepted. The signed bytes carry kind=admin.
+  record.payload["kind"] = "admin";
+  record.payload["sigs"] = json::array();
+  const nlohmann::json admin_cleaned = record.payload;
+  nlohmann::json admin_without_sigs = admin_cleaned;
+  admin_without_sigs.erase("sigs");
+  const std::string admin_bytes = onion::log::canonical_json(admin_without_sigs);
+  onion::log::Ed25519Signer signer_admin(key_admin);
+  record.payload["sigs"] = json::array({signer_admin.sign(admin_bytes)});
+  EXPECT_TRUE(onion::log::eviction_valid(record, members, pub(key_admin)));
+
+  // A non-admin single signature with kind=admin: rejected.
+  record.payload["sigs"] = json::array({signer_a.sign(admin_bytes)});
+  EXPECT_FALSE(onion::log::eviction_valid(record, members, pub(key_admin)));
+}

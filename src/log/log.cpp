@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <random>
 #include <stdexcept>
@@ -430,6 +431,52 @@ std::filesystem::path Segments::active_path() const {
          (std::to_string(impl_->active_first_seq) + ".log");
 }
 std::uint64_t Segments::active_bytes() const { return impl_->bytes; }
+
+bool eviction_valid(const Record& record,
+                    const std::vector<std::string>& member_public_keys_hex,
+                    std::string_view admin_public_key_hex) {
+  if (record.type != "MEMBER_EVICT" || !record.payload.is_object())
+    return false;
+  if (!record.payload.contains("sigs") || !record.payload["sigs"].is_array())
+    return false;
+  nlohmann::json unsigned_payload = record.payload;
+  unsigned_payload.erase("sigs");
+  const std::string bytes = canonical_json(unsigned_payload);
+  std::vector<std::string> signatures;
+  for (const auto& sig : record.payload["sigs"])
+    if (sig.is_string()) signatures.push_back(sig.get<std::string>());
+  if (signatures.empty()) return false;
+
+  const auto check = [&](const std::vector<std::uint8_t>& public_key,
+                         const std::string& signature_hex) {
+    if (public_key.size() != 32) return false;
+    const std::vector<std::uint8_t> signature = unhex_bytes(signature_hex);
+    if (signature.size() != 64) return false;
+    return crypto_ed25519_check(signature.data(), public_key.data(),
+                                reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                                bytes.size()) == 0;
+  };
+
+  const bool is_admin = record.payload.value("kind", std::string{}) == "admin";
+  if (is_admin) {
+    const std::vector<std::uint8_t> admin = unhex_bytes(std::string(admin_public_key_hex));
+    return check(admin, signatures.front());
+  }
+  std::size_t verified = 0;
+  std::set<std::string> signers;
+  for (const std::string& signature : signatures) {
+    for (const std::string& member_hex : member_public_keys_hex) {
+      if (signers.count(member_hex)) continue;
+      if (check(unhex_bytes(member_hex), signature)) {
+        verified++;
+        signers.insert(member_hex);
+        break;
+      }
+    }
+  }
+  return !member_public_keys_hex.empty() &&
+         verified > member_public_keys_hex.size() / 2;
+}
 
 // ------------------------------------------------------------- device keys
 
