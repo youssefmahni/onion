@@ -945,18 +945,16 @@ TEST_F(FunnelFixture, LowScoreNodeIsRetriedAndFixed) {
 
 // ---------------- live-resizable pool ----------------
 TEST_F(FunnelFixture, PoolResizesFromControlFile) {
-    // Deterministic synchronization: the synthesizer reply holds the funnel
-    // open until the manager has demonstrably announced "THREADS\t3" on the
-    // run's stdout.  A reader thread watches a pipe copy of stdout and
-    // releases the synthesizer only after it sees the announcement.  This
-    // removes the wall-clock race that made the test flake on loaded CI
-    // runners (the manager could be starved for the whole funnel window).
-    std::atomic<bool> raised{false};
-    std::mutex synth_mutex;
-    std::condition_variable synth_cv;
+    // Deterministic: the control loop runs inside the funnel's own thread
+    // (work() executes inline in the manager loop), so the previous
+    // handshake deadlocked whenever the manager took the ticket itself:
+    // the synthesizer waited for "THREADS\t3" while the manager was blocked
+    // inside the synthesizer. Instead, run TWO rounds with force, so the
+    // manager always passes its reconcile step between the rounds (the
+    // completion check cannot fire before round 2), whoever ran the funnel.
+    // The raise is then observed in the collected output after the run.
     depot::AskFn fake = [&](const std::string& payload) -> std::string {
-        // Slow-ish replies keep the funnel itself well beyond one control
-        // interval, as in the original timing-based test.
+        // Slow-ish replies keep each round well beyond one control interval.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (payload.find("Plan the knowledge coverage") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"items\": [\"A1\", \"A2\"]}"}}]})";
@@ -964,18 +962,8 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
             return R"({"choices":[{"message":{"content":"{\"items\": [\"Alpha\"]}"}}]})";
         if (payload.find("Critique this candidate set") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"score\": 0.9, \"remove\": [], \"add\": [], \"issues\": \"\"}"}}]})";
-        if (payload.find("select the final children set") != std::string::npos) {
-            // Bounded wait: if the manager never raises, the run still ends
-            // and the assertion below reports the real failure (no hang).
-            // The bound is deliberately long: the legacy control loop uses
-            // cv.wait_for with a clock that can jump on hosted runners
-            // (observed ~10 s stalls on macOS), so a short bound can expire
-            // just before a stalled manager wakes and reconciles.
-            std::unique_lock<std::mutex> lock(synth_mutex);
-            synth_cv.wait_for(lock, std::chrono::seconds(120),
-                              [&] { return raised.load(); });
+        if (payload.find("select the final children set") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"items\": [{\"title\": \"Alpha\", \"atomic\": true}]}"}}]})";
-        }
         return R"({"choices":[{"message":{"content":"{\"items\": []}"}}]})";
     };
     // control dir + initial target 1 -> then raise to 3 mid-run
@@ -985,8 +973,8 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
         f << "3\n";  // raise 1 -> 3 workers
     }
     setenv("DEPOT_CONTROL_INTERVAL_MS", "50", 1);
-    // Route the run's stdout through a pipe so the reader can watch for the
-    // manager's announcement without racing the test's own thread.
+    // Route the run's stdout through a pipe and collect everything; the
+    // assertion runs after the funnel returns.
     int pipefd[2];
     ASSERT_EQ(::pipe(pipefd), 0);
     std::cout << std::flush;
@@ -996,36 +984,22 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
     ASSERT_EQ(::dup2(pipefd[1], 1), 1);
 
     std::string observed;
-    std::atomic<bool> run_done{false};
     std::thread reader([&] {
         char buffer[4096];
-        while (!run_done.load()) {
-            const ssize_t n = ::read(pipefd[0], buffer, sizeof(buffer));
-            if (n > 0) {
-                observed.append(buffer, static_cast<std::size_t>(n));
-                if (!raised.load() &&
-                    observed.find("THREADS\t3") != std::string::npos) {
-                    raised.store(true);
-                    synth_cv.notify_all();
-                }
-            } else if (n == 0) {
-                break;  // every writer closed
-            }
-        }
-        for (;;) {  // drain anything left until EOF
+        for (;;) {
             const ssize_t n = ::read(pipefd[0], buffer, sizeof(buffer));
             if (n <= 0) break;
             observed.append(buffer, static_cast<std::size_t>(n));
         }
     });
 
+    // rounds=2 + force: the manager must reconcile between the rounds.
     const int rc = depot::run_funnel("P01-IN01-", 10, 1, false, true,
                                      "deepseek-v4-pro", "sk-fake", dir_.string(),
-                                     fake);
+                                     fake, "", 2);
 
     std::cout << std::flush;
     ::fflush(stdout);
-    run_done.store(true);
     ::close(pipefd[1]);
     ::dup2(saved_stdout, 1);
     ::close(saved_stdout);
