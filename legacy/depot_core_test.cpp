@@ -967,8 +967,12 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
         if (payload.find("select the final children set") != std::string::npos) {
             // Bounded wait: if the manager never raises, the run still ends
             // and the assertion below reports the real failure (no hang).
+            // The bound is deliberately long: the legacy control loop uses
+            // cv.wait_for with a clock that can jump on hosted runners
+            // (observed ~10 s stalls on macOS), so a short bound can expire
+            // just before a stalled manager wakes and reconciles.
             std::unique_lock<std::mutex> lock(synth_mutex);
-            synth_cv.wait_for(lock, std::chrono::seconds(10),
+            synth_cv.wait_for(lock, std::chrono::seconds(120),
                               [&] { return raised.load(); });
             return R"({"choices":[{"message":{"content":"{\"items\": [{\"title\": \"Alpha\", \"atomic\": true}]}"}}]})";
         }
