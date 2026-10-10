@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(onion_engine VERSION 0.1.0 LANGUAGES CXX)
+project(onion_engine VERSION 0.1.0 LANGUAGES C CXX)
 
 include(CTest)
 include(FetchContent)
@@ -101,6 +101,19 @@ target_link_libraries(onion_smoke PRIVATE onion::cli)
 
 if(BUILD_TESTING)
   FetchContent_Declare(
+    monocypher
+    URL https://monocypher.org/download/monocypher-4.0.2.tar.gz
+    URL_HASH SHA256=38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(monocypher)
+  add_library(monocypher STATIC
+    "${monocypher_SOURCE_DIR}/src/monocypher.c"
+    "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
+  target_include_directories(monocypher PUBLIC
+    "${monocypher_SOURCE_DIR}/src"
+    "${monocypher_SOURCE_DIR}/src/optional")
+
+  FetchContent_Declare(
     googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
     URL_HASH SHA256=7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926
@@ -120,6 +133,12 @@ if(BUILD_TESTING)
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
   gtest_discover_tests(onion_platform_test)
+
+  add_executable(onion_golden_test tests/golden/golden_test.cpp)
+  target_link_libraries(onion_golden_test PRIVATE monocypher GTest::gtest_main)
+  target_compile_definitions(onion_golden_test PRIVATE
+    ONION_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/expected")
+  gtest_discover_tests(onion_golden_test)
   if(ONION_GPU_AVAILABLE)
     add_executable(onion_gpu_test tests/unit/gpu_test.cpp)
     target_link_libraries(onion_gpu_test PRIVATE onion::gpu GTest::gtest_main)
