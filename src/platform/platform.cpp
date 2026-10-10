@@ -186,7 +186,11 @@ bool AppendFile::sync() {
 }
 bool atomic_replace(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
 #ifdef _WIN32
-  return MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+  const bool replaced = MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+  // MOVEFILE_WRITE_THROUGH is the Windows durable-write equivalent for this
+  // replacement. Count it as a file sync so the test hook covers this path.
+  if (replaced) ++sync_counts.file;
+  return replaced;
 #else
   const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
@@ -287,7 +291,7 @@ Sample sample() {
     previous = current;
   }
   std::ifstream network("/proc/net/dev"); std::string line; unsigned long long rx = 0, tx = 0;
-  while (std::getline(network, line)) { const auto colon = line.find(':'); if (colon == std::string::npos) continue; const auto name = line.substr(0, colon); if (name.find("lo") != std::string::npos) continue; std::istringstream values(line.substr(colon + 1)); unsigned long long received = 0, transmitted = 0, discard = 0; if (values >> received >> discard >> discard >> discard >> discard >> discard >> discard >> discard >> transmitted) { rx += received; tx += transmitted; } }
+  while (std::getline(network, line)) { const auto colon = line.find(':'); if (colon == std::string::npos) continue; const auto name = line.substr(0, colon); const auto first = name.find_first_not_of(" \t"); const auto last = name.find_last_not_of(" \t"); if (first == std::string::npos || name.substr(first, last - first + 1) == "lo") continue; std::istringstream values(line.substr(colon + 1)); unsigned long long received = 0, transmitted = 0, discard = 0; if (values >> received >> discard >> discard >> discard >> discard >> discard >> discard >> discard >> transmitted) { rx += received; tx += transmitted; } }
   struct Net { unsigned long long rx, tx; std::chrono::steady_clock::time_point at; }; static std::optional<Net> previous_net;
   const auto now = std::chrono::steady_clock::now(); if (previous_net && rx >= previous_net->rx && tx >= previous_net->tx) { const double seconds = std::chrono::duration<double>(now - previous_net->at).count(); if (seconds > 0) { result.net_rx_mbps = 8.0 * (rx - previous_net->rx) / seconds / 1'000'000.0; result.net_tx_mbps = 8.0 * (tx - previous_net->tx) / seconds / 1'000'000.0; } } previous_net = Net{rx, tx, now};
 #endif
