@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <system_error>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -79,7 +81,7 @@ std::filesystem::path data_dir(const std::optional<std::filesystem::path>& flag)
   if (const auto value = env("XDG_DATA_HOME")) return std::filesystem::path(*value) / "onion";
   if (const auto value = env("HOME")) return std::filesystem::path(*value) / ".local" / "share" / "onion";
 #endif
-  return "onion-data";
+  return std::filesystem::path("onion-data");
 }
 
 AppendFile::~AppendFile() {

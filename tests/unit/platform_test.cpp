@@ -5,6 +5,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <optional>
+#include <string>
 
 namespace {
 class PlatformTest : public testing::Test {
