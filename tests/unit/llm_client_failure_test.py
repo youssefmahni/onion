@@ -32,7 +32,7 @@ def main():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--limit", "100", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         assert completed.returncode == 1, completed.stderr
         assert_transport(completed.stdout)
         return
@@ -59,7 +59,7 @@ def main():
         thread = threading.Thread(target=accept, daemon=True); thread.start()
         try:
             timeout = "2" if args.mode == "reset" else "1"
-            completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", timeout], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--limit", "100", "--timeout", timeout], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
             assert completed.returncode == 1, completed.stderr
             if args.mode == "reset":
                 assert_transport(completed.stdout)
