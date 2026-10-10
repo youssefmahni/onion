@@ -12,21 +12,11 @@
 #include <utility>
 
 #ifdef _WIN32
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#ifndef WINVER
-#define WINVER 0x0600
-#endif
-#ifndef NTDDI_VERSION
-#define NTDDI_VERSION 0x06000000
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+#include <winsock2.h>
+#include <ws2ipdef.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <wincrypt.h>
-#include <iphlpapi.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -197,16 +187,26 @@ Sample sample() {
   if (GlobalMemoryStatusEx(&memory)) result.ram_avail_gb = static_cast<double>(memory.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
   SYSTEM_POWER_STATUS power{};
   if (GetSystemPowerStatus(&power) && power.ACLineStatus != 255) result.on_battery = power.ACLineStatus == 0;
-  // Resolve GetIfTable2 at runtime: its table layout is SDK-version-sensitive.
-  // A successful probe proves interface statistics are available; rate sampling
-  // remains unknown until the profile module consumes the typed table in M5.
-  using GetIfTable2Fn = DWORD (WINAPI*)(void**);
-  using FreeMibTableFn = VOID (WINAPI*)(void*);
-  if (const HMODULE iphlpapi = GetModuleHandleW(L"Iphlpapi.dll")) {
-    const auto get_table = reinterpret_cast<GetIfTable2Fn>(GetProcAddress(iphlpapi, "GetIfTable2"));
-    const auto free_table = reinterpret_cast<FreeMibTableFn>(GetProcAddress(iphlpapi, "FreeMibTable"));
-    void* table = nullptr;
-    if (get_table != nullptr && free_table != nullptr && get_table(&table) == NO_ERROR && table != nullptr) free_table(table);
+  PMIB_IF_TABLE2 table = nullptr;
+  if (GetIfTable2(&table) == NO_ERROR && table != nullptr) {
+    unsigned long long rx = 0;
+    unsigned long long tx = 0;
+    for (ULONG index = 0; index < table->NumEntries; ++index) {
+      rx += table->Table[index].InOctets;
+      tx += table->Table[index].OutOctets;
+    }
+    struct Net { unsigned long long rx, tx; std::chrono::steady_clock::time_point at; };
+    static std::optional<Net> previous;
+    const auto now = std::chrono::steady_clock::now();
+    if (previous) {
+      const double seconds = std::chrono::duration<double>(now - previous->at).count();
+      if (seconds > 0) {
+        result.net_rx_mbps = 8.0 * (rx - previous->rx) / seconds / 1'000'000.0;
+        result.net_tx_mbps = 8.0 * (tx - previous->tx) / seconds / 1'000'000.0;
+      }
+    }
+    previous = Net{rx, tx, now};
+    FreeMibTable(table);
   }
 #elif defined(__APPLE__)
   double loads[3]{};

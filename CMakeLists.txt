@@ -60,6 +60,10 @@ onion_add_compiled_module(platform src/platform/platform.cpp)
 if(WIN32)
   # platform is static, so consumers must receive the Windows API import libs.
   target_link_libraries(platform PUBLIC Crypt32 Iphlpapi)
+  target_compile_definitions(platform PRIVATE
+    _WIN32_WINNT=0x0A00
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN)
 endif()
 
 # Data layer
