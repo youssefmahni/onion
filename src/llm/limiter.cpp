@@ -15,18 +15,32 @@ void Limiter::on_window(const LimitWindow& window) {
     return;
   }
 
-  if (window.median_latency_s > 0.0 && !baseline_s_) baseline_s_ = window.median_latency_s;
+  if (window.median_latency_s > 0.0) {
+    healthy_latencies_.push_back({window.ended_at_s, window.median_latency_s});
+    while (!healthy_latencies_.empty() &&
+           healthy_latencies_.front().ended_at_s + 3600 < window.ended_at_s) {
+      healthy_latencies_.pop_front();
+    }
+  }
   if (hold_next_window_) {
     hold_next_window_ = false;
     return;
   }
-  if (baseline_s_ && window.median_latency_s > 0.0 &&
-      window.median_latency_s <= *baseline_s_ * 1.5) {
+  const auto baseline = low_load_baseline_s();
+  if (baseline && window.median_latency_s > 0.0 &&
+      window.median_latency_s <= *baseline * 1.5) {
     limit_ = std::min(ceiling_, limit_ + 4);
   }
 }
 
 int Limiter::limit() const { return limit_; }
 
-std::optional<double> Limiter::low_load_baseline_s() const { return baseline_s_; }
+std::optional<double> Limiter::low_load_baseline_s() const {
+  if (healthy_latencies_.empty()) return std::nullopt;
+  double lowest = healthy_latencies_.front().median_latency_s;
+  for (const auto& sample : healthy_latencies_) {
+    lowest = std::min(lowest, sample.median_latency_s);
+  }
+  return lowest;
+}
 }  // namespace onion::llm

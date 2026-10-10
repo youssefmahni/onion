@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <cstddef>
+#include <deque>
 #include <optional>
 #include <string_view>
 
@@ -8,6 +10,7 @@ namespace onion::llm {
 inline constexpr std::string_view component_name{"llm"};
 
 struct LimitWindow {
+  std::uint64_t ended_at_s{};
   std::size_t calls{};
   std::size_t rate_limited{};
   std::size_t server_errors{};
@@ -27,6 +30,10 @@ class Limiter {
   int limit_;
   int ceiling_;
   bool hold_next_window_{false};
-  std::optional<double> baseline_s_;
+  struct LatencySample {
+    std::uint64_t ended_at_s;
+    double median_latency_s;
+  };
+  std::deque<LatencySample> healthy_latencies_;
 };
 }
