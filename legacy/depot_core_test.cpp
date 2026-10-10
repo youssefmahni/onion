@@ -943,7 +943,10 @@ TEST_F(FunnelFixture, LowScoreNodeIsRetriedAndFixed) {
 TEST_F(FunnelFixture, PoolResizesFromControlFile) {
     // fake that answers a slow-ish 6-round funnel for TD1 then drains
     depot::AskFn fake = [&](const std::string& payload) -> std::string {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // The control loop polls every 50 ms in this test.  Keep each fake
+        // reply comfortably beyond that interval so slow hosted macOS runners
+        // cannot drain the ticket before the resize is observed.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (payload.find("Plan the knowledge coverage") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"items\": [\"A1\", \"A2\"]}"}}]})";
         if (payload.find("Aspect:") != std::string::npos)
