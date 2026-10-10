@@ -107,11 +107,22 @@ FetchContent_Declare(
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+FetchContent_Declare(
+  sqlite
+  URL https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip
+  URL_HASH SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(sqlite)
+add_library(onion_sqlite STATIC "${sqlite_SOURCE_DIR}/sqlite3.c")
+target_include_directories(onion_sqlite PUBLIC "${sqlite_SOURCE_DIR}")
+
 # Data layer
 onion_add_compiled_module(log src/log/log.cpp)
 target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json)
 target_link_libraries(log PUBLIC onion::core onion::platform)
-onion_add_module(store)
+onion_add_compiled_module(store src/store/store.cpp)
+target_link_libraries(store PUBLIC onion_sqlite)
+target_link_libraries(store PUBLIC onion::core onion::platform)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
   # keeps certificate validation on the Windows trust store.
@@ -194,6 +205,10 @@ if(BUILD_TESTING)
   add_executable(onion_log_test tests/unit/log_test.cpp)
   target_link_libraries(onion_log_test PRIVATE onion::log GTest::gtest_main)
   gtest_discover_tests(onion_log_test)
+
+  add_executable(onion_store_test tests/unit/store_test.cpp)
+  target_link_libraries(onion_store_test PRIVATE onion::store GTest::gtest_main)
+  gtest_discover_tests(onion_store_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
