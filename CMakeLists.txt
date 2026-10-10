@@ -96,6 +96,9 @@ if(WIN32)
   set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
   set(CURL_USE_OPENSSL OFF CACHE BOOL "" FORCE)
   set(CURL_USE_SECTRANSP OFF CACHE BOOL "" FORCE)
+  # curl 8.21.0+ hard-requires libpsl when the option is on; the LLM client
+  # sends no cookies, so PSL public-suffix matching is not needed.
+  set(CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
     curl
     URL https://github.com/curl/curl/releases/download/curl-8_22_0/curl-8.22.0.tar.xz
