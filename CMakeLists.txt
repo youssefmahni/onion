@@ -69,7 +69,7 @@ endif()
 # Data layer
 onion_add_module(log)
 onion_add_module(store)
-onion_add_module(llm)
+onion_add_compiled_module(llm src/llm/limiter.cpp)
 target_link_libraries(log INTERFACE onion::core onion::platform)
 target_link_libraries(store INTERFACE onion::core onion::platform)
 target_link_libraries(llm INTERFACE onion::core onion::platform)
@@ -133,6 +133,13 @@ if(BUILD_TESTING)
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
   gtest_discover_tests(onion_platform_test)
+
+  add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
+  target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
+  gtest_discover_tests(onion_limiter_test)
+
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME fake_deepseek.smoke COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/fake_deepseek_test.py")
 
   add_executable(onion_golden_test tests/golden/golden_test.cpp)
   target_link_libraries(onion_golden_test PRIVATE monocypher GTest::gtest_main)
