@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import socket
+import struct
+import threading
 from pathlib import Path
 
 
@@ -34,6 +36,35 @@ def main():
         assert completed.returncode == 1, completed.stderr
         assert_transport(completed.stdout)
         return
+    if args.mode in ("reset", "timeout"):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0)); listener.listen(2048)
+        port = listener.getsockname()[1]
+        stop = threading.Event()
+        def accept():
+            while not stop.is_set():
+                try:
+                    listener.settimeout(.1); connection, _ = listener.accept()
+                    if args.mode == "reset":
+                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                              struct.pack("ii", 1, 0))
+                        connection.close()
+                    else:
+                        threading.Thread(target=lambda connection=connection: (stop.wait(), connection.close()), daemon=True).start()
+                except socket.timeout: pass
+        thread = threading.Thread(target=accept, daemon=True); thread.start()
+        try:
+            timeout = "2" if args.mode == "reset" else "1"
+            completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", timeout], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            assert completed.returncode == 1, completed.stderr
+            if args.mode == "reset":
+                assert_transport(completed.stdout)
+            else:
+                assert "timeouts_uncertain_billed=1000" in completed.stdout, completed.stdout
+                assert "breaker_open=true" in completed.stdout, completed.stdout
+        finally:
+            stop.set(); listener.close()
+        return
     with tempfile.TemporaryDirectory() as temporary:
         if args.mode in ("auth", "balance"):
             status = 401 if args.mode == "auth" else 402
@@ -51,40 +82,6 @@ def main():
             finally:
                 server.terminate(); server.wait(timeout=10)
             return
-        if args.mode == "timeout":
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.bind(("127.0.0.1", 0)); listener.listen(2048)
-            port = listener.getsockname()[1]
-            # Accept connections but deliberately never reply.
-            import threading
-            stop = threading.Event()
-            def accept():
-                while not stop.is_set():
-                    try:
-                        listener.settimeout(.1); connection, _ = listener.accept()
-                        threading.Thread(target=lambda connection=connection: (stop.wait(), connection.close()), daemon=True).start()
-                    except socket.timeout: pass
-            thread = threading.Thread(target=accept, daemon=True); thread.start()
-            try:
-                completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", "1"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-                assert completed.returncode == 1, completed.stderr
-                assert "timeouts_uncertain_billed=1000" in completed.stdout, completed.stdout
-                assert "breaker_open=true" in completed.stdout, completed.stdout
-            finally:
-                stop.set(); listener.close()
-            return
-        scenario = Path(temporary) / "reset.json"
-        scenario.write_text(json.dumps({"reset_connection_rate": 1.0}), encoding="utf-8")
-        record = Path(temporary) / "record.jsonl"
-        server = subprocess.Popen([sys.executable, str(SERVER), "--scenario", str(scenario), "--record", str(record), "--port", "0"], stdout=subprocess.PIPE, text=True)
-        try:
-            port = server.stdout.readline().strip()
-            completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-            assert completed.returncode == 1, completed.stderr
-            assert_transport(completed.stdout)
-        finally:
-            server.terminate()
-            server.wait(timeout=10)
 
 
 if __name__ == "__main__":

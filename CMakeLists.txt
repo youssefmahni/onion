@@ -63,7 +63,7 @@ if(ONION_ENABLE_OPENCL)
   find_library(ONION_OPENCL_LIBRARY NAMES OpenCL libOpenCL.so.1)
 endif()
 
-if(ONION_OPENCL_INCLUDE_DIR AND ONION_OPENCL_LIBRARY)
+if(ONION_ENABLE_OPENCL AND ONION_OPENCL_INCLUDE_DIR AND ONION_OPENCL_LIBRARY)
   onion_add_compiled_module(gpu src/gpu/depot_gpu.cpp)
   target_include_directories(gpu PUBLIC "${ONION_OPENCL_INCLUDE_DIR}")
   target_link_libraries(gpu PUBLIC onion::core "${ONION_OPENCL_LIBRARY}")

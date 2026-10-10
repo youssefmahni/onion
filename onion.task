@@ -64,6 +64,8 @@ the technical progress log in `docs/agent/PROGRESS.md`.
   process thread count is unchanged at 100 and 1,000 simultaneous requests.
 - Added capacity, fixed-limit connection-reuse, half-budget, and compressed
   adaptive-limiter trace benchmark modes and their automated contracts.
+- Corrected the sanitizer configuration so disabling OpenCL actually skips the
+  GPU target, and made the reset regression use a raw local reset listener.
 
 ## Next approved task
 

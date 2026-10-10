@@ -10,6 +10,9 @@
   controls · local fake-server capacity run completed 1,000 requests at limit
   1,000; the limit-100 reuse run opened 100 connections for 1,000 requests;
   half-budget run started 500 and refused 500 · no real calls
+- 2026-10-10: Corrected the sanitizer-only OpenCL switch and converted the
+  reset fixture to a raw local TCP reset listener, avoiding Python handler
+  queue delay · focused timeout/reset tests pass · no real calls
 - 2026-10-10: Added compressed 30-second adaptive traces for healthy,
   rate-limited and slow-under-load observations · corrected first-baseline
   scheduling so the initial probe is one hour later, not in the next window ·
