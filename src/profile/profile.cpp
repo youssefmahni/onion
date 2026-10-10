@@ -46,9 +46,11 @@ Scan scan(const ScanOptions& options) {
     }
   }
 
-  // GPU fp64 from the OpenCL layer.
+  // GPU fp64 from the OpenCL layer, when the optional GPU module exists.
+#ifdef ONION_HAVE_OPENCL
   for (const auto& device : depot::gpu::list_devices())
     if (device.fp64) inputs.gpu_fp64 = true;
+#endif
 
   // Battery and load from the platform sampler.
   const onion::platform::Sample sample = onion::platform::sample();
