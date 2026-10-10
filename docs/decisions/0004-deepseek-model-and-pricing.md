@@ -9,20 +9,30 @@ hard-coded price would silently become wrong during part of each week.
 ## Options
 
 1. Hard-code one current rate in the client.
-2. Use the documented Flash model name and require the active rates in
-   `node.conf`.
+2. Configure one active rate and change it manually at every window boundary.
+3. Configure peak and off-peak rates plus their UTC window.
 
 ## Choice
 
-Use `deepseek-flash` as the M2 model identifier. `node.conf` must explicitly
-provide `llm.price_in`, `llm.price_cache`, and `llm.price_out`; the client has
-no implicit monetary defaults.
+Use `deepseek-flash` as the M2 model identifier. `node.conf` explicitly
+provides `llm.price_peak_in`, `llm.price_peak_cache`, `llm.price_peak_out`,
+`llm.price_offpeak_in`, `llm.price_offpeak_cache`, `llm.price_offpeak_out`,
+and `llm.offpeak_utc` (weekly UTC intervals). The client has no implicit
+monetary defaults.
 
 On 2026-10-10, the official source was
 https://api-docs.deepseek.com/quick_start/pricing/. It listed, per million
 tokens: peak input cache miss $0.30, cache hit $0.006, output $1.20; off-peak
-input cache miss $0.15, cache hit $0.003, output $0.60. Operators select the
-applicable rate in `node.conf` and update it when DeepSeek changes pricing.
+input cache miss $0.15, cache hit $0.003, output $0.60. It states: “Peak
+hours are 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday.”
+
+The page does not state whether the price for a request crossing a window
+boundary is selected at request start, request completion, or otherwise. A
+call whose start and end timestamps are both inside one configured window is
+metered at that window's triplet. Until DeepSeek documents the crossing rule,
+a call spanning a boundary is metered at the higher triplet. Reservations
+always use the maximum of the two price triplets, preventing an overspend.
+Cost projections display both peak and off-peak totals.
 
 ## Consequences
 

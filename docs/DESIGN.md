@@ -524,21 +524,25 @@ llm.base_url    = https://api.deepseek.com/chat/completions
 llm.model       = deepseek-flash
 llm.max_tokens  = 6000
 llm.timeout_s   = 120
-llm.price_in    = <USD per 1M input tokens, cache miss>
-llm.price_cache = <USD per 1M input tokens, cache hit>
-llm.price_out   = <USD per 1M output tokens>
+llm.price_peak_in       = <USD per 1M input tokens, cache miss>
+llm.price_peak_cache    = <USD per 1M input tokens, cache hit>
+llm.price_peak_out      = <USD per 1M output tokens>
+llm.price_offpeak_in    = <USD per 1M input tokens, cache miss>
+llm.price_offpeak_cache = <USD per 1M input tokens, cache hit>
+llm.price_offpeak_out   = <USD per 1M output tokens>
+llm.offpeak_utc         = <weekly UTC intervals>
 llm.budget_usd  = <budget>
 base_weight     = 1.0
 ```
 
 - **Reasoning knob.** Every DeepSeek request sends `reasoning_effort: "none"`; otherwise hidden reasoning can use the whole `max_tokens` and the reply comes back empty. A reply cut at `max_tokens` (`finish_reason` = `length`) is a failed attempt.
 - **Text only.** No image input anywhere; the old `vision.py` path is removed.
-- **Model ids and prices.** Read them from DeepSeek's `/models` endpoint and pricing page when setting up; nothing is hard-coded. A campaign's model and critic model must exist in every device's config.
+- **Model ids and prices.** Read them from DeepSeek's `/models` endpoint and pricing page when setting up; nothing is hard-coded. Configure peak and off-peak price triplets plus the weekly off-peak UTC intervals. A campaign's model and critic model must exist in every device's config.
 - **Keys.** One DeepSeek key per device, held in the OS key store. It never enters the log, gossip or sync traffic, so a leak or revocation affects one device only.
-- **Metering.** After each call the device reads the token counts in the response's usage block (cache-hit input, cache-miss input, output) and multiplies them by the configured prices. Spend and remaining budget are gossiped, so any dashboard shows the whole fleet.
+- **Metering.** After each call the device reads the token counts in the response's usage block (cache-hit input, cache-miss input, output). A call whose start and end timestamps fall inside one configured price window is billed at that window's triplet. A call spanning a UTC price-window boundary is billed at the higher triplet until DeepSeek documents its boundary rule. Spend and remaining budget are gossiped, so any dashboard shows the whole fleet. Cost projections show both peak and off-peak totals.
 - **Prompt caching.** Fixed instructions come first in every prompt and node-specific text last, so DeepSeek's cache can bill the shared prefix at the cheaper cache-hit rate.
 - **Errors.** HTTP 429 and 503 are retried with backoff, honouring `Retry-After`; the circuit breaker (P6) pauses the device after 20 consecutive failures.
-- **Reservation.** Before a ticket starts, the worker reserves that ticket's worst case (the pre-check plus every agent call of 3 attempts at `max_tokens`) from the remaining budget, and releases the unused part when the ticket ends. With hundreds of tickets in flight, reservations decide whether a new ticket may start, so the budget is never overspent.
+- **Reservation.** Before a ticket starts, the worker reserves that ticket's worst case (the pre-check plus every agent call of 3 attempts at `max_tokens`) at the higher configured price triplet, then releases the unused part when the ticket ends. With hundreds of tickets in flight, reservations decide whether a new ticket may start, so the budget is never overspent.
 - **Stop.** When no reservation fits, the device starts no new tickets, finishes those in flight, and its weight drops to 0.
 - **While stopped.** The device keeps syncing and serving its log, so it stays a full member. The `llm` title sweep stops too, since it also spends budget.
 - **Refill.** Only by hand: `data_depot node budget set <usd>`. Its weight returns and tickets flow back with minimal movement.
