@@ -2,12 +2,13 @@
 
 ## Current
 
-- Milestone: M3 · branch m3-engine · started 2026-10-10
-- M2 merged (`24a90eb`), tagged `m2-rc`
-- Tests: 182/182 new-tree on Linux (gtest + python) · legacy 98/98 · CI: pending push
+- Milestone: M4 · branch m4-signed-log · started 2026-10-10
+- M3 merged (`1b3eee5`, PR #7), tagged `m3-rc`; M2 merged (`24a90eb`), tagged `m2-rc`
+- Tests: 182/182 new-tree on Linux · legacy 98/98 · CI green on the M3 merge
 
 ## Log (newest first)
 
+- 2026-10-10: M3 merged as PR #7 (`1b3eee5`), all 8 CI jobs green, tagged `m3-rc` · gate report docs/agent/gates/M3.md with the offline 409-node campaign, P7 scans, live review accept, cost projection, kill-at-every-commit-step and the real DeepSeek run ($0.0135)
 - 2026-10-10: M3 real campaign against DeepSeek: one node, 3 attempts (0.35/0.35/0.22), all below the floor → review, nothing committed; audit records carry real token counts and peak-priced cost ($0.0135) · hard crash found and fixed: the strict parsers threw on a reply whose `issues` field was an array instead of a string — parsers now reject malformed replies without throwing
 - 2026-10-10: ATTEMPT audit records now carry the real token counts and the peak-priced cost (CLI --price-in/--price-cache/--price-out; node.conf arrives in M5); the funnel result counts LLM calls exactly
 - 2026-10-10: M3 end-to-end offline campaign via the CLI: fake funnel server, dev-import root, `campaign start` with cost projection, `node run` → 409 settled nodes, ended by the stop rule, campaign closed; P7 log scan clean (no failed attempt committed for any settled node); review accept over the live API (token + Origin + Content-Type) moves the item to decided; dashboard served at `/` · no real calls
