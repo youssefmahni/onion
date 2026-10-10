@@ -584,7 +584,7 @@ int admin_cmd(int argc, char** argv) {
     if (ec) return false;
     const auto relative = canonical_parent.lexically_relative(canonical_base);
     if (relative.empty()) return true;  // the data directory itself
-    return !relative.empty() && relative.native().find("..") != 0;
+    return !relative.empty() && relative.string().find("..") != 0;
   };
   if (inside(target, data)) {
     std::cerr << "refusing to write the admin key inside the data directory\n";
