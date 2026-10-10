@@ -10,6 +10,7 @@
 #include <zstd.h>
 
 #include "log/log.hpp"
+#include "store/checkpoint.hpp"
 
 namespace onion::state {
 namespace {
@@ -208,9 +209,32 @@ bool StateWriter::start(std::string* error) {
   if (!segments_->open(error)) return false;
   replay(error);
   if (error && !error->empty()) return false;
+  last_checkpoint_ = std::chrono::steady_clock::now();
   started_ = true;
   thread_ = std::thread([this] { run(); });
   return true;
+}
+
+bool StateWriter::write_checkpoint(std::string* error) {
+  std::string query_error;
+  std::map<std::string, std::int64_t> vector;
+  std::optional<store::Statement> stmt = db_.prepare(
+      "SELECT origin, seq FROM applied ORDER BY origin;", &query_error);
+  if (stmt) {
+    std::string step_error;
+    while (stmt->step_row(&step_error))
+      vector[stmt->text(0)] = stmt->integer(1);
+  }
+  store::CheckpointWriter writer(
+      options_.data_dir,
+      [this](std::string_view bytes) {
+        return options_.device_key && signer_ ? signer_->sign(bytes)
+                                              : std::string{};
+      });
+  const bool ok = writer.write(hlc_.now(), vector, error);
+  applied_since_checkpoint_.store(0);
+  last_checkpoint_ = std::chrono::steady_clock::now();
+  return ok;
 }
 
 namespace {
@@ -303,6 +327,7 @@ void StateWriter::replay(std::string* error) {
         next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
       fold(record, error);
     }
+    applied_since_checkpoint_ += batch.records.size();
     next_batch_ = batch.number + 1;
     expected_batch = batch.number + 1;
     expected_prev = batch.hash;

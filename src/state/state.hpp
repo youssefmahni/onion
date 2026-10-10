@@ -84,6 +84,8 @@ class StateWriter {
   void submit(DevImport command);
   // Blocks until every queued command is durable and folded.
   void sync();
+  // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
+  bool write_checkpoint(std::string* error);
   // Drains and joins the writer thread.
   void stop();
 
@@ -135,6 +137,8 @@ class StateWriter {
   // Writer-thread state: pending ATTEMPT group-commit.
   std::vector<log::Record> pending_attempts_;
   std::chrono::steady_clock::time_point last_flush_;
+  std::chrono::steady_clock::time_point last_checkpoint_;
+  std::atomic<std::uint64_t> applied_since_checkpoint_{0};
 
   // Shared read index, rebuilt by replay and kept current by the fold.
   mutable std::shared_mutex index_mutex_;

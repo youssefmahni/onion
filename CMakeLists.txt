@@ -134,8 +134,8 @@ target_include_directories(log PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)
 target_link_libraries(log PUBLIC onion::core onion::platform)
-onion_add_compiled_module(store src/store/store.cpp)
-target_link_libraries(store PUBLIC onion_sqlite)
+onion_add_compiled_module(store src/store/store.cpp src/store/checkpoint.cpp)
+target_link_libraries(store PUBLIC onion_sqlite onion::log)
 target_link_libraries(store PUBLIC onion::core onion::platform)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
@@ -186,7 +186,8 @@ onion_add_compiled_module(sched src/sched/sched.cpp)
 target_link_libraries(sched PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(sched PUBLIC onion::core onion::gate onion::state)
 onion_add_compiled_module(state src/state/state.cpp)
-target_link_libraries(state PUBLIC onion::core onion::log onion::store)
+target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
+target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
 
 # Interface layer
 FetchContent_Declare(
