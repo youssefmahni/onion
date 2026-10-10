@@ -185,6 +185,22 @@ int node_cmd(int argc, char** argv) {
               << " cpu_pool=" << settings.rules.cpu_pool
               << " on_battery_cap=" << settings.rules.on_battery_cap
               << " ram_floor_gb=" << settings.rules.ram_floor_gb << "\n";
+    // history: the stored profile versions
+    onion::store::Db db(dir / "onion.db");
+    std::string error;
+    if (db.open(&error)) {
+      auto stmt = db.prepare(
+          "SELECT version, reason, changed, rules_version FROM profiles "
+          "ORDER BY version;",
+          &error);
+      if (stmt) {
+        std::string step_error;
+        while (stmt->step_row(&step_error))
+          std::cout << "profile v" << stmt->integer(0) << " "
+                    << stmt->text(1) << " changed=[" << stmt->text(2)
+                    << "] rules_v" << stmt->integer(3) << "\n";
+      }
+    }
     return 0;
   }
   if (argc >= 3 && std::string(argv[2]) == "key") {
@@ -264,7 +280,25 @@ int node_cmd(int argc, char** argv) {
                  "'node key set'\n";
   }
 
-  onion::llm::Client client({base_url, key, 120, 10, 1, 1000});
+  // The profile feeds the concurrency defaults: the client's in-flight
+  // ceiling starts at the profile's start limit and never exceeds the
+  // profile ceiling.
+  int profile_limit = 16;
+  {
+    onion::profile::ScanOptions scan_options;
+    scan_options.data_dir = dir.string();
+    scan_options.provider_url = base_url;
+    const onion::profile::Scan scan = onion::profile::scan(scan_options);
+    const onion::profile::DerivedSettings settings =
+        onion::profile::derive(scan, {});
+    profile_limit = std::min(std::max(settings.rules.start_limit, 1),
+                             settings.rules.ceiling);
+    std::cout << "profile: base_weight=" << settings.rules.base_weight
+              << " start_limit=" << settings.rules.start_limit
+              << " ceiling=" << settings.rules.ceiling << "\n";
+  }
+  onion::llm::Client client(
+      {base_url, key, 120, 10, 1, static_cast<std::size_t>(profile_limit)});
   onion::llm::Budget budget("1000");
   const onion::gate::SyncAsk ask = sync_ask(client);
 
