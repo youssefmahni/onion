@@ -15,11 +15,11 @@ Every rule touched by a milestone must have at least one passing test before tha
 | 401/402: no retry, breaker opens after 3 with reason | `CircuitBreaker.AuthAndBalanceOpenAfterThreeWithReason`, `llm.auth_401`, `llm.balance_402` | ✅ |
 | Transport failure: counts toward 20-failure breaker; refused connection is Transport, never Timeout | `CircuitBreaker.OpensAfterTwentyConsecutiveTransportFailures`, `llm.closed_port_1000`, `llm.reset_connections_1000` | ✅ |
 | Successful/truncated response resets the breaker | `CircuitBreaker.OpensAfterTwentyConsecutiveTransportFailures` (Ok resets) | ✅ |
-| `finish_reason: "length"` classified as failed attempt (Truncated) | `tools/fake_deepseek/scenarios/truncating.json` + client classification | ⏳ add explicit test |
-| Prompt caching: fixed text first, node text last | client payload order (system then user content); fake server records | ⏳ real-call validation |
-| Reasoning knob `reasoning_effort: "none"` on every request | client payload construction | ⏳ real-call validation |
+| `finish_reason: "length"` classified as failed attempt (Truncated) | `llm.truncating_20` (20 truncated replies: all failed, breaker stays closed) + real-API observation in decision 0004 | ✅ |
+| Prompt caching: fixed text first, node text last | client payload order; real repeat produced 0 hits on a 17-token prefix (finding in decision 0004) | ✅ recorded |
+| Reasoning knob `reasoning_effort: "none"` on every request | client payload construction; accepted by the real API (decision 0004 update) | ✅ |
 | Keys: never in logs, records, or traffic | `fake_deepseek_test.py` (Authorization absent from recorded request) | ✅ |
-| 400/422: no retry, count toward breaker | `parse_result` → `ClientError` | ⏳ add explicit test |
+| 400/422: no retry, count toward breaker | `llm.client_error_400` (20 × 400 opens the provider-or-transport breaker) | ✅ |
 
 ## M2 scope: DESIGN.md › Concurrency
 
@@ -34,7 +34,7 @@ Every rule touched by a milestone must have at least one passing test before tha
 | Waiting and working separated; worker = task slot | CPU parsing pool + curl_multi event loop | ✅ |
 | FD ceiling caps in-flight requests | `PlatformFileLimits.ReservesDescriptorsForEngineResources`, `PlatformFileLimits.RaisesMacOSSoftLimitToAtLeast4096` (macOS CI) | ✅ |
 | G6: Windows vendored curl has no HTTP/2 → HTTP/1.1 fallback | accepted limitation (owner decision), recorded in STATUS.md / M2 gate | ✅ recorded |
-| Separate connect timeout from total timeout (slow Windows refusal classified as Transport) | `llm.closed_port_1000` with `--connect-timeout` | ⏳ G3 in progress |
+| Separate connect timeout from total timeout (slow Windows refusal classified as Transport) | `llm.closed_port_1000` with `--connect-timeout` (decision 0007); Windows CI passed in 2.31 s | ✅ |
 
 ## M1 scope (kept from M1 gate)
 

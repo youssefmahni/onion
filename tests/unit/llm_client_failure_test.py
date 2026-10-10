@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py"
+SCENARIOS = ROOT / "tools" / "fake_deepseek" / "scenarios"
 
 
 def assert_transport(output):
@@ -24,7 +25,7 @@ def assert_transport(output):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("closed-port", "reset", "timeout", "auth", "balance"), required=True)
+    parser.add_argument("--mode", choices=("closed-port", "reset", "timeout", "auth", "balance", "truncating", "client-error"), required=True)
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
     if args.mode == "closed-port":
@@ -85,6 +86,28 @@ def main():
             for connection in held: connection.close()
             listener.close()
         return
+    if args.mode in ("truncating", "client-error"):
+        scenario = SCENARIOS / "truncating.json" if args.mode == "truncating" else None
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.jsonl"
+            if args.mode == "client-error":
+                scenario = Path(temporary) / "client_error.json"
+                scenario.write_text(json.dumps({"errors": {"status": 400}}), encoding="utf-8")
+            server = subprocess.Popen([sys.executable, str(SERVER), "--scenario", str(scenario), "--record", str(record), "--port", "0"], stdout=subprocess.PIPE, text=True)
+            try:
+                port = server.stdout.readline().strip()
+                completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "20", "--limit", "8"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                assert "failed=20" in completed.stdout, completed.stdout
+                if args.mode == "truncating":
+                    # Truncated replies are failed attempts but reset the breaker.
+                    assert "breaker_open=false" in completed.stdout, completed.stdout
+                else:
+                    # 400 counts toward the 20-failure breaker and opens it.
+                    assert "breaker_open=true" in completed.stdout, completed.stdout
+                    assert "breaker_reason=provider-or-transport" in completed.stdout, completed.stdout
+            finally:
+                server.terminate(); server.wait(timeout=10)
+            return
     with tempfile.TemporaryDirectory() as temporary:
         if args.mode in ("auth", "balance"):
             status = 401 if args.mode == "auth" else 402

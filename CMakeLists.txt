@@ -198,6 +198,8 @@ if(BUILD_TESTING)
   add_test(NAME llm.auth_401 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "auth" "$<TARGET_FILE:data_depot>")
   add_test(NAME llm.balance_402 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "balance" "$<TARGET_FILE:data_depot>")
   add_test(NAME llm.limiter_traces COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/limiter_trace_test.py" "$<TARGET_FILE:data_depot>")
+  add_test(NAME llm.truncating_20 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "truncating" "$<TARGET_FILE:data_depot>")
+  add_test(NAME llm.client_error_400 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "client-error" "$<TARGET_FILE:data_depot>")
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
