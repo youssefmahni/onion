@@ -58,7 +58,8 @@ endif()
 
 onion_add_compiled_module(platform src/platform/platform.cpp)
 if(WIN32)
-  target_link_libraries(platform PRIVATE Crypt32 Iphlpapi)
+  # platform is static, so consumers must receive the Windows API import libs.
+  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi)
 endif()
 
 # Data layer
