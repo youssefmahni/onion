@@ -10,3 +10,6 @@ Onion.json
 Onion_Review.html
 *.tar.gz
 __pycache__/
+.aws/
+.env
+*.pem

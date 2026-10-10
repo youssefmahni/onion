@@ -8,7 +8,7 @@ Rebuild the engine in ten milestones, M0 to M9, keeping the pure algorithmic cor
 
 **Strategy**
 
-- **Keep what is proven.** `depot_core` (canonical titles, similarity, parsers, style gates) and `depot_gpu` move over unchanged with their 92 tests, which become the regression oracle for the core.
+- **Keep what is proven.** `depot_core` (canonical titles, similarity, parsers, style gates) and `depot_gpu` remain unchanged in `legacy/`, which retains all 98 tests; M1 copies 67 pure-core tests and 8 GPU tests (75 total) into the new tree as its regression oracle.
 - **Rewrite what blocks the design.** Funnel orchestration, LLM transport, storage, supervisor and CLI are rewritten as the modules in the design doc: one process per machine, SQLite as the store, signed logs as the truth, DeepSeek as the only provider.
 - **Drop what no longer fits.** Image understanding (`vision.py`), the bash launch scripts, the duplicated thread-policy code and the stale report scripts.
 - **Single machine first, fleet second.** The quality gate and the local engine (M3) are finished before any sync (M6), so every machine that ever joins produces checked output.
@@ -64,7 +64,7 @@ onion/
     api/                     local HTTP API (/api/state, review, campaigns)
     cli/                     main: node, campaign, review subcommands
   tests/
-    unit/                    per module, plus the 92 kept tests
+    unit/                    per module, plus 75 copied core/GPU regression tests
     golden/                  cross-OS byte-identical canonical bytes, hashes, signatures
     fleet/                   several nodes in one process, in-memory network
   tools/
@@ -100,7 +100,7 @@ Ten milestones in strict order; each needs the one before it, and sizes are rela
 | Milestone | Builds | Exit gate | Size |
 | --- | --- | --- | --- |
 | **M0 · Stabilize today's code** | P1 to P7 in the old code; full off-machine backup of CSVs and TSVs; duplicate-path report | One real DeepSeek node succeeds on a Mac; the P7 regression test passes | S |
-| **M1 · Foundations** | New repo layout; CMake presets; CI on macOS, Linux, Windows 10 and 11; vendored libraries; `depot_platform`; core and GPU moved with their tests; dropped files removed | The 92 kept tests pass on every target; a golden test produces identical bytes on every OS | M |
+| **M1 · Foundations** | New repo layout; CMake presets; CI on macOS, Linux, Windows 10 and 11; vendored libraries; `depot_platform`; core and GPU copied with their tests; dropped files removed | The 75 copied tests pass on every target (GPU tests skipped where no OpenCL runtime exists); a golden test produces identical bytes on every OS | M |
 | **M2 · DeepSeek client** | `depot_llm`: async requests, metering, reservations, adaptive limit, backoff, circuit breaker; `tools/fake_deepseek` | Against the fake server: 1,000 requests in flight on about 20 threads, the limit halves on 429, no budget overspend | M |
 | **M3 · One-machine engine** | SQLite store, `depot_state`, `depot_gate` (pre-check, funnel, checks, best-of-3, leaf rules, review), `depot_sched` with campaigns and one lane, CLI, local API, dashboard on the new `/api/state` | A test campaign of a few hundred nodes on one Mac: no failed attempt is committed, review works from the dashboard, the cost projection is shown before start | L |
 | **M4 · Signed log and genesis import** | Keys, 2^40 slot ids, batches, segments, torn-tail repair, checkpoints, admin key; the genesis import of the existing corpus; cutover from the old system | Import counts, parents and Merkle root match the cleaned CSVs; a cut at every byte offset keeps exactly the complete batches | L |
@@ -137,7 +137,7 @@ Five test layers, each added when its milestone needs it; nothing merges unless 
 
 | Layer | What it is | From | Proves |
 | --- | --- | --- | --- |
-| Unit | gtest per module, plus the 92 kept tests | M1 | Every rule in the design doc, one test per rule |
+| Unit | gtest per module, plus 75 copied core/GPU regression tests | M1 | Every rule in the design doc, one test per rule |
 | Golden | The same inputs canonicalized, hashed and signed on each OS | M1 | Byte-identical results, so every OS folds the same state |
 | Fake DeepSeek | `tools/fake_deepseek`: scripted latency, 429, 503, cut-off replies, bad JSON | M2 | Limit, reservations, retries and the gate behave under every failure |
 | Fleet harness | Several nodes in one process over an in-memory network | M6 | Convergence, lanes, stealing, claims and merges under reordering and duplicates |

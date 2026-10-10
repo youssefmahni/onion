@@ -277,7 +277,7 @@ SELECT * FROM nodes WHERE path = :p OR (path >= :p || '-' AND path < :p || '.');
 Every state change is a record. All records of one commit go into one signed, hash-chained batch, written as one JSON line in its origin's log; the store is a deterministic fold of all logs. Signing once per batch instead of once per record keeps the logs small and fast.
 
 ```json
-{"v":1,"o":"9f2c41ab07de5531","b":312,"prev":"<blake2b of batch 311>","hash":"<blake2b of recs>","sig":"<ed25519 over prev and hash>","recs":[{"s":4121,"h":1760010000000001,"t":"ADD_NODE","p":{"path":"P01-IN01-T03-ST47-TD1362-TK164926744166401","layer":6,"title":"Order Capture"}},{"s":4122,"h":1760010000000002,"t":"SETTLE","p":{"path":"P01-IN01-T03-ST47-TD1362","kept":1,"end":"children"}}]}
+{"v":1,"o":"9f2c41ab07de5531","b":312,"prev":"<blake2b of batch 311>","hash":"<blake2b of recs>","sig":"<ed25519 over prev and hash>","recs":[{"s":4121,"h":115344015360000001,"t":"ADD_NODE","p":{"path":"P01-IN01-T03-ST47-TD1362-TK164926744166401","layer":6,"title":"Order Capture"}},{"s":4122,"h":115344015360000002,"t":"SETTLE","p":{"path":"P01-IN01-T03-ST47-TD1362","kept":1,"end":"children"}}]}
 ```
 
 | Field | Meaning |
@@ -292,6 +292,8 @@ Every state change is a record. All records of one commit go into one signed, ha
 | `recs[].h` | Hybrid logical clock: 48-bit physical ms + 16-bit logical counter |
 | `recs[].t` | Op type (below) |
 | `recs[].p` | Payload |
+
+**Record-number canonicalization.** Every number in a record is a signed 64-bit integer, rendered as exact base-10 decimal digits. Floating-point values are forbidden. This intentionally differs from RFC 8785's ECMAScript-number serialization above 2<sup>53</sup>, because a current HLC such as `115344015360000001` must retain every bit across all platforms. Canonicalization otherwise follows RFC 8785: object keys are sorted, no insignificant whitespace is emitted, and strings use its minimal JSON escaping rules.
 
 | Op | Payload | Emitted by |
 | --- | --- | --- |
