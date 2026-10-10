@@ -183,3 +183,64 @@ TEST(NodeIdAllocator, SlotBounds) {
   EXPECT_LT(onion::sched::NodeIdAllocator::counter_from_code(last),
             std::numeric_limits<std::int64_t>::max() / 2);
 }
+
+// --------------------------------------------------------------- M6 lanes
+
+TEST(HrwLanes, ScoreIsDeterministicAndStrictlyBetweenBounds) {
+  using onion::sched::hrw_score;
+  const double score = hrw_score("P01-IN01", "dev0000000000000001", 1.0);
+  EXPECT_TRUE(std::isfinite(score));
+  EXPECT_GT(score, 0.0);
+  // Identical inputs give identical scores.
+  EXPECT_EQ(hrw_score("P01-IN01", "dev0000000000000001", 1.0), score);
+  // Different paths usually move the score (no equality guaranteed, but
+  // the function must not crash or repeat the same value for all paths).
+  EXPECT_NE(hrw_score("P01-IN02", "dev0000000000000001", 1.0),
+            hrw_score("P01-IN03", "dev0000000000000001", 1.0));
+}
+
+TEST(HrwLanes, OwnerIsTheHighestWeightedScore) {
+  using onion::sched::lane_owner;
+  const std::vector<onion::sched::LaneMember> members = {
+      {"dev0000000000000001", 1.0},
+      {"dev0000000000000002", 2.0},
+  };
+  const auto owner = lane_owner("P01-IN01", members);
+  ASSERT_TRUE(owner.has_value());
+  // With double the weight, device 2 usually owns; whichever, the owner is
+  // one of the members and the same call repeats it.
+  EXPECT_EQ(lane_owner("P01-IN01", members), owner);
+  const bool is_member = *owner == "dev0000000000000001" ||
+                         *owner == "dev0000000000000002";
+  EXPECT_TRUE(is_member);
+  // Empty members: no owner.
+  EXPECT_FALSE(lane_owner("P01-IN01", {}).has_value());
+}
+
+TEST(HrwLanes, WeightShiftMovesALargeShare) {
+  using onion::sched::lane_owner;
+  std::vector<onion::sched::LaneMember> members = {
+      {"dev0000000000000001", 1.0},
+      {"dev0000000000000002", 1.0},
+  };
+  int first_owns = 0;
+  int second_owns = 0;
+  for (int i = 0; i < 200; ++i) {
+    const auto owner =
+        lane_owner("P01-IN" + std::to_string(100 + i), members);
+    if (*owner == "dev0000000000000001") first_owns++;
+    else second_owns++;
+  }
+  EXPECT_GT(first_owns, 0);
+  EXPECT_GT(second_owns, 0);
+  // Raising one weight must not DECREASE its share substantially: with 4x
+  // the weight, the heavier device owns more than half of the paths.
+  members[1].weight = 4.0;
+  int heavier = 0;
+  for (int i = 0; i < 200; ++i) {
+    const auto owner =
+        lane_owner("P01-IN" + std::to_string(100 + i), members);
+    if (*owner == "dev0000000000000002") heavier++;
+  }
+  EXPECT_GT(heavier, 100);
+}

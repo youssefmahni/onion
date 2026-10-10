@@ -1,6 +1,7 @@
 #include "sched.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <deque>
 #include <limits>
@@ -329,6 +330,18 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     }
 
     std::vector<Ticket> tickets = refresh_tickets();
+    // M6: only the tickets whose home lane is this device are worked; the
+    // rest stay for their owners.
+    if (!impl_->options.self.empty() && !impl_->options.members.empty()) {
+      tickets.erase(
+          std::remove_if(tickets.begin(), tickets.end(),
+                         [&](const Ticket& ticket) {
+                           const auto owner = lane_owner(
+                               ticket.path, impl_->options.members);
+                           return !owner || *owner != impl_->options.self;
+                         }),
+          tickets.end());
+    }
     if (tickets.empty() && waiting.empty()) cache_valid = false;
     if (tickets.empty() && waiting.empty()) {
       result.end_reason = "drained";
@@ -572,6 +585,41 @@ void Engine::review_reject(std::string_view path, const CampaignSpec& spec) {
       "REVIEW", {{"path", std::string(path)}, {"decision", "reject"}, {"note", ""}}));
   impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
   impl_->options.writer.sync();
+}
+
+
+// ------------------------------------------------------------------ lanes
+
+double hrw_score(std::string_view path, std::string_view device_id,
+                 double weight) {
+  const std::string combined = std::string(path) + std::string(device_id);
+  const std::string digest = onion::log::blake2b_hex(combined);
+  // First 64 bits big-endian from the first 16 hex characters.
+  std::uint64_t x = 0;
+  for (int i = 0; i < 16; ++i) {
+    const char c = digest[static_cast<std::size_t>(i)];
+    const int nibble = c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10;
+    x = (x << 4) | static_cast<std::uint64_t>(nibble);
+  }
+  const double h = (static_cast<double>(x) + 0.5) / 18446744073709551616.0;
+  // h is strictly in (0, 1), so ln(h) is finite and negative.
+  return -weight / std::log(h);
+}
+
+std::optional<std::string> lane_owner(std::string_view path,
+                                      const std::vector<LaneMember>& members) {
+  if (members.empty()) return std::nullopt;
+  double best_score = -std::numeric_limits<double>::infinity();
+  std::string best_id;
+  for (const LaneMember& member : members) {
+    const double score = hrw_score(path, member.device_id, member.weight);
+    if (score > best_score ||
+        (score == best_score && member.device_id < best_id)) {
+      best_score = score;
+      best_id = member.device_id;
+    }
+  }
+  return best_id;
 }
 
 }  // namespace onion::sched

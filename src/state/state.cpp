@@ -330,8 +330,9 @@ void StateWriter::replay(std::string* error) {
     for (const log::Record& record : batch.records) {
       if (record.seq >= static_cast<std::int64_t>(next_seq_))
         next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
-      fold(record, error);
+      fold(record, batch.origin, error);
     }
+    update_applied(batch.origin, batch.records);
     applied_since_checkpoint_ += batch.records.size();
     next_batch_ = batch.number + 1;
     expected_batch = batch.number + 1;
@@ -434,14 +435,16 @@ void StateWriter::rebuild_index() {
   }
 }
 
-void StateWriter::fold(const log::Record& record, std::string* error) {
+void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
+                       std::string* error) {
   const std::string& type = record.type;
-  if (type == "ADD_NODE") upsert_node(db_, record, options_.origin, error);
-  else if (type == "SETTLE") upsert_settle(db_, record, options_.origin, error);
-  else if (type == "ATTEMPT") upsert_attempt(db_, record, options_.origin, error);
-  else if (type == "CRITIQUE") upsert_critique(db_, record, options_.origin, error);
-  else if (type == "NEEDS_REVIEW") upsert_review(db_, record, options_.origin, error);
-  else if (type == "CAMPAIGN") upsert_campaign(db_, record, options_.origin, error);
+  const std::string origin(batch_origin);
+  if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
+  else if (type == "SETTLE") upsert_settle(db_, record, origin, error);
+  else if (type == "ATTEMPT") upsert_attempt(db_, record, origin, error);
+  else if (type == "CRITIQUE") upsert_critique(db_, record, origin, error);
+  else if (type == "NEEDS_REVIEW") upsert_review(db_, record, origin, error);
+  else if (type == "CAMPAIGN") upsert_campaign(db_, record, origin, error);
   // REVIEW decisions update the reviews row:
   else if (type == "REVIEW") {
     const auto& payload = record.payload;
@@ -543,10 +546,41 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;
   if (options_.crash_hook) options_.crash_hook(1);  // batch durable, store stale
-  for (const log::Record& record : records) fold(record, error);
+  for (const log::Record& record : records) fold(record, options_.origin, error);
+  update_applied(options_.origin, records);
   if (error && !error->empty()) return false;
   if (options_.crash_hook) options_.crash_hook(2);  // fold done
   return true;
+}
+
+void StateWriter::update_applied(std::string_view origin,
+                                 const std::vector<log::Record>& records) {
+  if (records.empty()) return;
+  std::string error;
+  auto statement = db_.prepare(
+      "INSERT INTO applied(origin, seq) VALUES (?1, ?2) "
+      "ON CONFLICT(origin) DO UPDATE SET seq = excluded.seq "
+      "WHERE excluded.seq > applied.seq;",
+      &error);
+  if (!statement) return;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(origin), &bind_error) ||
+      !statement->bind(2, records.back().seq, &bind_error)) {
+    return;
+  }
+  statement->step(&bind_error);
+}
+
+std::map<std::string, std::int64_t> StateWriter::vector() const {
+  std::map<std::string, std::int64_t> result;
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT origin, seq FROM applied ORDER BY origin;", &error);
+  if (!statement) return result;
+  std::string step_error;
+  while (statement->step_row(&step_error))
+    result[statement->text(0)] = statement->integer(1);
+  return result;
 }
 
 bool StateWriter::flush_pending_attempts(std::string* error) {
@@ -595,6 +629,34 @@ void StateWriter::run() {
         flush_pending_attempts(&error);
         if (error.empty()) append_batch(std::move(command.records), &error);
         break;
+      case Command::Kind::Foreign: {
+        // Append the verified foreign batch to the origin's local log and
+        // fold it. The batch was verified by the sync client.
+        flush_pending_attempts(&error);
+        if (!error.empty()) break;
+        // Append to the foreign origin's segments (a separate Segments).
+        auto& foreign_segments = foreign_segments_[command.foreign.origin];
+        if (!foreign_segments) {
+          log::Segments::Options segment_options;
+          segment_options.dir =
+              options_.data_dir / "oplog" / command.foreign.origin;
+          segment_options.origin = command.foreign.origin;
+          segment_options.seal_bytes = options_.seal_bytes;
+          foreign_segments =
+              std::make_unique<log::Segments>(segment_options);
+          std::string open_error;
+          foreign_segments->open(&open_error);
+        }
+        std::string append_error;
+        if (!foreign_segments->append(command.foreign, &append_error)) {
+          error = "foreign append failed: " + append_error;
+          break;
+        }
+        for (const log::Record& record : command.foreign.records)
+          fold(record, command.foreign.origin, &error);
+        update_applied(command.foreign.origin, command.foreign.records);
+        break;
+      }
       case Command::Kind::Import: {
         auto statement = db_.prepare(
             "INSERT INTO nodes(code, path, parent_id, layer, title, origin, "
@@ -666,6 +728,15 @@ void StateWriter::submit(DevImport command) {
   Command queued;
   queued.kind = Command::Kind::Import;
   queued.nodes = std::move(command.nodes);
+  queue_.push_back(std::move(queued));
+  queue_cv_.notify_one();
+}
+
+void StateWriter::submit(AppendForeign command) {
+  std::lock_guard lock(queue_mutex_);
+  Command queued;
+  queued.kind = Command::Kind::Foreign;
+  queued.foreign = std::move(command.batch);
   queue_.push_back(std::move(queued));
   queue_cv_.notify_one();
 }

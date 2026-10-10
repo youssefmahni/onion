@@ -171,12 +171,17 @@ target_link_libraries(store INTERFACE onion::core onion::platform)
 target_link_libraries(llm INTERFACE onion::core onion::platform)
 
 # Fleet layer
-onion_add_module(sync)
+onion_add_compiled_module(sync src/sync/sync.cpp)
+target_include_directories(sync PUBLIC "${httplib_SOURCE_DIR}")
+target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion::state)
+if(WIN32)
+  target_link_libraries(sync PUBLIC ws2_32)
+endif()
 onion_add_module(swim)
 onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
 target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onion::log onion::llm)
-target_link_libraries(sync INTERFACE onion::log onion::store onion::platform)
+
 target_link_libraries(swim INTERFACE onion::core onion::platform)
 
 # Engine layer
@@ -269,6 +274,10 @@ if(BUILD_TESTING)
   add_executable(onion_profile_test tests/unit/profile_test.cpp)
   target_link_libraries(onion_profile_test PRIVATE onion::profile GTest::gtest_main)
   gtest_discover_tests(onion_profile_test)
+
+  add_executable(onion_sync_test tests/unit/sync_test.cpp)
+  target_link_libraries(onion_sync_test PRIVATE onion::sync GTest::gtest_main)
+  gtest_discover_tests(onion_sync_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)

@@ -89,6 +89,11 @@ std::string project_cost_usd(std::int64_t loop_budget,
 
 // ----------------------------------------------------------------- engine
 
+struct LaneMember {
+  std::string device_id;
+  double weight{1.0};
+};
+
 // The single-device engine: runs one campaign against the state writer,
 // reserving budget before every ticket, chunking the loop budget through
 // RESERVE records, and stopping on the stop rule.
@@ -109,6 +114,11 @@ class Engine {
     // The device's 20-bit id slot (M4+): child TK ids are allocated from
     // slot × 2^40. 0 keeps the legacy allocation for M3-era tests.
     std::int64_t slot{0};
+    // M6: the static member list (device ids and weights). When non-empty,
+    // the engine only works tickets whose home lane is this device.
+    std::vector<LaneMember> members;
+    // M6: this device's id (for lane ownership). Empty = single-device mode.
+    std::string self;
   };
 
   Engine(Options options);
@@ -142,5 +152,19 @@ class Engine {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+
+// ------------------------------------------------------------------ lanes
+
+// Home lanes (DESIGN › Work scheduling): score = −w / ln(h), with
+// h = (x + 0.5) / 2^64 and x the first 64 bits (big-endian) of
+// BLAKE2b-256(node_path ‖ device_id). Higher scores own the lane.
+double hrw_score(std::string_view path, std::string_view device_id,
+                 double weight);
+
+// The device with the highest HRW score for the path, ties broken by the
+// lexicographically smaller device id. Empty members → empty result.
+std::optional<std::string> lane_owner(std::string_view path,
+                                      const std::vector<LaneMember>& members);
 
 }  // namespace onion::sched
