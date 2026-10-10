@@ -3,10 +3,11 @@
 ## Current
 
 - Milestone: M2 · branch m2-deepseek-client · started 2026-10-10
-- Tests: legacy 98/98 · new 88/88 on Linux · CI: M1 green; M2 not started
+- Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
 
 ## Log (newest first)
 
+- 2026-10-10: M2 checkpoint: added standard-library fake DeepSeek server, scenarios and adaptive limiter tests · CI 56aa921 green on Linux, macOS arm64, macOS Intel compatibility build and Windows · no real calls; 1,000-request benchmark not started
 - 2026-10-10: M2 started from merged M1; no real DeepSeek completions approved or used · pricing source recorded in decision 0004
 - 2026-10-10: M1 tasks 7–9: added RFC and project golden vectors, confirmed CI on Linux/macOS/Windows, and completed decision records · local new 88/88 · legacy 98/98 plus controller 9/9 · gate report prepared
 - 2026-10-10: M1 task 6 checkpoint: corrected durable replacement semantics and platform sampler/key-store/data-directory coverage · local new 83/83 · CI green on all jobs
