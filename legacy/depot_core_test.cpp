@@ -1007,7 +1007,17 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
     ::close(pipefd[0]);
     unsetenv("DEPOT_CONTROL_INTERVAL_MS");
     EXPECT_EQ(rc, 0);
-    EXPECT_NE(observed.find("THREADS\t3"), std::string::npos)
+    // The manager prints "THREADS\t<target>\t<live>" once at start and once
+    // per target change. Each "THREADS\t" prefix is a single atomic pipe
+    // write, but the rest of the line can interleave with the workers'
+    // prints, so the literal "THREADS\t3" is not guaranteed contiguous.
+    // Two announcements prove the manager raised the pool (the only change
+    // in this run is 1 -> 3).
+    std::size_t announcements = 0;
+    for (std::size_t at = observed.find("THREADS\t"); at != std::string::npos;
+         at = observed.find("THREADS\t", at + 1))
+      announcements++;
+    EXPECT_GE(announcements, 2u)
         << "manager never raised the pool; captured run output:\n" << observed;
 }
 
