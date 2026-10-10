@@ -116,6 +116,7 @@ class Client {
     std::string base_url;
     std::string api_key;
     int timeout_s{120};
+    int connect_timeout_s{10};
     int worker_threads{1};
     std::size_t max_in_flight{1000};
   };

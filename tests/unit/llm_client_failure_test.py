@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import socket
 import struct
 import threading
@@ -32,7 +33,20 @@ def main():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--limit", "100", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        # Evidence probe: on Windows the TCP stack retries a refused loopback
+        # connection for about two seconds before surfacing ECONNREFUSED, so a
+        # short total deadline hides the refusal as a timeout.  Measure the
+        # time until refusal with a 10 s deadline before the main run.
+        started = time.monotonic()
+        refusal = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        refusal.settimeout(10)
+        error = refusal.connect_ex(("127.0.0.1", port))
+        refusal.close()
+        print(f"probe_refusal_error={error} probe_refusal_s={time.monotonic() - started:.3f}", flush=True)
+        # The 10 s deadline lets a slow Windows refusal surface as a refused
+        # connection (Transport), never as a timeout; connect and total
+        # timeouts are separate in the client.
+        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--limit", "100", "--timeout", "10", "--connect-timeout", "10"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=150)
         assert completed.returncode == 1, completed.stderr
         assert_transport(completed.stdout)
         return

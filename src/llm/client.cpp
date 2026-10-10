@@ -298,7 +298,10 @@ struct Client::Impl {
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, item.headers);
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_body); curl_easy_setopt(easy, CURLOPT_WRITEDATA, &item.body);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, read_header); curl_easy_setopt(easy, CURLOPT_HEADERDATA, &item.retry_after);
-    curl_easy_setopt(easy, CURLOPT_TIMEOUT, options.timeout_s); curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(easy, CURLOPT_TIMEOUT, options.timeout_s);
+    if (options.connect_timeout_s > 0)
+      curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, options.connect_timeout_s);
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
     curl_easy_setopt(easy, CURLOPT_PRIVATE, easy); curl_multi_add_handle(multi, easy);
     const auto now = active.size();

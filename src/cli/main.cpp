@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
   std::string url;
   int requests = 0;
   int timeout_s = 120;
+  int connect_timeout_s = 10;
   int limit = 1000;
   std::string budget_limit = "10";
   for (int index = 2; index < argc; ++index) {
@@ -74,6 +75,7 @@ int main(int argc, char** argv) {
     if (arg == "--url" && index + 1 < argc) url = argv[++index];
     else if (arg == "--requests" && index + 1 < argc) requests = std::atoi(argv[++index]);
     else if (arg == "--timeout" && index + 1 < argc) timeout_s = std::atoi(argv[++index]);
+    else if (arg == "--connect-timeout" && index + 1 < argc) connect_timeout_s = std::atoi(argv[++index]);
     else if (arg == "--limit" && index + 1 < argc) limit = std::atoi(argv[++index]);
     else if (arg == "--budget" && index + 1 < argc) budget_limit = argv[++index];
   }
@@ -85,7 +87,7 @@ int main(int argc, char** argv) {
     std::cerr << "bench requires a positive --limit\n";
     return 2;
   }
-  onion::llm::Client client({url, {}, timeout_s, 1, static_cast<std::size_t>(limit)});
+  onion::llm::Client client({url, {}, timeout_s, connect_timeout_s, 1, static_cast<std::size_t>(limit)});
   onion::llm::CircuitBreaker breaker;
   onion::llm::Budget budget(budget_limit);
   std::mutex mutex; std::condition_variable done; int completed = 0; int failed = 0; int transport = 0; int timeouts = 0; std::vector<double> latencies;
