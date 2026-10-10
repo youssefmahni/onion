@@ -208,3 +208,35 @@ TEST_F(SyncTest, VerificationFailureQuarantinesAndDoesNotApply) {
 }
 
 }  // namespace
+
+TEST_F(SyncTest, RepeatedRoundsAreIdempotent) {
+  writer_a_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_a_->sync();
+  start_server_a();
+  SyncClient client = make_client_b();
+  const std::string peer = "127.0.0.1:" + std::to_string(server_->bound_port());
+
+  std::map<std::string, std::string> quarantined;
+  std::string error;
+  const int first = client.run_round(peer, &quarantined, &error);
+  EXPECT_GE(first, 1);
+  EXPECT_TRUE(quarantined.empty());
+
+  // A duplicate delivery (the same round again) applies nothing new: the
+  // vector is ahead, so there is nothing to pull, and nothing double-folds.
+  quarantined.clear();
+  const int second = client.run_round(peer, &quarantined, &error);
+  EXPECT_EQ(second, 0);
+  EXPECT_TRUE(quarantined.empty());
+
+  // A dropped connection retried later also converges: the vector already
+  // matches, so a third round changes nothing.
+  const int third = client.run_round(peer, &quarantined, &error);
+  EXPECT_EQ(third, 0);
+  EXPECT_TRUE(writer_b_->settled("P01-IN01-T01"));
+  std::string query_error;
+  EXPECT_EQ(writer_b_->db().settles(&query_error).size(), 1u);
+}

@@ -128,16 +128,24 @@ def main():
                 return False
         assert wait_for(all_done, timeout=300), "campaign never finished everywhere"
 
-        # Give the sync rounds time to converge every store.
-        time.sleep(35)
-
-        # All three must agree on the settled count, and it must be > 0.
-        counts = []
-        for index in (1, 2, 3):
-            state = http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
-            counts.append(state["settled_nodes"])
-        assert max(counts) > 0, "the campaign settled nothing anywhere"
-        assert counts[0] == counts[1] == counts[2], counts
+        # Poll until every store converges on a non-zero settled count (the
+        # sync rounds spread the settles a few rounds after the stop).
+        def converged():
+            try:
+                counts = [
+                    http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
+                    ["settled_nodes"]
+                    for index in (1, 2, 3)
+                ]
+                return max(counts) > 0 and counts[0] == counts[1] == counts[2]
+            except Exception:
+                return False
+        assert wait_for(converged, timeout=150), "the stores never converged"
+        counts = [
+            http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
+            ["settled_nodes"]
+            for index in (1, 2, 3)
+        ]
         print("multi-process convergence: PASS", counts)
     finally:
         for node in nodes:
