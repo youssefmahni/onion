@@ -85,8 +85,32 @@ if(WIN32)
     WIN32_LEAN_AND_MEAN)
 endif()
 
+# Monocypher (BLAKE2b, Ed25519) and nlohmann/json are production dependencies
+# of the data layer: records are hashed and canonicalized by the engine.
+FetchContent_Declare(
+  monocypher
+  URL https://monocypher.org/download/monocypher-4.0.2.tar.gz
+  URL_HASH SHA256=38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(monocypher)
+add_library(onion_monocypher STATIC
+  "${monocypher_SOURCE_DIR}/src/monocypher.c"
+  "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
+target_include_directories(onion_monocypher PUBLIC
+  "${monocypher_SOURCE_DIR}/src"
+  "${monocypher_SOURCE_DIR}/src/optional")
+
+FetchContent_Declare(
+  nlohmann_json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Data layer
-onion_add_module(log)
+onion_add_compiled_module(log src/log/log.cpp)
+target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json)
+target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_module(store)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
@@ -147,19 +171,6 @@ target_link_libraries(onion_smoke PRIVATE onion::cli)
 
 if(BUILD_TESTING)
   FetchContent_Declare(
-    monocypher
-    URL https://monocypher.org/download/monocypher-4.0.2.tar.gz
-    URL_HASH SHA256=38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-  FetchContent_MakeAvailable(monocypher)
-  add_library(monocypher STATIC
-    "${monocypher_SOURCE_DIR}/src/monocypher.c"
-    "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
-  target_include_directories(monocypher PUBLIC
-    "${monocypher_SOURCE_DIR}/src"
-    "${monocypher_SOURCE_DIR}/src/optional")
-
-  FetchContent_Declare(
     googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
     URL_HASH SHA256=7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926
@@ -179,6 +190,10 @@ if(BUILD_TESTING)
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
   gtest_discover_tests(onion_platform_test)
+
+  add_executable(onion_log_test tests/unit/log_test.cpp)
+  target_link_libraries(onion_log_test PRIVATE onion::log GTest::gtest_main)
+  gtest_discover_tests(onion_log_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
@@ -204,7 +219,7 @@ if(BUILD_TESTING)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
   add_executable(onion_golden_test tests/golden/golden_test.cpp)
-  target_link_libraries(onion_golden_test PRIVATE monocypher GTest::gtest_main)
+  target_link_libraries(onion_golden_test PRIVATE onion_monocypher GTest::gtest_main)
   target_compile_definitions(onion_golden_test PRIVATE
     ONION_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/expected")
   gtest_discover_tests(onion_golden_test)
