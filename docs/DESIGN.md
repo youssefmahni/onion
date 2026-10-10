@@ -562,7 +562,7 @@ Each device controls one number, the DeepSeek requests it has in flight, and adj
 **The request limit (adjusted every 30 s)**
 
 - Any HTTP 429 or 503, or timeouts above 5% of calls: halve the limit, then hold for one window.
-- Median latency within 1.5 times its low-load baseline: add 4. The baseline is the lowest successful 30-second-window median in the trailing hour, so it adapts slowly as the service's normal latency changes.
+- Median latency within 1.5 times its low-load baseline: add 4. Baseline samples come only from initial windows at the starting limit and from an hourly probe. A probe caps one 30-second window at `max(starting limit, current limit / 4)`, stores that window's median as the new baseline, then restores the prior limit. Busy windows never update the baseline.
 - Latency rising without errors: hold, because more requests would only queue at DeepSeek.
 - It starts at the profile's starting value and never exceeds the profile's ceiling.
 
