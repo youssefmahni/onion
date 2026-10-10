@@ -38,3 +38,16 @@ Evidence:
 - Key check: `DEEPSEEK_API_KEY` present in env (not printed). Corpus copy `~/onion-data` absent; `ORIGINAL_PROJECT` blank in §0 → M0 real node is OA-1. Candidate original project found at `~/Desktop/PlanningProcess` (10 level CSVs) — owner must confirm; NOT touched.
 
 Next step: commit G7+G8 memory files, then G3 connect-timeout fix (separate `CURLOPT_CONNECTTIMEOUT`), then G5 curl pin.
+
+## 2026-10-10T16:0xZ · m2 · G3, G5, G4, real calls, gate preparation
+
+Result: in progress
+Evidence:
+- G3: `655a2b2` separate connect timeout (decision 0007 pending at that point). Windows CI 38061629737: `llm.closed_port_1000 ... Passed 22.62 sec` (curl 8.11.1; ~2 s/refusal, 10 waves × 2 s). After G5's curl 8.22.0, CI 38062411051: same test `Passed 2.31 sec` — curl 8.22.0 changelog "cf-socket: disable TCP SYN retransmissions for localhost on Windows" explains the immediate refusal.
+- G5: curl 8.22.0 (2026-09-02), SHA-256 f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7 verified from both curl.se and GitHub; `CURL_USE_LIBPSL OFF` required by 8.21+ CMake; CI 38062411051 all 8 jobs green.
+- G4: `de07b8b` trace CSVs + benchmark evidence set + reproducible runner.
+- Real calls: `GET /models` (free) → deepseek-flash + deepseek-v4-pro, HTTP/2. 4 billed completions + 1 unbilled 401: shape accepted (reasoning_effort "none" OK), usage names confirmed, finish_reason length → Truncated, 401 → auth breaker. 100-call adaptive probe: 100/100 OK, 0 errors, h2 multiplexing (4 connections), limit 4→32. Decision 0004 updated; PROGRESS usage table filled.
+- New tests: `llm.truncating_20`, `llm.client_error_400` (`fc2724d`); local suite 115/115.
+- Gate report drafted: docs/agent/gates/M2.md.
+
+Next step: confirm the final CI run (fc2724d) is green on all 8 jobs, fill the CI link into gates/M2.md, open the PR, merge checklist, merge, tag m2-rc, update main, create m3-engine.
