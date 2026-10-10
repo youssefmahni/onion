@@ -2,10 +2,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -941,6 +943,7 @@ TEST_F(FunnelFixture, LowScoreNodeIsRetriedAndFixed) {
 TEST_F(FunnelFixture, PoolResizesFromControlFile) {
     // fake that answers a slow-ish 6-round funnel for TD1 then drains
     depot::AskFn fake = [&](const std::string& payload) -> std::string {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if (payload.find("Plan the knowledge coverage") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"items\": [\"A1\", \"A2\"]}"}}]})";
         if (payload.find("Aspect:") != std::string::npos)
