@@ -116,9 +116,23 @@ FetchContent_MakeAvailable(sqlite)
 add_library(onion_sqlite STATIC "${sqlite_SOURCE_DIR}/sqlite3.c")
 target_include_directories(onion_sqlite PUBLIC "${sqlite_SOURCE_DIR}")
 
+FetchContent_Declare(
+  zstd
+  URL https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.tar.gz
+  URL_HASH SHA256=30f35f71c1203369dc979ecde0400ffea93c27391bfd2ac5a9715d2173d92ff7
+  SOURCE_SUBDIR build/cmake
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(zstd)
+
 # Data layer
 onion_add_compiled_module(log src/log/log.cpp)
-target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json)
+target_include_directories(log PUBLIC "${zstd_SOURCE_DIR}/lib")
+target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
+  libzstd_static)
 target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_compiled_module(store src/store/store.cpp)
 target_link_libraries(store PUBLIC onion_sqlite)
@@ -222,6 +236,8 @@ if(BUILD_TESTING)
 
   add_executable(onion_log_test tests/unit/log_test.cpp)
   target_link_libraries(onion_log_test PRIVATE onion::log GTest::gtest_main)
+  target_compile_definitions(onion_log_test PRIVATE
+    ONION_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/expected")
   gtest_discover_tests(onion_log_test)
 
   add_executable(onion_store_test tests/unit/store_test.cpp)
