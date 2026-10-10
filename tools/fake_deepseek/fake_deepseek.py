@@ -3,6 +3,8 @@
 import argparse
 import json
 import random
+import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,6 +83,11 @@ def handler_for(fake):
             try:
                 fake.delay()
                 if random.random() < fake.scenario.get("reset_connection_rate", 0.0):
+                    # A FIN can leave a client with a partial HTTP response on
+                    # some platforms.  Linger-zero produces the requested TCP
+                    # reset deterministically instead.
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                               struct.pack("ii", 1, 0))
                     self.connection.close()
                     return
                 route = fake.route(prompt)

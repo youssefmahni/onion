@@ -8,6 +8,7 @@
 ## Log (newest first)
 - 2026-10-10: Diagnosed the 1,000-request client crash with ASan/UBSan as a queued-deque iterator use-after-free; fixed by draining ready tasks under the mutex before curl work · normal and sanitizer benchmarks now complete 1,000/1,000 against the fake server · added fake-server concurrency and transport-failure regression coverage · no real calls
 - 2026-10-10: TSan CI found a second construction-order race; reordered the client worker after its synchronization state and verified the focused suite locally · sanitizer CI disables POCL only because its external allocations leak under LSan · no real calls
+- 2026-10-10: Re-ran 1,000 fake requests after the TSan repair: normal 1,149.14 req/s and ASan/UBSan 307.235 req/s, both 1,000/1,000 successful · no real calls
 
 - 2026-10-10: M2 checkpoint: added standard-library fake DeepSeek server, scenarios and adaptive limiter tests · CI 56aa921 green on Linux, macOS arm64, macOS Intel compatibility build and Windows · no real calls; 1,000-request benchmark not started
 - 2026-10-10: M2 started from merged M1; no real DeepSeek completions approved or used · pricing source recorded in decision 0004
