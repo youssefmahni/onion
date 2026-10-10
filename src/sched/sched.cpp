@@ -233,8 +233,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     return result;
   }
 
-  // Emit the CAMPAIGN record (start).
-  writer.submit(state::CommitTerminal{{make_record(
+  // Emit the CAMPAIGN record only when the campaign is new (the run loop
+  // re-enters run() after every drain; re-emission would spam the log).
+  if (!existing) {
+    writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", {{"scope", spec.scope},
                              {"loop_budget", spec.loop_budget},
@@ -246,6 +248,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                              {"chunk", spec.chunk},
                              {"model", spec.model}}},
                    {"state", "running"}})}});
+  }
 
   gate::FunnelOptions funnel_options;
   funnel_options.params.pass_score = spec.gate;
@@ -521,9 +524,12 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   }
 
   // A campaign that finished by itself (stop rule, drained, budget) is
-  // closed: stop is final for the campaign record too.
-  if (result.end_reason == "stop rule" || result.end_reason == "drained" ||
-      result.end_reason == "budget") {
+  // closed: stop is final for the campaign record too. In fleet mode a
+  // drained lane is not a finished campaign — the device waits for sync
+  // to bring more of its lane (or the fleet-wide stop record).
+  const bool fleet = !impl_->options.members.empty();
+  if (result.end_reason == "stop rule" || result.end_reason == "budget" ||
+      (result.end_reason == "drained" && !fleet)) {
     writer.submit(state::CommitTerminal{{make_record(
         "CAMPAIGN", {{"id", spec.id},
                      {"spec", {{"scope", spec.scope},

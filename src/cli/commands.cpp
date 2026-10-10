@@ -21,6 +21,7 @@
 #include "core/depot_core.hpp"
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
+#include "sync/sync.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
 #include "platform/platform.hpp"
@@ -203,6 +204,25 @@ int node_cmd(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 3 && std::string(argv[2]) == "identity") {
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::platform::KeyStore store(dir / "keys");
+    std::string error;
+    auto key = load_device_key(store, &error);
+    if (!key) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    std::string public_key_hex;
+    for (const std::uint8_t byte : key->public_key) {
+      public_key_hex += "0123456789abcdef"[byte >> 4];
+      public_key_hex += "0123456789abcdef"[byte & 0x0f];
+    }
+    std::cout << "device_id=" << key->device_id << "\n"
+              << "public_key=" << public_key_hex << "\n"
+              << "slot=" << key->slot << "\n";
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[2]) == "key") {
     if (argc < 6 || std::string(argv[3]) != "set") {
       std::cerr << "usage: data_depot node key set <name> <value> "
@@ -320,6 +340,54 @@ int node_cmd(int argc, char** argv) {
 
   std::atomic<bool> stop_flag{false};
 
+  // M6: the static member list and the sync server (members.json).
+  std::vector<onion::sched::LaneMember> lane_members;
+  std::vector<onion::sync::MemberKey> sync_members;
+  std::map<std::string, std::string> member_urls;
+  std::unique_ptr<onion::sync::SyncServer> sync_server;
+  const std::string members_path = flag(argc, argv, "--members", "");
+  const std::string self_host = flag(argc, argv, "--host", "127.0.0.1");
+  const int self_sync_port = std::atoi(flag(argc, argv, "--sync-port", "7947").c_str());
+  if (!members_path.empty()) {
+    std::ifstream members_file(members_path);
+    auto members_json = json::parse(members_file, nullptr, false);
+    if (members_json.is_discarded() || !members_json.is_array()) {
+      std::cerr << "--members must point at a JSON array\n";
+      return 2;
+    }
+    for (const auto& member : members_json) {
+      if (!member.contains("device_id") || !member.contains("public_key")) {
+        std::cerr << "members.json entries need device_id and public_key\n";
+        return 2;
+      }
+      const std::string member_id = member["device_id"].get<std::string>();
+      const std::string public_key_hex = member["public_key"].get<std::string>();
+      std::vector<std::uint8_t> public_key;
+      for (std::size_t i = 0; i + 1 < public_key_hex.size(); i += 2)
+        public_key.push_back(static_cast<std::uint8_t>(
+            std::stoul(public_key_hex.substr(i, 2), nullptr, 16)));
+      lane_members.push_back(
+          {member_id, member.value("weight", 1.0)});
+      sync_members.push_back({member_id, public_key});
+      if (member.contains("url"))
+        member_urls[member_id] = member["url"].get<std::string>();
+    }
+    onion::sync::SyncServer::Options sync_options;
+    sync_options.port = self_sync_port;
+    sync_options.bind_address = self_host;
+    sync_options.writer = writer.get();
+    sync_options.key = device_key;
+    sync_options.members = sync_members;
+    sync_server = std::make_unique<onion::sync::SyncServer>(std::move(sync_options));
+    std::string sync_error;
+    if (!sync_server->start(&sync_error)) {
+      std::cerr << sync_error << "\n";
+      return 1;
+    }
+    std::cout << "sync listening on " << self_host << ":"
+              << sync_server->bound_port() << "\n";
+  }
+
   const auto campaign_action = [&](std::string id,
                                    std::string state) -> bool {
     const auto existing = writer->campaign(id);
@@ -406,9 +474,11 @@ int node_cmd(int argc, char** argv) {
   std::cout << "node listening on 127.0.0.1:" << server.bound_port()
             << " data=" << dir << "\n";
 
-  // Engine loop: run every running campaign until stopped.
+  // Engine loop: run every running campaign until stopped. With a member
+  // list, the engine works only its own home-lane tickets.
   onion::sched::Engine engine(
-      {*writer, ask, budget, 1, device_key->device_id, "0.02", prices});
+      {*writer, ask, budget, 1, device_key->device_id, "0.02", prices,
+       device_key->slot, lane_members, device_key->device_id});
   while (!stop_flag.load()) {
     bool worked = false;
     for (const auto& campaign : writer->campaigns()) {
@@ -426,8 +496,31 @@ int node_cmd(int argc, char** argv) {
                 << " calls=" << result.calls << "\n";
       if (stop_flag.load()) break;
     }
+    // Sync round every 15 s when the member list is present.
+    if (sync_server && !lane_members.empty()) {
+      static auto last_sync = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() - last_sync >=
+          std::chrono::seconds(15)) {
+        last_sync = std::chrono::steady_clock::now();
+        for (const auto& member : lane_members) {
+          if (member.device_id == device_key->device_id) continue;
+          const auto peer_entry = member_urls.find(member.device_id);
+          if (peer_entry == member_urls.end()) continue;
+          const std::string peer = peer_entry->second;
+          std::map<std::string, std::string> quarantined;
+          std::string sync_error;
+          std::map<std::string, onion::sync::MemberKey> client_members;
+          for (const auto& entry : sync_members)
+            client_members[entry.device_id] = entry;
+          onion::sync::SyncClient client(
+              {*writer, device_key, std::move(client_members)});
+          client.run_round(peer, &quarantined, &sync_error);
+        }
+      }
+    }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
+  if (sync_server) sync_server->stop();
   server.stop();
   writer->stop();
   return 0;

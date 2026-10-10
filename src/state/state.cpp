@@ -34,7 +34,8 @@ void upsert_node(store::Db& db, const log::Record& record,
       "hlc) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, ?1, ?2, "
       "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
-      "layer=excluded.layer WHERE excluded.hlc > nodes.hlc;",
+      "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
+      "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -62,7 +63,8 @@ void upsert_settle(store::Db& db, const log::Record& record,
       "ON CONFLICT(path) DO UPDATE SET kept=excluded.kept, "
       "atomic=excluded.atomic, attempts=excluded.attempts, "
       "score=excluded.score, campaign=excluded.campaign, hlc=excluded.hlc, "
-      "origin=excluded.origin WHERE excluded.hlc > settles.hlc;",
+      "origin=excluded.origin WHERE excluded.hlc > settles.hlc OR "
+      "(excluded.hlc = settles.hlc AND excluded.origin > settles.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -147,7 +149,8 @@ void upsert_review(store::Db& db, const log::Record& record,
       "VALUES (?1, ?2, 'open', '', ?3, ?4) "
       "ON CONFLICT(path) DO UPDATE SET state='open', reason=excluded.reason, "
       "hlc=excluded.hlc, origin=excluded.origin "
-      "WHERE excluded.hlc > reviews.hlc;",
+      "WHERE excluded.hlc > reviews.hlc OR "
+      "(excluded.hlc = reviews.hlc AND excluded.origin > reviews.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -172,7 +175,8 @@ void upsert_campaign(store::Db& db, const log::Record& record,
       "ON CONFLICT(id) DO UPDATE SET spec=excluded.spec, "
       "state=CASE WHEN campaigns.state = 'stopped' THEN 'stopped' "
       "ELSE excluded.state END, hlc=excluded.hlc, origin=excluded.origin "
-      "WHERE excluded.hlc > campaigns.hlc;",
+      "WHERE excluded.hlc > campaigns.hlc OR "
+      "(excluded.hlc = campaigns.hlc AND excluded.origin > campaigns.origin);",
       error);
   if (!statement) return;
   std::string bind_error;

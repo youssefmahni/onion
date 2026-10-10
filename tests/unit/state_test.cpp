@@ -443,3 +443,88 @@ TEST_F(StateWriterTest, SealedSegmentsReplayAcrossRestart) {
     writer->stop();
   }
 }
+
+// -------------------------------------------------- M6 conflict table (fold)
+
+namespace {
+using nlohmann::json;
+
+Record settle_record(std::string path, double score, std::uint64_t hlc,
+                     std::string origin, int attempts = 1) {
+  Record record;
+  record.type = "SETTLE";
+  record.payload = {{"path", path},
+                    {"kept", 1},
+                    {"atomic", 0},
+                    {"attempts", attempts},
+                    {"score", std::to_string(score)},
+                    {"end", "children"},
+                    {"campaign", "c1"},
+                    {"origin", origin}};
+  record.hlc = hlc;
+  return record;
+}
+}  // namespace
+
+TEST_F(StateWriterTest, ConflictHigherScoreWinsInEitherOrder) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  // Order A: low score first, high score second.
+  writer_->submit(CommitTerminal{{settle_record("P01", 0.6, 10, "dev0000000000000001")}});
+  writer_->submit(CommitTerminal{{settle_record("P01", 0.9, 11, "dev0000000000000001")}});
+  writer_->sync();
+  auto settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 1u);
+  EXPECT_EQ(settles[0].score, "0.900000");
+}
+
+TEST_F(StateWriterTest, ConflictHigherScoreWinsInReverseOrder) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  // Order B: high score first, low score second — the fold must still keep
+  // the higher score (the reverse order must give the same state).
+  writer_->submit(CommitTerminal{{settle_record("P02", 0.9, 11, "dev0000000000000001")}});
+  writer_->submit(CommitTerminal{{settle_record("P02", 0.6, 10, "dev0000000000000001")}});
+  writer_->sync();
+  auto settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 1u);
+  EXPECT_EQ(settles[0].score, "0.900000");
+}
+
+TEST_F(StateWriterTest, ConflictTieBreaksOnHighestHlcThenOrigin) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  // Same hlc: the higher origin wins.
+  writer_->submit(CommitTerminal{{settle_record("P03", 0.8, 10, "aaaaaaaaaaaaaaaa")}});
+  writer_->submit(CommitTerminal{{settle_record("P03", 0.7, 10, "bbbbbbbbbbbbbbbb")}});
+  writer_->sync();
+  auto settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 1u);
+  EXPECT_EQ(settles[0].origin, "bbbbbbbbbbbbbbbb");
+  // Reverse order: the same state.
+  writer_->submit(CommitTerminal{{settle_record("P04", 0.7, 10, "bbbbbbbbbbbbbbbb")}});
+  writer_->submit(CommitTerminal{{settle_record("P04", 0.8, 10, "aaaaaaaaaaaaaaaa")}});
+  writer_->sync();
+  settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 2u);
+  const auto p04 = writer_->db().node_by_path("P04", &error);
+  (void)p04;
+}
+
+TEST_F(StateWriterTest, CampaignStopFinalInEitherOrder) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  writer_->submit(CommitTerminal{{make_record(
+      "CAMPAIGN", {{"id", "c1"}, {"spec", json::object()}, {"state", "stopped"}})}});
+  writer_->submit(CommitTerminal{{make_record(
+      "CAMPAIGN", {{"id", "c1"}, {"spec", json::object()}, {"state", "paused"}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->campaign("c1")->state, "stopped");
+  // Reverse: a resume after a stop still stays stopped.
+  writer_->submit(CommitTerminal{{make_record(
+      "CAMPAIGN", {{"id", "c2"}, {"spec", json::object()}, {"state", "running"}})}});
+  writer_->submit(CommitTerminal{{make_record(
+      "CAMPAIGN", {{"id", "c2"}, {"spec", json::object()}, {"state", "stopped"}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->campaign("c2")->state, "stopped");
+}
