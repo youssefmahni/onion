@@ -87,6 +87,9 @@ class Engine {
     // Worst case of one ticket: pre-check + max_attempts × max_tokens,
     // priced at the configured highest triplet (set by the caller).
     std::string ticket_worst_case_usd{"0.02"};
+    // Optional per-1M-token prices for attempt cost metering (decision
+    // 0004: no implicit defaults; node.conf arrives in M5).
+    std::optional<onion::llm::PriceSchedule> prices;
   };
 
   Engine(Options options);
@@ -100,6 +103,7 @@ class Engine {
     int leaves{};
     int reviews{};
     int attempts{};
+    int calls{};  // LLM completions made during this run
     std::string end_reason;  // stop rule | stopped | paused | drained | budget
   };
 

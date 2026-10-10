@@ -175,6 +175,22 @@ int node_cmd(int argc, char** argv) {
   onion::llm::Budget budget("1000");
   const onion::gate::SyncAsk ask = sync_ask(client);
 
+  // Optional per-1M-token prices (USD), peak triplet (decision 0004: no
+  // implicit defaults; node.conf arrives in M5).
+  std::optional<onion::llm::PriceSchedule> prices;
+  const std::string price_in = flag(argc, argv, "--price-in", "");
+  const std::string price_cache = flag(argc, argv, "--price-cache", "");
+  const std::string price_out = flag(argc, argv, "--price-out", "");
+  if (!price_in.empty() || !price_out.empty()) {
+    prices = onion::llm::PriceSchedule{
+        {price_in.empty() ? "0" : price_in,
+         price_cache.empty() ? "0" : price_cache,
+         price_out.empty() ? "0" : price_out},
+        {price_in.empty() ? "0" : price_in,
+         price_cache.empty() ? "0" : price_cache,
+         price_out.empty() ? "0" : price_out}};
+  }
+
   std::atomic<bool> stop_flag{false};
 
   const auto campaign_action = [&](std::string id,
@@ -265,7 +281,7 @@ int node_cmd(int argc, char** argv) {
 
   // Engine loop: run every running campaign until stopped.
   onion::sched::Engine engine(
-      {*writer, ask, budget, 1, origin, "0.02"});
+      {*writer, ask, budget, 1, origin, "0.02", prices});
   while (!stop_flag.load()) {
     bool worked = false;
     for (const auto& campaign : writer->campaigns()) {
@@ -279,7 +295,8 @@ int node_cmd(int argc, char** argv) {
       worked = true;
       std::cout << "campaign " << spec->id << " ended: " << result.end_reason
                 << " settled=" << result.settled
-                << " attempts=" << result.attempts << "\n";
+                << " attempts=" << result.attempts
+                << " calls=" << result.calls << "\n";
       if (stop_flag.load()) break;
     }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));

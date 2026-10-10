@@ -226,7 +226,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   funnel_options.params.max_attempts = spec.max_attempts;
   funnel_options.model = spec.critic_model.empty() ? spec.model
                                                    : spec.critic_model;
-  gate::Funnel funnel(funnel_options);
+  funnel_options.prices = impl_->options.prices;
 
   std::vector<SettledSample> settled_samples;
   std::deque<Ticket> waiting;
@@ -334,8 +334,13 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       impl_->options.budget.settle(*reservation, "0");
       continue;
     }
+    // The light funnel runs from the campaign's light-funnel depth.
+    gate::FunnelOptions ticket_options = funnel_options;
+    ticket_options.light = ticket.layer >= spec.light_funnel_from;
+    gate::Funnel funnel(ticket_options);
     const gate::NodeContext context = build_context(writer, *node, &error);
     gate::FunnelResult funnel_result = funnel.run(context, impl_->options.ask);
+    result.calls += funnel_result.calls;
 
     for (const gate::Attempt& attempt : funnel_result.attempts) {
       writer.submit(state::AppendAttempt{make_record(
@@ -343,10 +348,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                       {"n", attempt.number},
                       {"score", std::to_string(attempt.score)},
                       {"passed", attempt.checks_passed ? 1 : 0},
-                      {"tokens_in", 0},
-                      {"tokens_cached", 0},
-                      {"tokens_out", 0},
-                      {"cost", "0"},
+                      {"tokens_in", attempt.tokens_in},
+                      {"tokens_cached", attempt.tokens_cached},
+                      {"tokens_out", attempt.tokens_out},
+                      {"cost", attempt.cost_usd},
                       {"campaign", spec.id},
                       {"issues", attempt.issues}})});
       result.attempts++;

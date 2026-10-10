@@ -1,6 +1,7 @@
 #include "gate.hpp"
 
 #include <algorithm>
+#include <iomanip>
 #include <set>
 #include <sstream>
 
@@ -172,7 +173,8 @@ std::optional<std::vector<Child>> parse_children(const std::string& body) {
       return std::nullopt;
     Child child;
     child.title = item["title"].get<std::string>();
-    child.atomic = item.value("atomic", false);
+    child.atomic = item.contains("atomic") && item["atomic"].is_boolean() &&
+                   item["atomic"].get<bool>();
     children.push_back(std::move(child));
   }
   return children;
@@ -185,7 +187,8 @@ std::optional<Critique> parse_critique(const std::string& body) {
     return std::nullopt;
   Critique critique;
   critique.score = json["score"].get<double>();
-  critique.issues = json.value("issues", std::string{});
+  if (json.contains("issues") && json["issues"].is_string())
+    critique.issues = json["issues"].get<std::string>();
   if (json.contains("remove") && json["remove"].is_array())
     for (const auto& item : json["remove"])
       if (item.is_string()) critique.remove.push_back(item.get<std::string>());
@@ -350,14 +353,10 @@ struct Meter {
   std::uint64_t in_hit{};
   std::uint64_t in_miss{};
   std::uint64_t out{};
-  std::string cost{"0"};
-  void add(const llm::Result& result) {
-    in_hit += result.in_hit;
-    in_miss += result.in_miss;
-    out += result.out;
-    // Exact decimal-string addition (no floats in audit records).
-    const std::string& a = cost;
-    const std::string& b = result.cost_usd;
+  const llm::PriceSchedule* prices{};
+
+  // Exact decimal-string addition (no floats in audit records).
+  static std::string add_usd(std::string a, std::string b) {
     std::size_t a_dot = a.find('.');
     std::size_t b_dot = b.find('.');
     const std::string a_int = a.substr(0, a_dot);
@@ -367,18 +366,49 @@ struct Meter {
     const std::size_t frac = std::max(a_frac.size(), b_frac.size());
     a_frac.append(frac - a_frac.size(), '0');
     b_frac.append(frac - b_frac.size(), '0');
-    const std::int64_t total_cents =
+    const std::int64_t total =
         std::stoll(a_int + a_frac, nullptr, 10) +
         std::stoll(b_int + b_frac, nullptr, 10);
-    const std::string total = std::to_string(total_cents);
-    if (total.size() <= frac) {
-      cost = "0." + std::string(frac - total.size(), '0') + total;
-    } else {
-      cost = total.substr(0, total.size() - frac) + "." +
-             total.substr(total.size() - frac);
-    }
-    while (cost.size() > 1 && cost.back() == '0') cost.pop_back();
-    if (!cost.empty() && cost.back() == '.') cost.pop_back();
+    const std::string text = std::to_string(total);
+    std::string out_text;
+    if (text.size() <= frac)
+      out_text = "0." + std::string(frac - text.size(), '0') + text;
+    else
+      out_text = text.substr(0, text.size() - frac) + "." +
+                 text.substr(text.size() - frac);
+    while (out_text.size() > 1 && out_text.back() == '0') out_text.pop_back();
+    if (!out_text.empty() && out_text.back() == '.') out_text.pop_back();
+    return out_text.empty() ? "0" : out_text;
+  }
+
+  void add(const llm::Result& result) {
+    in_hit += result.in_hit;
+    in_miss += result.in_miss;
+    out += result.out;
+  }
+
+  std::string cost() const {
+    if (!prices) return "0";
+    // (cache-miss in × in + cache-hit in × cache + out × out) / 1M, peak
+    // triplet (the conservative maximum — decision 0004).
+    const auto cents = [](const std::string& usd) -> std::int64_t {
+      std::size_t dot = usd.find('.');
+      const std::string integer = dot == std::string::npos ? usd : usd.substr(0, dot);
+      std::string fraction = dot == std::string::npos ? "0" : usd.substr(dot + 1);
+      if (fraction.size() < 9) fraction.append(9 - fraction.size(), '0');
+      return std::stoll(integer + fraction.substr(0, 9), nullptr, 10);
+    };
+    // Tokens × USD-per-token, in integer micro-cents to stay exact.
+    const auto mul = [&cents](std::uint64_t tokens, const std::string& usd) {
+      return static_cast<long double>(tokens) * static_cast<long double>(cents(usd)) / 1000000.0L;
+    };
+    const long double total = mul(in_miss, prices->peak.input) +
+                              mul(in_hit, prices->peak.cached_input) +
+                              mul(out, prices->peak.output);
+    // Round to nano-dollars (9 decimal places), like the rest of the ledger.
+    std::ostringstream out_text;
+    out_text << std::fixed << std::setprecision(9) << (total / 1e9L);
+    return out_text.str();
   }
 };
 
@@ -386,12 +416,16 @@ struct Meter {
 
 FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
   FunnelResult result;
+  const SyncAsk counted = [&](const llm::Request& request) -> llm::Result {
+    result.calls++;
+    return ask(request);
+  };
 
   // Pre-check: at most 400 tokens, temperature 0.
   {
     bool tried = false;
     for (int attempt = 0; attempt < 2; ++attempt) {
-      const llm::Result precheck = ask(make_request(
+      const llm::Result precheck = counted(make_request(
           impl_->options, ctx, precheck_prompt(ctx), 0.0, 400));
       if (result_ok(precheck)) {
         tried = true;
@@ -417,6 +451,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     Attempt attempt;
     attempt.number = number;
     Meter meter;
+    meter.prices = impl_->options.prices ? &*impl_->options.prices : nullptr;
     const double temperature =
         impl_->options.temperatures[(number - 1) % 3];
     bool failed = false;
@@ -424,7 +459,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     // Planner.
     std::vector<std::string> aspects;
     {
-      const llm::Result reply = ask(make_request(
+      const llm::Result reply = counted(make_request(
           impl_->options, ctx,
           planner_prompt(ctx, injected_issues, impl_->options.light),
           temperature));
@@ -449,7 +484,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       const std::string existing_joined = join(ctx.existing);
       std::set<std::string> seen;
       for (const std::string& aspect : aspects) {
-        const llm::Result reply = ask(make_request(
+        const llm::Result reply = counted(make_request(
             impl_->options, ctx,
             worker_prompt(ctx, aspect, existing_joined), temperature));
         meter.add(reply);
@@ -492,7 +527,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     int trim_failures = 0;
     auto trim_round = [&](int keep) {
       if (failed || candidates.size() <= static_cast<std::size_t>(keep)) return;
-      const llm::Result reply = ask(make_request(
+      const llm::Result reply = counted(make_request(
           impl_->options, ctx, trimmer_prompt(ctx, candidates, keep),
           temperature));
       meter.add(reply);
@@ -520,7 +555,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     // Critique.
     Critique critique;
     if (!failed) {
-      const llm::Result reply = ask(make_request(
+      const llm::Result reply = counted(make_request(
           impl_->options, ctx, critique_prompt(ctx, candidates), temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -531,6 +566,11 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         else critique = std::move(*parsed);
       }
     }
+
+    attempt.tokens_in = meter.in_miss;
+    attempt.tokens_cached = meter.in_hit;
+    attempt.tokens_out = meter.out;
+    attempt.cost_usd = meter.cost();
 
     // Synthesizer.
     std::vector<Child> children;
@@ -544,7 +584,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         critique_text << (i ? ";" : "") << critique.add[i];
       critique_text << ", issues: " << critique.issues;
 
-      const llm::Result reply = ask(make_request(
+      const llm::Result reply = counted(make_request(
           impl_->options, ctx,
           synthesizer_prompt(ctx, candidates, critique_text.str()),
           temperature));

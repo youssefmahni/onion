@@ -35,6 +35,11 @@ struct Attempt {
   bool checks_passed{};
   std::vector<Child> children;
   std::string issues;  // critique issues, ≤ 1000 characters (decision 0000)
+  // Metering of the attempt's calls (decision 0003: exact integers/decimals).
+  std::uint64_t tokens_in{};
+  std::uint64_t tokens_cached{};
+  std::uint64_t tokens_out{};
+  std::string cost_usd{"0"};
 };
 
 // ---- prompts (fixed instruction text first, node text last) ----
@@ -108,6 +113,7 @@ struct FunnelResult {
   std::vector<Attempt> attempts;  // audit records, child-free
   int chosen{-1};
   bool precheck_leaf{false};
+  int calls{};  // LLM completions made (the pre-check + every funnel call)
 };
 
 struct FunnelOptions {
@@ -116,6 +122,10 @@ struct FunnelOptions {
   double temperatures[3]{0.0, 0.3, 0.5};
   int max_tokens{6000};
   std::string model{"deepseek-flash"};
+  // Optional per-1M-token prices (USD per 1M). When set, the attempt cost
+  // is computed from usage; when absent, cost stays 0 (node.conf arrives
+  // with M5 — decision 0004: no implicit monetary defaults).
+  std::optional<onion::llm::PriceSchedule> prices;
 };
 
 using SyncAsk = std::function<llm::Result(const llm::Request&)>;
