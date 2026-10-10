@@ -305,6 +305,19 @@ std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) const {
   return nodes;
 }
 
+std::vector<Node> Db::all_nodes(std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      std::string("SELECT ") + kNodeColumns +
+          " FROM nodes WHERE tombstone = 0 ORDER BY path;",
+      error);
+  if (!stmt) return {};
+  std::string step_error;
+  std::vector<Node> nodes;
+  while (stmt->step_row(&step_error)) nodes.push_back(read_node(*stmt));
+  if (!step_error.empty()) set_error(error, handle_, "all-nodes query failed");
+  return nodes;
+}
+
 std::vector<Node> Db::nodes_with_path_prefix(std::string_view prefix,
                                              std::string* error) const {
   std::optional<Statement> stmt = prepare(

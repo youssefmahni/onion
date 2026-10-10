@@ -134,6 +134,7 @@ class Db {
   std::optional<Node> node_by_path(std::string_view path, std::string* error) const;
   std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error) const;
   std::vector<Node> nodes_at_layer(int layer, std::string* error) const;
+  std::vector<Node> all_nodes(std::string* error) const;
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
                                            std::string* error) const;
   std::vector<Review> open_reviews(std::string* error) const;
