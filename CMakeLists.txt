@@ -173,10 +173,11 @@ target_link_libraries(llm INTERFACE onion::core onion::platform)
 # Fleet layer
 onion_add_module(sync)
 onion_add_module(swim)
-onion_add_module(profile)
+onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
+target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onion::log onion::llm)
 target_link_libraries(sync INTERFACE onion::log onion::store onion::platform)
 target_link_libraries(swim INTERFACE onion::core onion::platform)
-target_link_libraries(profile INTERFACE onion::core onion::gpu onion::platform)
 
 # Engine layer
 onion_add_compiled_module(gate src/gate/gate.cpp)
@@ -265,6 +266,10 @@ if(BUILD_TESTING)
   target_link_libraries(onion_api_test PRIVATE onion::api GTest::gtest_main)
   gtest_discover_tests(onion_api_test)
 
+  add_executable(onion_profile_test tests/unit/profile_test.cpp)
+  target_link_libraries(onion_profile_test PRIVATE onion::profile GTest::gtest_main)
+  gtest_discover_tests(onion_profile_test)
+
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
   gtest_discover_tests(onion_limiter_test)
@@ -312,6 +317,6 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")

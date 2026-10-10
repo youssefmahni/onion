@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -25,6 +26,8 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
 #if defined(__APPLE__)
 #include <limits.h>
 #include <mach/mach.h>
@@ -355,6 +358,54 @@ std::size_t effective_open_file_limit() {
 }
 
 KeyStore::KeyStore(std::filesystem::path directory) : directory_(std::move(directory)) {}
+
+#if defined(__APPLE__)
+// macOS: the Keychain, through the OS `security` tool (fork/exec, no shell).
+namespace {
+std::optional<std::string> security_tool(const std::vector<std::string>& args,
+                                         bool capture_output) {
+  int pipefd[2] = {-1, -1};
+  if (capture_output && ::pipe(pipefd) != 0) return std::nullopt;
+  const pid_t child = ::fork();
+  if (child == 0) {
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("security"));
+    for (const std::string& arg : args)
+      argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    if (capture_output) {
+      ::dup2(pipefd[1], 1);
+      ::close(pipefd[0]);
+    }
+    ::execvp("security", argv.data());
+    ::_exit(127);
+  }
+  if (child < 0) {
+    if (capture_output) { ::close(pipefd[0]); ::close(pipefd[1]); }
+    return std::nullopt;
+  }
+  std::string output;
+  if (capture_output) {
+    ::close(pipefd[1]);
+    char buffer[256];
+    ssize_t read_bytes;
+    while ((read_bytes = ::read(pipefd[0], buffer, sizeof(buffer))) > 0)
+      output.append(buffer, static_cast<std::size_t>(read_bytes));
+    ::close(pipefd[0]);
+  }
+  int status = 0;
+  ::waitpid(child, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return std::nullopt;
+  if (capture_output) {
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r'))
+      output.pop_back();
+    return output;
+  }
+  return std::string{};
+}
+}  // namespace
+#endif
+
 bool KeyStore::put(std::string_view name, std::string_view secret) {
   if (!valid_name(name) || !private_dir(directory_)) return false;
   const auto path = directory_ / std::string(name);
@@ -364,6 +415,11 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   if (file) file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
   const bool ok = file.good(); LocalFree(output.pbData); return ok;
+#elif defined(__APPLE__)
+  return security_tool({"add-generic-password", "-U", "-s", "onion", "-a",
+                        std::string(name), "-w", std::string(secret)},
+                       false)
+      .has_value();
 #else
   const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
   if (fd < 0) return false;
@@ -373,21 +429,111 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
 }
 std::optional<std::string> KeyStore::get(std::string_view name) const {
   if (!valid_name(name)) return std::nullopt;
-#ifndef _WIN32
-  struct stat status{};
-  const auto path = directory_ / std::string(name);
-  if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0) return std::nullopt;
-#endif
+#if defined(__APPLE__)
+  return security_tool({"find-generic-password", "-s", "onion", "-a",
+                        std::string(name), "-w"},
+                       true);
+#elif defined(_WIN32)
   std::ifstream file(directory_ / std::string(name), std::ios::binary);
   if (!file) return std::nullopt;
   const std::string encrypted((std::istreambuf_iterator<char>(file)), {});
-#ifdef _WIN32
   if (encrypted.empty() || encrypted.size() > std::numeric_limits<DWORD>::max()) return std::nullopt;
   DATA_BLOB input{static_cast<DWORD>(encrypted.size()), reinterpret_cast<BYTE*>(const_cast<char*>(encrypted.data()))}, output{};
   if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0, &output)) return std::nullopt;
   std::string secret(reinterpret_cast<const char*>(output.pbData), output.cbData); LocalFree(output.pbData); return secret;
 #else
-  return encrypted;
+  struct stat status{};
+  const auto path = directory_ / std::string(name);
+  if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0) return std::nullopt;
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return std::nullopt;
+  return std::string((std::istreambuf_iterator<char>(file)), {});
 #endif
 }
+
+// ------------------------------------------------- machine facts (M5)
+
+std::string os_name() {
+#ifdef _WIN32
+  return "windows";
+#elif defined(__APPLE__)
+  return "macos";
+#else
+  return "linux";
+#endif
+}
+
+std::optional<double> total_ram_gb() {
+#ifdef _WIN32
+  MEMORYSTATUSEX memory;
+  memory.dwLength = sizeof(memory);
+  if (GlobalMemoryStatusEx(&memory))
+    return static_cast<double>(memory.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
+  return std::nullopt;
+#elif defined(__APPLE__)
+  std::int64_t bytes = 0;
+  std::size_t size = sizeof(bytes);
+  if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0)
+    return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  return std::nullopt;
+#else
+  std::ifstream in("/proc/meminfo");
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("MemTotal:", 0) == 0) {
+      long long kilobytes = 0;
+      std::sscanf(line.c_str() + 9, "%lld", &kilobytes);
+      return static_cast<double>(kilobytes) / (1024.0 * 1024.0);
+    }
+  }
+  return std::nullopt;
+#endif
+}
+
+std::optional<double> disk_free_gb(const std::filesystem::path& path) {
+#ifdef _WIN32
+  ULARGE_INTEGER free_bytes;
+  if (GetDiskFreeSpaceExW(path.c_str(), &free_bytes, nullptr, nullptr))
+    return static_cast<double>(free_bytes.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+  return std::nullopt;
+#else
+  struct statvfs stats;
+  if (::statvfs(path.c_str(), &stats) == 0)
+    return static_cast<double>(stats.f_bavail) * stats.f_frsize /
+           (1024.0 * 1024.0 * 1024.0);
+  return std::nullopt;
+#endif
+}
+
+std::optional<double> link_speed_mbps() {
+#ifdef _WIN32
+  return std::nullopt;  // Windows fleet profiles arrive with the M9 joins
+#elif defined(__APPLE__)
+  // The default route interface speed via sysctl net.link... best effort.
+  return std::nullopt;
+#else
+  // The default-route interface from /proc/net/route, speed from sysfs.
+  std::string interface;
+  {
+    std::ifstream in("/proc/net/route");
+    std::string line;
+    std::getline(in, line);
+    while (std::getline(in, line)) {
+      std::istringstream fields(line);
+      std::string iface, destination;
+      fields >> iface >> destination;
+      if (destination == "00000000") {
+        interface = iface;
+        break;
+      }
+    }
+  }
+  if (interface.empty()) return std::nullopt;
+  std::ifstream speed("/sys/class/net/" + interface + "/speed");
+  double mbps = 0;
+  if (speed >> mbps) return mbps;
+  return std::nullopt;
+#endif
+}
+
 }  // namespace onion::platform

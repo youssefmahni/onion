@@ -19,6 +19,8 @@
 
 #include "api/api.hpp"
 #include "core/depot_core.hpp"
+#include "profile/profile.hpp"
+#include "profile/service.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
 #include "platform/platform.hpp"
@@ -162,6 +164,67 @@ json state_json(onion::state::StateWriter& writer, int api_port,
 }  // namespace
 
 int node_cmd(int argc, char** argv) {
+  // --- subcommands that don't run the node ---
+  if (argc >= 3 && std::string(argv[2]) == "profile") {
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::profile::ScanOptions options;
+    options.data_dir = dir.string();
+    options.provider_url = flag(argc, argv, "--base-url", "");
+    const onion::profile::Scan scan = onion::profile::scan(options);
+    const onion::profile::DerivedSettings settings =
+        onion::profile::derive(scan, {});
+    std::cout << "os=" << scan.os << " cores=" << scan.cores
+              << " ram_gb=" << scan.ram_gb
+              << " gpu_fp64=" << (scan.gpu_fp64 ? "yes" : "no")
+              << " on_battery=" << (scan.on_battery ? (*scan.on_battery ? "yes" : "no")
+                                                    : "n/a")
+              << "\n";
+    std::cout << "base_weight=" << settings.rules.base_weight
+              << " start_limit=" << settings.rules.start_limit
+              << " ceiling=" << settings.rules.ceiling
+              << " cpu_pool=" << settings.rules.cpu_pool
+              << " on_battery_cap=" << settings.rules.on_battery_cap
+              << " ram_floor_gb=" << settings.rules.ram_floor_gb << "\n";
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "key") {
+    if (argc < 6 || std::string(argv[3]) != "set") {
+      std::cerr << "usage: data_depot node key set <name> <value> "
+                   "[--data-dir <dir>]\n";
+      return 2;
+    }
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::platform::KeyStore store(dir / "keys");
+    if (!store.put(argv[4], argv[5])) {
+      std::cerr << "cannot store the key\n";
+      return 1;
+    }
+    std::cout << "stored " << argv[4] << "\n";
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "install-service") {
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::profile::ServiceConfig config;
+    config.binary = flag(argc, argv, "--binary", "");
+    config.data_dir = dir.string();
+    config.base_url = flag(argc, argv, "--base-url", "");
+    config.model = flag(argc, argv, "--model", "deepseek-flash");
+    config.api_port = std::atoi(flag(argc, argv, "--api-port", "8080").c_str());
+    if (config.binary.empty()) {
+      std::cerr << "--binary is required\n";
+      return 2;
+    }
+#ifdef __linux__
+    std::cout << onion::profile::systemd_unit(config);
+#elif defined(__APPLE__)
+    std::cout << onion::profile::launchd_plist(config);
+#else
+    std::cout << onion::profile::windows_service_script(config);
+#endif
+    std::cerr << "\ninstall it with the OS tooling (systemd/launchctl/sc) — "
+                 "see docs\n";
+    return 0;
+  }
   if (argc < 3 || std::string(argv[2]) != "run") {
     std::cerr << "usage: data_depot node run --data-dir <dir> --base-url <url>"
                  " [--model <id>] [--api-port 8080] [--key-file <path>]\n";
