@@ -172,6 +172,9 @@ int adaptive_bench(int argc, char** argv) {
   WindowSink sink;
   std::atomic<int> submitted{0};
   std::atomic<int> finished{0};
+  std::atomic<std::uint64_t> tokens_hit{0};
+  std::atomic<std::uint64_t> tokens_miss{0};
+  std::atomic<std::uint64_t> tokens_out{0};
   const auto begin = std::chrono::steady_clock::now();
   std::uint64_t window_start = 0;
   const auto report = [&](int window, int used, std::vector<onion::llm::Result> results) {
@@ -203,12 +206,16 @@ int adaptive_bench(int argc, char** argv) {
               << " http_version=" << client.negotiated_http_version()
               << " breaker_open=" << (breaker.open() ? "true" : "false") << "\n";
   };
+  (void)report;
   for (int window = 0; submitted.load() < requests; ++window) {
     const int used = limiter.begin_window(window_start);
     while (submitted.load() < requests && client.in_flight() < static_cast<std::size_t>(used)) {
       client.submit({model, "You answer in at most five words.", "Say ok", 16, 0.0},
         [&](onion::llm::Result result) {
           breaker.on_result(result.kind);
+          tokens_hit += result.in_hit;
+          tokens_miss += result.in_miss;
+          tokens_out += result.out;
           sink.add(std::move(result));
           ++finished;
         });
@@ -236,6 +243,8 @@ int adaptive_bench(int argc, char** argv) {
     report(window, used, std::move(results));
     window_start += 30;
   }
+  std::cout << "tokens_in_hit=" << tokens_hit.load() << " tokens_in_miss=" << tokens_miss.load()
+            << " tokens_out=" << tokens_out.load() << " total_requests=" << submitted.load() << "\n";
   return 0;
 }
 }  // namespace

@@ -40,6 +40,7 @@
 | Date | Milestone | Purpose | Calls | Cost (USD) |
 |---|---|---|---:|---:|
 | 2026-10-10 | M2 | Real-call validation (decision 0004 update): models list, request shape, usage fields, truncation, 401 | 5 (1 free /models, 1 unbilled 401, 4 billed) | $0.0000126 |
+| 2026-10-10 | M2 | Real concurrency probe (adaptive limiter start 4 / ceiling 50) | 100 | ≤ $0.0003 (upper-bound estimate; build predated per-run token totals) |
 
 ## Background processes started
 

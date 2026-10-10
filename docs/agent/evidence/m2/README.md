@@ -38,3 +38,13 @@ python3 docs/agent/evidence/m2/run_benchmarks.py build/linux-debug/data_depot do
 ```
 
 Expected wall time: ~2 minutes.
+
+
+## Real DeepSeek validation and probe (§11 M2.6–2.7)
+
+`real_probe.txt` holds the 100-call concurrency probe (adaptive limiter, start
+4, ceiling 50, `max_tokens` 16): 100/100 OK, no 429/503, HTTP/2 with h2
+multiplexing (4 connections), breaker closed, limit growing +4 per window at
+~1.0 s latency. The 5-call request-shape validation (models list, usage field
+names, `finish_reason` handling, 401 breaker path) is recorded in decision
+0004's 2026-10-10 update and in PROGRESS.md › Real API usage.

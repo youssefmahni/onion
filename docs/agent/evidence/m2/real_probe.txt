@@ -1,0 +1,17 @@
+Real DeepSeek concurrency probe, 2026-10-10 (agent run), Kali Linux, curl 8.22.0.
+Command: data_depot llm bench --url https://api.deepseek.com --requests 100 --adaptive --start 4 --ceiling 50 --timeout 120
+Model: deepseek-flash, max_tokens 16, temperature 0, reasoning_effort "none", HTTP/2 (http_version=3).
+
+window=0 window_s=0 limit_used=4 limit_after=8 calls=4 ok=4 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=1.10249 p95_s=1.10442 submitted=4 finished=4 connections_opened=4 http_version=3 breaker_open=false
+window=1 window_s=30 limit_used=8 limit_after=12 calls=8 ok=8 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=0.961672 p95_s=1.00499 submitted=12 finished=12 connections_opened=4 http_version=3 breaker_open=false
+window=2 window_s=60 limit_used=12 limit_after=16 calls=12 ok=12 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=1.04162 p95_s=1.07954 submitted=24 finished=24 connections_opened=4 http_version=3 breaker_open=false
+window=3 window_s=90 limit_used=16 limit_after=20 calls=16 ok=16 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=0.999079 p95_s=1.05602 submitted=40 finished=40 connections_opened=4 http_version=3 breaker_open=false
+window=4 window_s=120 limit_used=20 limit_after=24 calls=20 ok=20 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=1.00232 p95_s=1.07321 submitted=60 finished=60 connections_opened=4 http_version=3 breaker_open=false
+window=5 window_s=150 limit_used=24 limit_after=28 calls=24 ok=24 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=0.989494 p95_s=1.08678 submitted=84 finished=84 connections_opened=4 http_version=3 breaker_open=false
+window=6 window_s=180 limit_used=28 limit_after=32 calls=16 ok=16 rate_limited=0 server_errors=0 timeouts=0 transport=0 other=0 p50_s=0.978556 p95_s=1.20586 submitted=100 finished=100 connections_opened=4 http_version=3 breaker_open=false
+
+Notes: 100/100 OK, no 429/503, breaker stayed closed, limit grew 4→32 at
+healthy latency (~1.0 s), HTTP/2 throughout, 4 connections for 100 requests
+(h2 multiplexing).  The build that ran this probe did not yet print per-run
+token totals; cost logged in PROGRESS.md as an upper-bound estimate from the
+measured call counts and the observed per-call usage of the same prompt shape.
