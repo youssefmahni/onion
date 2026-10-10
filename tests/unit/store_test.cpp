@@ -4,7 +4,10 @@
 #include <fstream>
 #include <string>
 
+#include "log/log.hpp"
 #include "store/store.hpp"
+#include "store/checkpoint.hpp"
+#include "store/checkpoint.hpp"
 
 namespace {
 
@@ -138,3 +141,74 @@ TEST_F(StoreTest, SettlesAndSpendQueries) {
 }
 
 }  // namespace
+
+// ------------------------------------------------------------- checkpoints
+
+TEST(CheckpointTest, MerkleRootIsStableAndOrderIndependent) {
+  std::vector<Node> nodes;
+  Node a; a.path = "P01"; a.layer = 0; a.title = "Phase"; a.hlc = 1; a.code = "P01";
+  Node b; b.path = "P01-IN01"; b.layer = 1; b.title = "In"; b.hlc = 2; b.code = "IN01";
+  nodes.push_back(b);
+  nodes.push_back(a);  // unsorted on purpose
+  const std::string root = onion::store::merkle_root(nodes);
+  EXPECT_EQ(root.size(), 64u);
+  std::swap(nodes[0], nodes[1]);
+  EXPECT_EQ(onion::store::merkle_root(nodes), root);
+  // A different title changes the root.
+  nodes[1].title = "Different";
+  EXPECT_NE(onion::store::merkle_root(nodes), root);
+}
+
+TEST(CheckpointTest, WritesSnapshotManifestAndKeepsThree) {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("onion_checkpoint_test_" +
+                    std::to_string(std::chrono::steady_clock::now()
+                                       .time_since_epoch()
+                                       .count()));
+  std::filesystem::create_directories(dir);
+  {
+    Db db(dir / "onion.db");
+    std::string error;
+    ASSERT_TRUE(db.open(&error)) << error;
+    ASSERT_TRUE(db.exec(
+        "INSERT INTO nodes(id, code, path, layer, title, origin, hlc) "
+        "VALUES (1, 'P01', 'P01', 0, 'Phase', 'dev', 1);",
+        &error))
+        << error;
+    ASSERT_TRUE(db.exec(
+        "INSERT INTO applied(origin, seq) VALUES ('dev0000000000000001', 5);",
+        &error))
+        << error;
+  }
+  onion::store::CheckpointWriter writer(dir, [](std::string_view bytes) {
+    return onion::log::blake2b_hex(bytes);  // any deterministic "signature"
+  });
+  std::string error;
+  ASSERT_TRUE(writer.write(1001, {{"dev0000000000000001", 5}}, &error)) << error;
+  ASSERT_TRUE(writer.write(2002, {{"dev0000000000000001", 9}}, &error)) << error;
+  ASSERT_TRUE(writer.write(3003, {{"dev0000000000000001", 13}}, &error)) << error;
+  ASSERT_TRUE(writer.write(4004, {{"dev0000000000000001", 17}}, &error)) << error;
+
+  std::vector<std::string> snapshots;
+  for (const auto& entry : std::filesystem::directory_iterator(dir))
+    if (entry.path().filename().string().rfind("checkpoint-", 0) == 0 &&
+        entry.path().extension() == ".db")
+      snapshots.push_back(entry.path().filename().string());
+  ASSERT_EQ(snapshots.size(), 3u);  // only the last 3 survive
+  std::sort(snapshots.begin(), snapshots.end());
+  EXPECT_EQ(snapshots[0], "checkpoint-2002.db");
+  EXPECT_EQ(snapshots[2], "checkpoint-4004.db");
+
+  // The manifest carries the merkle root and the snapshot hash.
+  std::string content;
+  {
+    std::ifstream manifest(dir / "checkpoint-4004.db.manifest");
+    content.assign((std::istreambuf_iterator<char>(manifest)),
+                   std::istreambuf_iterator<char>());
+  }  // close before remove_all (Windows keeps open files locked)
+  auto json = nlohmann::json::parse(content);
+  EXPECT_EQ(json["merkle_root"].get<std::string>().size(), 64u);
+  EXPECT_EQ(json["vector"]["dev0000000000000001"].get<int>(), 17);
+  EXPECT_FALSE(json["signature"].get<std::string>().empty());
+  std::filesystem::remove_all(dir);
+}

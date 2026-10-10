@@ -5,8 +5,12 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
+
+#include <zstd.h>
 
 #include "log/log.hpp"
+#include "store/checkpoint.hpp"
 
 namespace onion::state {
 namespace {
@@ -200,47 +204,191 @@ bool StateWriter::start(std::string* error) {
   log::Segments::Options segment_options;
   segment_options.dir = options_.data_dir / "oplog" / options_.origin;
   segment_options.origin = options_.origin;
+  segment_options.seal_bytes = options_.seal_bytes;
   segments_ = std::make_unique<log::Segments>(segment_options);
   if (!segments_->open(error)) return false;
   replay(error);
   if (error && !error->empty()) return false;
+  last_checkpoint_ = std::chrono::steady_clock::now();
   started_ = true;
   thread_ = std::thread([this] { run(); });
   return true;
 }
 
+bool StateWriter::write_checkpoint(std::string* error) {
+  std::string query_error;
+  std::map<std::string, std::int64_t> vector;
+  std::optional<store::Statement> stmt = db_.prepare(
+      "SELECT origin, seq FROM applied ORDER BY origin;", &query_error);
+  if (stmt) {
+    std::string step_error;
+    while (stmt->step_row(&step_error))
+      vector[stmt->text(0)] = stmt->integer(1);
+  }
+  store::CheckpointWriter writer(
+      options_.data_dir,
+      [this](std::string_view bytes) {
+        return options_.device_key && signer_ ? signer_->sign(bytes)
+                                              : std::string{};
+      });
+  const bool ok = writer.write(hlc_.now(), vector, error);
+  applied_since_checkpoint_.store(0);
+  last_checkpoint_ = std::chrono::steady_clock::now();
+  return ok;
+}
+
+namespace {
+// zstd-decompresses a sealed segment into memory.
+std::string decompress_segment(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  std::string compressed((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  in.close();
+  const unsigned long long size =
+      ZSTD_getFrameContentSize(compressed.data(), compressed.size());
+  if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN)
+    return {};
+  std::string content(static_cast<std::size_t>(size), '\0');
+  const std::size_t written = ZSTD_decompress(
+      content.data(), content.size(), compressed.data(), compressed.size());
+  if (ZSTD_isError(written)) return {};
+  return content;
+}
+}  // namespace
+
 void StateWriter::replay(std::string* error) {
-  // M3: replay every batch of every segment in order, folding each record.
-  // The fold is idempotent (highest hlc wins), so a crash between the
-  // durable write and the store update recovers exactly.
-  std::vector<std::filesystem::path> files;
+  // Replay every batch of every segment in order, folding each record. The
+  // fold is idempotent (highest hlc wins), so a crash between the durable
+  // write and the store update recovers exactly. With a device key, each
+  // batch is verified against the chain; the first failing line is a torn
+  // tail and is cut from the active segment.
+  std::vector<std::filesystem::path> sealed_files;
+  std::filesystem::path active_file;
   std::error_code ec;
   const std::filesystem::path dir = segments_->active_path().parent_path();
   if (std::filesystem::exists(dir))
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
       if (!entry.is_regular_file()) continue;
-      files.push_back(entry.path());
+      if (entry.path().extension() == ".zst") sealed_files.push_back(entry.path());
+      else if (active_file.empty() || entry.path() > active_file)
+        active_file = entry.path();  // the newest raw segment wins
     }
-  std::sort(files.begin(), files.end());
-  for (const auto& file : files) {
-    std::ifstream in(file, std::ios::binary);
+  std::sort(sealed_files.begin(), sealed_files.end());
+  if (std::getenv("ONION_REPLAY_DEBUG")) {
+    std::fprintf(stderr, "replay: sealed=%zu active=%s\n",
+                 sealed_files.size(), active_file.string().c_str());
+  }
+
+  std::int64_t expected_first = 1;
+  std::string expected_prev =
+      options_.device_key ? log::genesis_prev(*options_.device_key)
+                          : std::string{};
+  std::vector<std::string> members{options_.origin};
+  std::uint64_t expected_batch = 1;
+
+  const auto process_line = [&](const std::string& line, std::string* line_error) {
+    auto batch_json = nlohmann::json::parse(line, nullptr, false);
+    if (batch_json.is_discarded() || !batch_json.contains("recs")) {
+      if (line_error) *line_error = "unparseable batch line";
+      return false;
+    }
+    log::Batch batch;
+    batch.version = batch_json.value("v", 0);
+    batch.origin = batch_json.value("o", std::string{});
+    batch.number = batch_json.value("b", std::uint64_t{0});
+    batch.prev = batch_json.value("prev", std::string{});
+    batch.hash = batch_json.value("hash", std::string{});
+    batch.sig = batch_json.value("sig", std::string{});
+    for (const auto& record_json : batch_json["recs"]) {
+      if (!record_json.contains("s") || !record_json.contains("h") ||
+          !record_json.contains("t")) {
+        if (line_error) *line_error = "malformed record";
+        return false;
+      }
+      batch.records.push_back(log::Record::from_json(record_json));
+    }
+    if (options_.device_key) {
+      log::VerifyContext context;
+      context.version = 1;
+      context.expected_prev = expected_prev;
+      context.expected_first_seq = expected_first;
+      context.members = &members;
+      context.origin_public_key = &options_.device_key->public_key;
+      const log::Verify verified = log::verify(batch, context);
+      if (verified != log::Verify::Ok) {
+        if (line_error)
+          *line_error = "batch failed verification (" +
+                        std::to_string(static_cast<int>(verified)) + ")";
+        return false;
+      }
+    }
+    if (batch.number != expected_batch && options_.device_key) {
+      if (line_error) *line_error = "batch number gap";
+      return false;
+    }
+    for (const log::Record& record : batch.records) {
+      if (record.seq >= static_cast<std::int64_t>(next_seq_))
+        next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
+      fold(record, error);
+    }
+    applied_since_checkpoint_ += batch.records.size();
+    next_batch_ = batch.number + 1;
+    expected_batch = batch.number + 1;
+    expected_prev = batch.hash;
+    expected_first = static_cast<std::int64_t>(next_seq_.load());
+    prev_hash_ = batch.hash;
+    return true;
+  };
+
+  for (const auto& file : sealed_files) {
+    const std::string content = decompress_segment(file);
+    if (content.empty()) {
+      if (error) *error = "cannot decompress sealed segment " + file.string();
+      return;
+    }
+    std::istringstream in(content);
     std::string line;
     while (std::getline(in, line)) {
       if (line.empty()) continue;
-      auto batch_json = nlohmann::json::parse(line, nullptr, false);
-      if (batch_json.is_discarded() || !batch_json.contains("recs")) continue;
-      for (const auto& record_json : batch_json["recs"]) {
-        log::Record record = log::Record::from_json(record_json);
-        if (record.seq >= static_cast<std::int64_t>(next_seq_))
-          next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
-        fold(record, error);
+      std::string line_error;
+      if (!process_line(line, &line_error)) {
+        if (error)
+          *error = "sealed segment " + file.string() +
+                   " failed verification: " + line_error +
+                   " (corruption, not a torn tail)";
+        return;
       }
-      if (batch_json.contains("b")) {
-        const std::uint64_t number = batch_json["b"].get<std::uint64_t>();
-        if (number >= next_batch_) next_batch_ = number + 1;
+    }
+  }
+
+  if (!active_file.empty()) {
+    std::ifstream in(active_file, std::ios::binary);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    in.close();
+    std::size_t good = 0;
+    for (; good < lines.size(); ++good) {
+      if (lines[good].empty()) {
+        good++;
+        continue;
       }
-      if (batch_json.contains("hash"))
-        prev_hash_ = batch_json["hash"].get<std::string>();
+      std::string line_error;
+      if (!process_line(lines[good], &line_error)) break;
+    }
+    // A failing tail line is a torn tail: cut it (and anything after).
+    if (good < lines.size()) {
+      std::uint64_t keep = 0;
+      for (std::size_t i = 0; i < good; ++i) keep += lines[i].size() + 1;
+      std::filesystem::resize_file(active_file, keep, ec);
+      if (ec) {
+        if (error) *error = "cannot cut torn tail: " + ec.message();
+        return;
+      }
+      std::fprintf(stderr,
+                   "state writer: cut a torn tail of %zu batch(es) from %s\n",
+                   lines.size() - good, active_file.string().c_str());
     }
   }
   rebuild_index();
@@ -355,8 +503,12 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
     ++next_seq_;
     if (record.hlc == 0) record.hlc = hlc_.now();
   }
-  log::Batch batch =
-      log::make_batch(options_.origin, next_batch_.load(), prev_hash_, records, *signer_);
+  log::Batch batch = log::make_batch(
+      options_.origin, next_batch_.load(),
+      prev_hash_.empty() && options_.device_key
+          ? log::genesis_prev(*options_.device_key)
+          : prev_hash_,
+      records, *signer_);
   ++next_batch_;
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;

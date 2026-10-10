@@ -349,6 +349,8 @@ int main(int argc, char** argv) {
   if (command == "review") return review_cmd(argc, argv);
   if (command == "dev-import") return dev_import_cmd(argc, argv);
   if (command == "export-csv") return export_csv_cmd(argc, argv);
+  if (command == "admin") return admin_cmd(argc, argv);
+  if (command == "genesis-import") return genesis_import_cmd(argc, argv);
   std::cerr << "unknown command: " << command << "\n";
   return 2;
 }

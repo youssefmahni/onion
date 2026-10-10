@@ -417,6 +417,17 @@ std::int64_t Db::max_node_id(std::string* error) const {
   return stmt->integer(0);
 }
 
+std::int64_t Db::max_tk_value(std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT COALESCE(MAX(CAST(substr(code, 3) AS INTEGER)), 0) FROM nodes "
+      "WHERE code LIKE 'TK%';",
+      error);
+  if (!stmt) return 0;
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return 0;
+  return stmt->integer(0);
+}
+
 std::string Db::spend_usd(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT COALESCE(SUM(CAST(cost AS REAL)), 0.0) FROM attempts;", error);

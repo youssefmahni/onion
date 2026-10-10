@@ -12,6 +12,16 @@ Evidence:
 Attempts: 1. sibling-title collisions in the deterministic funnel fake (palette rotation) → depth-banded palette so children never repeat siblings/ancestors · 2. 41 s engine test → O(1) index sets + node cache → 13 s · 3. api bound_port returned the bind bool → bind_to_any_port · 4. node run stalled with `[{` content → M2 client regex bug → nlohmann parse.
 Next step: push m3-engine, wait for CI green, real small campaign (≤10 nodes, ≤150 calls), gate report, PR, merge, m3-rc.
 
+## 2026-10-10T18:3xZ · m3 · M3 merged
+
+Result: done
+Evidence:
+- Real campaign: 3 attempts scored 0.35/0.35/0.22 (all below floor) → review, nothing committed; 5,907 in + 9,772 out tokens, $0.0135 peak-priced; audit records now carry real tokens/cost; exact call counts added.
+- Windows/macOS CI fixes: plain-HTTP httplib (no OpenSSL) for the Intel macOS 12 link; Db::close + Segments::close so Windows tests can remove temp dirs.
+- CI 38074766582 all 8 jobs green; PR #7 merged `1b3eee5`; tagged `m3-rc`.
+Next step: create m4-signed-log from main; device keys, Ed25519 signer, batch verification, zstd-sealed segments with torn-tail repair, checkpoints, admin keygen, tools/import, CUTOVER.md.
+
+
 
 
 > Session protocol: read `WORKLOG.md`, `PROGRESS.md`, `OWNER_ACTIONS.md` at the start of every session, then the AUTONOMOUS_GOAL.md section for the current milestone.
@@ -78,3 +88,10 @@ Evidence:
 
 Next step: merge PR #4 with a merge commit, tag `m2-rc`, fast-forward main, create `m3-engine` from main.
 
+
+## 2026-10-10T18:4xZ · m4 · start; process lapse recorded
+
+Result: in progress
+Evidence: -
+Lapse: the "record the merge" memory-docs commit landed on main (before branching) — §6.1 says never commit to main. Docs-only and harmless, but recorded. All code commits from here land on m4-signed-log only.
+Next step: DeviceKey + Ed25519Signer in src/log with golden determinism, then verify() with every rejection case.

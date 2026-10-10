@@ -144,6 +144,8 @@ class Db {
   std::vector<Campaign> campaigns(std::string* error) const;
   std::vector<Settle> settles(std::string* error) const;
   std::int64_t max_node_id(std::string* error) const;
+  // The largest numeric TK id value (TK<digits>) in nodes.
+  std::int64_t max_tk_value(std::string* error) const;
   std::string spend_usd(std::string* error) const;
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,

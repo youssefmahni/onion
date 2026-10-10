@@ -1,4 +1,5 @@
 #include "commands.hpp"
+#include "genesis_import.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,9 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include <memory>
 #include <sstream>
 #include <string>
@@ -46,12 +50,34 @@ std::filesystem::path data_dir_arg(int argc, char** argv) {
   return onion::platform::data_dir();
 }
 
+// Loads the device key from the key store, or generates it on first use.
+// The seed is stored as hex; the key never leaves the process.
+std::shared_ptr<onion::log::DeviceKey> load_device_key(
+    onion::platform::KeyStore& store, std::string* error) {
+  const auto stored = store.get("device-key");
+  if (stored && stored->size() == 64) {
+    return std::make_shared<onion::log::DeviceKey>(
+        onion::log::DeviceKey::from_seed_hex(*stored));
+  }
+  auto key = std::make_shared<onion::log::DeviceKey>(
+      onion::log::DeviceKey::generate());
+  if (!store.put("device-key", key->seed_hex())) {
+    if (error) *error = "cannot store the device key";
+    return nullptr;
+  }
+  return key;
+}
+
 std::unique_ptr<onion::state::StateWriter> open_writer(
-    const std::filesystem::path& dir, const std::string& origin,
-    std::string* error) {
+    const std::filesystem::path& dir, std::string* error) {
+  onion::platform::KeyStore store(dir / "keys");
+  auto key = load_device_key(store, error);
+  if (!key) return nullptr;
   onion::state::StateWriter::Options options;
   options.data_dir = dir;
-  options.origin = origin;
+  options.origin = key->device_id;
+  options.device_key = key;
+  options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
   auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
   if (!writer->start(error)) return nullptr;
   return writer;
@@ -145,16 +171,20 @@ int node_cmd(int argc, char** argv) {
   const std::string base_url = flag(argc, argv, "--base-url", "");
   const std::string model = flag(argc, argv, "--model", "deepseek-flash");
   const int api_port = std::atoi(flag(argc, argv, "--api-port", "8080").c_str());
-  const std::string origin = flag(argc, argv, "--origin", "dev0000000000000001");
 
   std::string error;
-  auto writer = open_writer(dir, origin, &error);
+  auto writer = open_writer(dir, &error);
   if (!writer) {
     std::cerr << "cannot open node state: " << error << "\n";
     return 1;
   }
   onion::platform::KeyStore key_store(dir / "keys");
   const std::string token = api_token(key_store);
+  const auto device_key = load_device_key(key_store, &error);
+  if (!device_key) {
+    std::cerr << error << "\n";
+    return 1;
+  }
 
   // The DeepSeek key: environment first (development fallback), then the
   // OS key store. Never printed.
@@ -281,7 +311,7 @@ int node_cmd(int argc, char** argv) {
 
   // Engine loop: run every running campaign until stopped.
   onion::sched::Engine engine(
-      {*writer, ask, budget, 1, origin, "0.02", prices});
+      {*writer, ask, budget, 1, device_key->device_id, "0.02", prices});
   while (!stop_flag.load()) {
     bool worked = false;
     for (const auto& campaign : writer->campaigns()) {
@@ -314,9 +344,8 @@ int campaign_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
-  const std::string origin = flag(argc, argv, "--origin", "dev0000000000000001");
   std::string error;
-  auto writer = open_writer(dir, origin, &error);
+  auto writer = open_writer(dir, &error);
   if (!writer) {
     std::cerr << error << "\n";
     return 1;
@@ -400,9 +429,8 @@ int review_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
-  const std::string origin = flag(argc, argv, "--origin", "dev0000000000000001");
   std::string error;
-  auto writer = open_writer(dir, origin, &error);
+  auto writer = open_writer(dir, &error);
   if (!writer) {
     std::cerr << error << "\n";
     return 1;
@@ -469,9 +497,8 @@ int dev_import_cmd(int argc, char** argv) {
     return 2;
   }
   const std::filesystem::path dir = data_dir_arg(argc, argv);
-  const std::string origin = flag(argc, argv, "--origin", "dev0000000000000001");
   std::string error;
-  auto writer = open_writer(dir, origin, &error);
+  auto writer = open_writer(dir, &error);
   if (!writer) {
     std::cerr << error << "\n";
     return 1;
@@ -529,5 +556,65 @@ int export_csv_cmd(int argc, char** argv) {
     return 1;
   }
   std::cout << "exported to " << out << "\n";
+  return 0;
+}
+
+// ------------------------------------------------------------------ admin
+
+int admin_cmd(int argc, char** argv) {
+  const std::string action = argc >= 3 ? argv[2] : "";
+  if (action != "keygen") {
+    std::cerr << "usage: data_depot admin keygen --out <path>\n";
+    return 2;
+  }
+  const std::string out = flag(argc, argv, "--out", "");
+  if (out.empty()) {
+    std::cerr << "admin keygen needs --out <path>\n";
+    return 2;
+  }
+  // The admin key must never live inside the data directory.
+  const std::filesystem::path target(out);
+  const std::filesystem::path data = data_dir_arg(argc, argv);
+  const auto inside = [](const std::filesystem::path& path,
+                         const std::filesystem::path& base) {
+    std::error_code ec;
+    const auto canonical_parent =
+        std::filesystem::weakly_canonical(path.parent_path(), ec);
+    const auto canonical_base = std::filesystem::weakly_canonical(base, ec);
+    if (ec) return false;
+    const auto relative = canonical_parent.lexically_relative(canonical_base);
+    if (relative.empty()) return true;  // the data directory itself
+    return !relative.empty() && relative.string().find("..") != 0;
+  };
+  if (inside(target, data)) {
+    std::cerr << "refusing to write the admin key inside the data directory\n";
+    return 1;
+  }
+  if (std::filesystem::exists(target)) {
+    std::cerr << target << " already exists; choose another path\n";
+    return 1;
+  }
+  const auto key = onion::log::DeviceKey::generate();
+  nlohmann::json file = {{"seed_hex", key.seed_hex()},
+                         {"public_key_hex",
+                          [&] {
+                            std::string hex;
+                            for (const std::uint8_t byte : key.public_key)
+                              hex += "0123456789abcdef"[byte >> 4],
+                                  hex += "0123456789abcdef"[byte & 0x0f];
+                            return hex;
+                          }()}};
+  std::ofstream output(target, std::ios::binary);
+  if (!output) {
+    std::cerr << "cannot write " << target << "\n";
+    return 1;
+  }
+  output << file.dump() << "\n";
+  output.close();
+#ifndef _WIN32
+  ::chmod(target.c_str(), S_IRUSR | S_IWUSR);
+#endif
+  std::cout << "public key: " << file["public_key_hex"].get<std::string>() << "\n";
+  std::cout << "keep this file offline, outside every machine's data directory\n";
   return 0;
 }

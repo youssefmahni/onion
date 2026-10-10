@@ -92,3 +92,32 @@ Prerequisites: OA-2 resolved; `~/onion-data` populated.
 Steps: the agent provides a runbook once OA-2 is done; expected cost ≈ $0.02 for 10 nodes at light settings.
 
 Cost / duration: ≤ 150 calls, ≈ $0.02, ~20 minutes.
+
+---
+
+### OA-10 · M4 corpus-copy import and cutover preparation · M4 · status: open
+
+Why: The genesis import was verified on a fixture corpus; the real corpus copy needs OA-2 first. The import itself and the cutover are fully scripted.
+
+Prerequisites: OA-2 resolved (`~/onion-data` populated).
+
+Steps:
+1. Run the weekly dry run: `tools/import/weekly_dry_run.sh` (from the repo). Expect `VERIFIED`, `orphans=0`, per-layer counts.
+2. Approve the duplicate proposal: copy `~/onion-data/duplicates-proposal.tsv` to `~/onion-data/duplicates-resolution.tsv`, editing the `kept` column where you disagree.
+3. The actual cutover follows `docs/CUTOVER.md` §3–§6 when you are ready (no earlier than M6 for the final switch; the dry run is safe now).
+
+Cost / duration: none (offline).
+
+---
+
+### OA-11 · Generate the offline admin key · M4 · status: open
+
+Why: Emergency evictions need the admin key, kept offline. The command exists; only the owner runs it.
+
+Steps:
+```bash
+data_depot admin keygen --out <path outside any data directory, e.g. a USB drive or password manager export>
+```
+Store the printed public key with the runbook. Never place the file on a fleet machine.
+
+Cost / duration: none.

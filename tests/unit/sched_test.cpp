@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -159,3 +160,26 @@ TEST(ProjectCost, ScalesLinearlyInExactDecimals) {
 }
 
 }  // namespace
+
+// -------------------------------------------------------------- M4 slot ids
+
+TEST(NodeIdAllocator, AllocatesFromSlotTimesTwoToTheForty) {
+  onion::sched::NodeIdAllocator allocator(3, 0);
+  EXPECT_EQ(allocator.allocate(), "TK3298534883328");     // 3 × 2^40
+  EXPECT_EQ(allocator.allocate(), "TK3298534883329");
+  EXPECT_EQ(onion::sched::NodeIdAllocator::counter_from_code("TK3298534883329"),
+            3298534883329LL);
+  EXPECT_EQ(onion::sched::NodeIdAllocator::counter_from_code("P01"), 0);
+  EXPECT_EQ(onion::sched::NodeIdAllocator::id_value(0, 42), 42);
+}
+
+TEST(NodeIdAllocator, SlotBounds) {
+  // The largest slot still fits int64 with a 40-bit counter.
+  const std::int64_t max_slot = (1 << 20) - 1;
+  onion::sched::NodeIdAllocator allocator(max_slot, (1LL << 40) - 1);
+  const std::string last = allocator.allocate();
+  EXPECT_EQ(onion::sched::NodeIdAllocator::counter_from_code(last),
+            (1LL << 40) - 1 + max_slot * (1LL << 40));
+  EXPECT_LT(onion::sched::NodeIdAllocator::counter_from_code(last),
+            std::numeric_limits<std::int64_t>::max() / 2);
+}

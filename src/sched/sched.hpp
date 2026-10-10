@@ -39,6 +39,22 @@ struct CampaignSpec {
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
                                            std::string* error);
 
+// Node ids: TK + decimal of slot × 2^40 + counter (DESIGN › Device identity
+// and ID slots). Legacy ids live in slot 0 and keep their numbers.
+class NodeIdAllocator {
+ public:
+  // slot: the device's 20-bit slot; next: the highest counter already used
+  // in this slot (from the store on start).
+  NodeIdAllocator(std::int64_t slot, std::int64_t next_counter = 0);
+  std::string allocate();             // next id, e.g. "TK00000000000000001"
+  static std::int64_t counter_from_code(std::string_view code);  // 0 if not a TK id
+  static std::int64_t id_value(std::int64_t slot, std::int64_t counter);
+
+ private:
+  std::int64_t slot_;
+  std::int64_t counter_;
+};
+
 struct Ticket {
   std::string path;
   std::string title;
@@ -90,6 +106,9 @@ class Engine {
     // Optional per-1M-token prices for attempt cost metering (decision
     // 0004: no implicit defaults; node.conf arrives in M5).
     std::optional<onion::llm::PriceSchedule> prices;
+    // The device's 20-bit id slot (M4+): child TK ids are allocated from
+    // slot × 2^40. 0 keeps the legacy allocation for M3-era tests.
+    std::int64_t slot{0};
   };
 
   Engine(Options options);
