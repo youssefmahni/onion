@@ -44,6 +44,12 @@ struct Sample {
 };
 Sample sample();
 
+// Static machine facts for the profile scan. Unknown values are nullopt.
+std::string os_name();                       // "linux" | "macos" | "windows"
+std::optional<double> total_ram_gb();
+std::optional<double> disk_free_gb(const std::filesystem::path& path);
+std::optional<double> link_speed_mbps();     // the default-route interface
+
 // Raises the Unix soft descriptor limit to the hard limit where permitted, then
 // returns the usable number of simultaneous outbound requests (64 descriptors
 // remain reserved for logs, listeners, and other engine resources).

@@ -121,3 +121,22 @@ data_depot admin keygen --out <path outside any data directory, e.g. a USB drive
 Store the printed public key with the runbook. Never place the file on a fleet machine.
 
 Cost / duration: none.
+
+---
+
+### OA-12 · M5 Mac Pro profile, service restart and live tuning run · M5 · status: open
+
+Why: Hosted CI cannot run systemd services or touch the Mac Pros; these checks need the real fleet hardware.
+
+Prerequisites: a Mac Pro (Intel, macOS 12) with the repo built; a DeepSeek key for the live run.
+
+Steps:
+1. `data_depot node profile --data-dir ~/.local/share/onion` — expect laptop rules v1 (base_weight 0.25, start 4, ceiling 32) unless overridden in node.conf.
+2. `node install-service --binary <abs path>/data_depot --data-dir ~/.local/share/onion --base-url https://api.deepseek.com` → copy the plist to ~/Library/LaunchAgents, `launchctl load`, then `kill -9` the node and confirm launchd restarts it (KeepAlive).
+3. Live tuning: run a small campaign with real calls; watch the limit stay at the profile start value without 429 storms; report the highest limit reached and the error count.
+
+Cost / duration: ≤ 50 real calls, ~30 minutes.
+
+Pass criteria: the profile shows laptop rules; the node restarts after kill -9; no 429 storm.
+
+If it fails: collect `node profile` output, the plist, and the node log tail.

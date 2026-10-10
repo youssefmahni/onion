@@ -462,6 +462,36 @@ void StateWriter::fold(const log::Record& record, std::string* error) {
       statement->bind(1, payload.at("path").get<std::string>(), &bind_error);
       statement->step(&bind_error);
     }
+  } else if (type == "MEMBER_PROFILE") {
+    const auto& payload = record.payload;
+    auto statement = db_.prepare(
+        "INSERT INTO profiles(device_id, version, prev, reason, changed, "
+        "spec, rules_version, schema, hlc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, "
+        "?7, ?8, ?9);",
+        error);
+    if (statement) {
+      std::string bind_error;
+      std::string changed;
+      if (payload.contains("changed") && payload["changed"].is_array())
+        for (const auto& item : payload["changed"])
+          if (item.is_string()) {
+            if (!changed.empty()) changed += ",";
+            changed += item.get<std::string>();
+          }
+      if (!statement->bind(1, payload.value("device_id", std::string{options_.origin}), &bind_error) ||
+          !statement->bind(2, payload.value("version", std::int64_t{1}), &bind_error) ||
+          !statement->bind(3, payload.value("prev", std::string{}), &bind_error) ||
+          !statement->bind(4, payload.value("reason", std::string{}), &bind_error) ||
+          !statement->bind(5, changed, &bind_error) ||
+          !statement->bind(6, payload.value("spec", nlohmann::json::object()).dump(), &bind_error) ||
+          !statement->bind(7, payload.value("rules_version", std::int64_t{1}), &bind_error) ||
+          !statement->bind(8, payload.value("schema", std::int64_t{1}), &bind_error) ||
+          !statement->bind(9, static_cast<std::int64_t>(record.hlc), &bind_error)) {
+        if (error) *error = "fold profile bind failed: " + bind_error;
+        return;
+      }
+      statement->step(&bind_error);
+    }
   }
   // ATOMIC, RESERVE, CLAIM, REEXPAND, RETITLE, TOMBSTONE, membership and
   // CHECKPOINT records are append-only in M3; their store effects arrive

@@ -85,3 +85,16 @@ Every rule touched by a milestone must have at least one passing test before tha
 | Admin keygen refuses the data directory, prints the public key | CLI evidence (gate report), `admin keygen` exit codes | ✅ |
 | Genesis import: duplicates need an approved resolution; counts per layer, parents, Merkle root verified | `genesis_import.verify` (fixture corpus with duplicates) | ✅ |
 | A lone eviction signature is rejected; an admin-signed one is accepted | `EvictionValid.LoneMemberSignatureIsRejected` | ✅ |
+
+## M5 scope: DESIGN.md › Member profiles, LLM provider (keys), Concurrency (safety caps)
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| Profile scan measures OS, CPU, RAM, disk, durable write, GPU fp64, battery, link speed, RTT — unknown never invented | `node profile` live output; platform `os_name/total_ram_gb/disk_free_gb/link_speed_mbps` | ✅ |
+| Rules version 1: desktop 1.0/16/2000/2GB, laptop 0.25/4/32/8/1GB | `ProfileRules.DesktopAndLaptopDefaults` | ✅ |
+| node.conf overrides always win | `ProfileDerive.OverridesAlwaysWin`, `ProfileNodeConf.ParsesOverridesAndComments` | ✅ |
+| MEMBER_PROFILE only when something changed; version, prev, reason, changed | `ProfileVersions.NewProfileOnlyOnChange`, `ProfileVersions.OverrideChangeBumpsVersion` | ✅ |
+| Records never contain floats: profile measurements are decimal strings | profile spec construction (decision 0003), all profile tests | ✅ |
+| Key storage: Keychain (macOS), DPAPI (Windows), 0600 file (Linux); keys never in service definitions | platform KeyStore backends; `ServiceFiles.GoldenContent` (no Environment=, no key text) | ✅ |
+| Service definitions: systemd Restart=always + StateDirectory, launchd KeepAlive, Windows restart-on-failure | `ServiceFiles.GoldenContent`, `ServiceFiles.EscapeXmlInPlist` | ✅ |
+| Profile feeds the limiter start value and ceiling | `node run` derives the client limit from the profile | ✅ |
