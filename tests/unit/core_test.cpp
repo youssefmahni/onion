@@ -7,8 +7,6 @@
 #include <set>
 #include <string>
 #include <vector>
-#include <unistd.h>
-
 #include "core/depot_core.hpp"
 
 namespace {

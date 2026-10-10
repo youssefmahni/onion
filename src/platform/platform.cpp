@@ -12,9 +12,13 @@
 #include <utility>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <wincrypt.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -34,9 +38,21 @@
 namespace onion::platform {
 namespace {
 std::optional<std::string> env(std::string_view name) {
+#ifdef _WIN32
+  char* value = nullptr;
+  std::size_t length = 0;
+  if (_dupenv_s(&value, &length, std::string(name).c_str()) != 0 || value == nullptr || *value == '\0') {
+    std::free(value);
+    return std::nullopt;
+  }
+  const std::string result(value);
+  std::free(value);
+  return result;
+#else
   const char* value = std::getenv(std::string(name).c_str());
   if (value == nullptr || *value == '\0') return std::nullopt;
   return std::string(value);
+#endif
 }
 bool valid_name(std::string_view name) {
   return !name.empty() && name.find("..") == std::string_view::npos &&
