@@ -3,10 +3,11 @@
 ## Current
 
 - Milestone: M1 · branch m1-foundations · started 2026-10-09
-- Tests: legacy 98/98 · new 81/81 on Linux · CI: pending task-6 checkpoint
+- Tests: legacy 98/98 · new 83/83 on Linux · CI: green task-6 checkpoint
 
 ## Log (newest first)
 
+- 2026-10-10: M1 task 6 checkpoint: corrected durable replacement semantics and platform sampler/key-store/data-directory coverage · local new 83/83 · CI green on all jobs
 - 2026-10-09: M1 task 6: implemented the platform data directory, durable append, atomic replace, sampler and staged key store · local new 81/81 · GPU tests cannot run in hosted CI on real fp64 hardware; full GPU validation needs the Mac Pro runner
 - 2026-10-10: M1 task 6 follow-up: battery sampling on macOS/Linux and GPU-load sampling are deferred to M5.
 - 2026-10-09: Corrected TLS policy: macOS SDK curl, Linux distribution OpenSSL curl, Windows pinned Schannel curl; minimum M2 curl version 7.66.0 · no real API calls
