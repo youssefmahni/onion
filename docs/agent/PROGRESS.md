@@ -2,11 +2,31 @@
 
 ## Current
 
-- Milestone: M1 · branch m1-foundations · started 2026-10-09
-- Tests: legacy 98/98 · new 88/88 on Linux · CI: green M1 gate candidate
+- Milestone: M2 · branch m2-deepseek-client · started 2026-10-10
+- Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
 
 ## Log (newest first)
+- 2026-10-10: Added core-sized CPU reply-parsing pool and fixed-limit bench
+  controls · local fake-server capacity run completed 1,000 requests at limit
+  1,000; the limit-100 reuse run opened 100 connections for 1,000 requests;
+  half-budget run started 500 and refused 500 · no real calls
+- 2026-10-10: Corrected the sanitizer-only OpenCL switch and converted the
+  reset fixture to a raw local TCP reset listener, avoiding Python handler
+  queue delay · focused timeout/reset tests pass · no real calls
+- 2026-10-10: Added compressed 30-second adaptive traces for healthy,
+  rate-limited and slow-under-load observations · corrected first-baseline
+  scheduling so the initial probe is one hour later, not in the next window ·
+  no real calls
+- 2026-10-10: M2 timeout accounting: timed-out requests now retain their full
+  reservation as uncertain spend; added a 1,000-request one-second
+  accept-without-response regression that verifies Timeout classification and
+  breaker opening · no real calls
+- 2026-10-10: Diagnosed the 1,000-request client crash with ASan/UBSan as a queued-deque iterator use-after-free; fixed by draining ready tasks under the mutex before curl work · normal and sanitizer benchmarks now complete 1,000/1,000 against the fake server · added fake-server concurrency and transport-failure regression coverage · no real calls
+- 2026-10-10: TSan CI found a second construction-order race; reordered the client worker after its synchronization state and verified the focused suite locally · sanitizer CI disables POCL only because its external allocations leak under LSan · no real calls
+- 2026-10-10: Re-ran 1,000 fake requests after the TSan repair: normal 1,149.14 req/s and ASan/UBSan 307.235 req/s, both 1,000/1,000 successful · no real calls
 
+- 2026-10-10: M2 checkpoint: added standard-library fake DeepSeek server, scenarios and adaptive limiter tests · CI 56aa921 green on Linux, macOS arm64, macOS Intel compatibility build and Windows · no real calls; 1,000-request benchmark not started
+- 2026-10-10: M2 started from merged M1; no real DeepSeek completions approved or used · pricing source recorded in decision 0004
 - 2026-10-10: M1 tasks 7–9: added RFC and project golden vectors, confirmed CI on Linux/macOS/Windows, and completed decision records · local new 88/88 · legacy 98/98 plus controller 9/9 · gate report prepared
 - 2026-10-10: M1 task 6 checkpoint: corrected durable replacement semantics and platform sampler/key-store/data-directory coverage · local new 83/83 · CI green on all jobs
 - 2026-10-09: M1 task 6: implemented the platform data directory, durable append, atomic replace, sampler and staged key store · local new 81/81 · GPU tests cannot run in hosted CI on real fp64 hardware; full GPU validation needs the Mac Pro runner
@@ -19,6 +39,8 @@
 
 | Date | Milestone | Purpose | Calls | Cost (USD) |
 |---|---|---|---:|---:|
+| 2026-10-10 | M2 | Real-call validation (decision 0004 update): models list, request shape, usage fields, truncation, 401 | 5 (1 free /models, 1 unbilled 401, 4 billed) | $0.0000126 |
+| 2026-10-10 | M2 | Real concurrency probe (adaptive limiter start 4 / ceiling 50) | 100 | ≤ $0.0003 (upper-bound estimate; build predated per-run token totals) |
 
 ## Background processes started
 

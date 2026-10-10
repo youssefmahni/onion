@@ -1,0 +1,66 @@
+# Worklog (append-only, newest at top)
+
+> Session protocol: read `WORKLOG.md`, `PROGRESS.md`, `OWNER_ACTIONS.md` at the start of every session, then the AUTONOMOUS_GOAL.md section for the current milestone.
+
+## Folded from `onion.task` (completed-task ledger, pre-autonomy)
+
+### M1 — Foundations
+- New repository layout, CMake presets and layered targets; 67 pure-core + 8 GPU tests in the new tree; 98 legacy tests retained.
+- Cross-platform CI: Linux, macOS arm64, macOS x86_64/12.0 compat build, Windows; GPU tests run on Linux, skipped elsewhere without a runtime.
+- Platform data-directory precedence, durable append, atomic replace, sampling and staged key stores; pinned dependencies; TLS-backend decision 0002; canonical JSON, BLAKE2b-256, Ed25519 golden vectors.
+- Merged as M1 (`b885e96`), tagged `m1`, gate report `docs/agent/gates/M1.md`.
+
+### M2 — DeepSeek client checkpoint (pre-autonomy, completed tasks)
+- Python-stdlib fake DeepSeek server with healthy, rate-limited, truncating, slow-under-load scenarios; request recording omits Authorization values.
+- Adaptive limiter: 429/503 and >5% timeouts halve; healthy latency +4; latency rise holds; ceiling and floor enforced. Probe-baseline model per decision 0005.
+- Peak/off-peak pricing per decision 0004: requests inside one window use its rate; crossing requests use the higher rate; reservations always use the maximum.
+- Legacy pool-resize test stabilized test-only (PR #2, merge `62ae2f9`).
+- ASan/UBSan: fixed queued-deque iterator use-after-free; TSan: fixed construction-order race; 1,000-request benchmarks green after both (1,149.14 req/s normal, 307.235 req/s ASan).
+- curl_multi_poll-only event loop, stable heap ownership per request, descriptor-limit raising with 64-descriptor reserve, 1,000-request closed-port/reset/timeout regressions.
+- Timeout accounting: full reservation retained as uncertain spend; breaker opens after 20 failures (1,000 accept-without-response regression).
+- CPU parsing pool sized to cores; process thread count unchanged at 100 vs 1,000 in flight (14 threads).
+- Capacity/reuse/half-budget/adaptive-trace benchmark modes; sanitizer-only OpenCL switch; raw reset listener fixture.
+- `status_repport.md` (now `docs/agent/STATUS.md`) written as the stakeholder report.
+
+## 2026-10-10T15:xxZ · m2 · bootstrap — G1–G9 verification (autonomous run)
+
+Result: in progress
+Evidence:
+- `git branch --show-current` → `m2-deepseek-client`. First commit `1abbd2f` added `docs/agent/AUTONOMOUS_GOAL.md`.
+- `git ls-remote --tags origin` → `m0` = annotated tag on `42ecd8a24e870df8e50cf4659a45f05fdbf2a2f0`, annotation "M0: P1-P7 fixed, one real DeepSeek node verified"; local `git tag -l m0` agrees. The `status_repport.md` claim "m0 is not tagged" is FALSE.
+- G2: CI 38060403321, macOS arm64 New tree job, `76/114 Test #76: PlatformFileLimits.RaisesMacOSSoftLimitToAtLeast4096 ... Passed`. Job exists, runs on PRs, assertion executes.
+- G3: CI 38060403321 Windows New tree job: `100/113 ... llm.closed_port_1000 ... ***Failed 20.49 sec`; 1,000 attempts end as Timeout at the 2 s deadline.
+- G5: `third_party/VERSIONS.md` pins Windows curl 8.11.1; `CMakeLists.txt:101` matches.
+- G6: accepted limitation, already recorded in STATUS.md.
+- G7/G8: this commit moves the stray files and creates the memory files.
+- G9: half-budget run kept; waiting-reservation test deferred to M3 (recorded in M3 task list).
+- Local Linux baseline: `ctest --preset linux-debug` → 113/113 passed.
+- Key check: `DEEPSEEK_API_KEY` present in env (not printed). Corpus copy `~/onion-data` absent; `ORIGINAL_PROJECT` blank in §0 → M0 real node is OA-1. Candidate original project found at `~/Desktop/PlanningProcess` (10 level CSVs) — owner must confirm; NOT touched.
+
+Next step: commit G7+G8 memory files, then G3 connect-timeout fix (separate `CURLOPT_CONNECTTIMEOUT`), then G5 curl pin.
+
+## 2026-10-10T16:0xZ · m2 · G3, G5, G4, real calls, gate preparation
+
+Result: in progress
+Evidence:
+- G3: `655a2b2` separate connect timeout (decision 0007 pending at that point). Windows CI 38061629737: `llm.closed_port_1000 ... Passed 22.62 sec` (curl 8.11.1; ~2 s/refusal, 10 waves × 2 s). After G5's curl 8.22.0, CI 38062411051: same test `Passed 2.31 sec` — curl 8.22.0 changelog "cf-socket: disable TCP SYN retransmissions for localhost on Windows" explains the immediate refusal.
+- G5: curl 8.22.0 (2026-09-02), SHA-256 f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7 verified from both curl.se and GitHub; `CURL_USE_LIBPSL OFF` required by 8.21+ CMake; CI 38062411051 all 8 jobs green.
+- G4: `de07b8b` trace CSVs + benchmark evidence set + reproducible runner.
+- Real calls: `GET /models` (free) → deepseek-flash + deepseek-v4-pro, HTTP/2. 4 billed completions + 1 unbilled 401: shape accepted (reasoning_effort "none" OK), usage names confirmed, finish_reason length → Truncated, 401 → auth breaker. 100-call adaptive probe: 100/100 OK, 0 errors, h2 multiplexing (4 connections), limit 4→32. Decision 0004 updated; PROGRESS usage table filled.
+- New tests: `llm.truncating_20`, `llm.client_error_400` (`fc2724d`); local suite 115/115.
+- Gate report drafted: docs/agent/gates/M2.md.
+
+Next step: confirm the final CI run (fc2724d) is green on all 8 jobs, fill the CI link into gates/M2.md, open the PR, merge checklist, merge, tag m2-rc, update main, create m3-engine.
+
+## 2026-10-10T16:4xZ · m2 · unblock merge: legacy macOS flake, PR #4 final head
+
+Result: in progress
+Evidence:
+- The merged head `238a800` failed only in Legacy (macOS): `FunnelFixture.PoolResizesFromControlFile (10638 ms)`, line 1032 — the synthesizer's 10 s bounded wait expired before a clock-stalled manager announced `THREADS\t3` (control loop `cv.wait_for` at legacy/depot_io.cpp:1025). Two further test-only commits existed on `fix-legacy-pool-test-3`: `a24e7db` (diagnosis output) and `217764a` (bound 10 s → 120 s; assertion unchanged).
+- Opened PR #6 (fix-legacy-pool-test-3 → main), CI 38066383814 all 6 main-workflow jobs green, merged `8f7217c` with merge commit.
+- Merged main into m2: `b83414b`. Push CI 38066565411 and PR #4 CI 38066568216: all 8 jobs green (incl. Legacy macOS 21 s, ASan+UBSan, TSan).
+- Merge checklist: TRACEABILITY covers DESIGN.md › LLM provider/keys/budgets and › Concurrency; gate report has owner checklist; deviations recorded (decision 0007); owner actions OA-1/2/3 open; no stray files; TODO grep hits are false positives (`\uXXXX` escape comment).
+- gates/M2.md CI link updated to 38066568216 (final PR head).
+
+Next step: merge PR #4 with a merge commit, tag `m2-rc`, fast-forward main, create `m3-engine` from main.
+
