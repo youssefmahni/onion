@@ -33,6 +33,10 @@ class AppendFile {
 bool atomic_replace(const std::filesystem::path& tmp,
                     const std::filesystem::path& destination);
 
+struct SyncCounts { unsigned file = 0; unsigned directory = 0; };
+void reset_sync_counts_for_test();
+SyncCounts sync_counts_for_test();
+
 struct Sample {
   std::optional<double> load1, cpu_pct, ram_avail_gb, net_rx_mbps, net_tx_mbps, gpu_pct;
   std::optional<bool> on_battery;

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <system_error>
 #include <utility>
 
@@ -35,6 +36,7 @@
 
 namespace onion::platform {
 namespace {
+SyncCounts sync_counts{};
 std::optional<std::string> env(std::string_view name) {
 #ifdef _WIN32
   char* value = nullptr;
@@ -79,7 +81,20 @@ bool private_dir(const std::filesystem::path& path) {
   return true;
 #endif
 }
+#ifndef _WIN32
+bool sync_directory(const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  if (ok) ++sync_counts.directory;
+  return ok;
+}
+#endif
 }  // namespace
+
+void reset_sync_counts_for_test() { sync_counts = {}; }
+SyncCounts sync_counts_for_test() { return sync_counts; }
 
 std::filesystem::path data_dir(const std::optional<std::filesystem::path>& flag) {
   if (flag && !flag->empty()) return *flag;
@@ -129,11 +144,13 @@ bool AppendFile::open(const std::filesystem::path& path) {
 #ifdef _WIN32
   if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) CloseHandle(static_cast<HANDLE>(handle_));
   handle_ = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  return handle_ != INVALID_HANDLE_VALUE;
+  if (handle_ == INVALID_HANDLE_VALUE) return false;
+  return true;
 #else
+  const bool existed = std::filesystem::exists(path);
   if (fd_ >= 0) ::close(fd_);
   fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
-  return fd_ >= 0;
+  return fd_ >= 0 && (existed || sync_directory(path.parent_path()));
 #endif
 }
 bool AppendFile::append(std::string_view bytes) {
@@ -153,18 +170,31 @@ bool AppendFile::append(std::string_view bytes) {
 }
 bool AppendFile::sync() {
 #ifdef _WIN32
-  return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE && FlushFileBuffers(static_cast<HANDLE>(handle_)) != 0;
+  const bool ok = handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE && FlushFileBuffers(static_cast<HANDLE>(handle_)) != 0;
+  if (ok) ++sync_counts.file;
+  return ok;
 #elif defined(__APPLE__)
-  return fd_ >= 0 && ::fcntl(fd_, F_FULLFSYNC) == 0;
+  if (fd_ < 0) return false;
+  const bool ok = ::fcntl(fd_, F_FULLFSYNC) == 0 || ::fsync(fd_) == 0;
+  if (ok) ++sync_counts.file;
+  return ok;
 #else
-  return fd_ >= 0 && ::fsync(fd_) == 0;
+  const bool ok = fd_ >= 0 && ::fsync(fd_) == 0;
+  if (ok) ++sync_counts.file;
+  return ok;
 #endif
 }
 bool atomic_replace(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
 #ifdef _WIN32
   return MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
-  return ::rename(tmp.c_str(), dst.c_str()) == 0;
+  const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool synced = ::fsync(fd) == 0;
+  ::close(fd);
+  if (!synced) return false;
+  ++sync_counts.file;
+  return ::rename(tmp.c_str(), dst.c_str()) == 0 && sync_directory(dst.parent_path());
 #endif
 }
 
@@ -241,6 +271,17 @@ Sample sample() {
   if (load >> load1) result.load1 = load1;
   std::ifstream memory("/proc/meminfo"); std::string label, unit; double kib = 0.0;
   while (memory >> label >> kib >> unit) if (label == "MemAvailable:") { result.ram_avail_gb = kib / (1024.0 * 1024.0); break; }
+  std::ifstream stat("/proc/stat"); std::string cpu; unsigned long long user = 0, nice = 0, system = 0, idle = 0, wait = 0, irq = 0, softirq = 0, steal = 0;
+  if (stat >> cpu >> user >> nice >> system >> idle >> wait >> irq >> softirq >> steal && cpu == "cpu") {
+    struct Cpu { unsigned long long idle, total; }; static std::optional<Cpu> previous;
+    const Cpu current{idle + wait, user + nice + system + idle + wait + irq + softirq + steal};
+    if (previous && current.total > previous->total) result.cpu_pct = 100.0 * (1.0 - static_cast<double>(current.idle - previous->idle) / static_cast<double>(current.total - previous->total));
+    previous = current;
+  }
+  std::ifstream network("/proc/net/dev"); std::string line; unsigned long long rx = 0, tx = 0;
+  while (std::getline(network, line)) { const auto colon = line.find(':'); if (colon == std::string::npos) continue; const auto name = line.substr(0, colon); if (name.find("lo") != std::string::npos) continue; std::istringstream values(line.substr(colon + 1)); unsigned long long received = 0, transmitted = 0, discard = 0; if (values >> received >> discard >> discard >> discard >> discard >> discard >> discard >> discard >> transmitted) { rx += received; tx += transmitted; } }
+  struct Net { unsigned long long rx, tx; std::chrono::steady_clock::time_point at; }; static std::optional<Net> previous_net;
+  const auto now = std::chrono::steady_clock::now(); if (previous_net && rx >= previous_net->rx && tx >= previous_net->tx) { const double seconds = std::chrono::duration<double>(now - previous_net->at).count(); if (seconds > 0) { result.net_rx_mbps = 8.0 * (rx - previous_net->rx) / seconds / 1'000'000.0; result.net_tx_mbps = 8.0 * (tx - previous_net->tx) / seconds / 1'000'000.0; } } previous_net = Net{rx, tx, now};
 #endif
   return result;
 }
