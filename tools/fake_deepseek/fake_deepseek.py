@@ -133,19 +133,19 @@ def main():
     parser.add_argument("--funnel", action="store_true",
                         help="deterministic funnel replies (offline campaigns)")
     parser.add_argument("--funnel-max-depth", default=5, type=int)
+    parser.add_argument("--funnel-score", default=0.9, type=float)
     arguments = parser.parse_args()
     scenario = json.loads(arguments.scenario.read_text(encoding="utf-8"))
     arguments.record.parent.mkdir(parents=True, exist_ok=True)
     fake = FakeDeepSeek(scenario, arguments.record)
-    handler = (handler_for_funnel(fake, arguments.funnel_max_depth)
+    handler = (handler_for_funnel(fake, arguments.funnel_max_depth,
+                                   arguments.funnel_score)
                if arguments.funnel else handler_for(fake))
     server = ConcurrentFakeServer((arguments.host, arguments.port), handler)
     print(server.server_address[1], flush=True)
     server.serve_forever()
 
 
-if __name__ == "__main__":
-    main()
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def funnel_depth(prompt):
     return int(digits) if digits else None
 
 
-def funnel_reply(prompt, max_depth):
+def funnel_reply(prompt, max_depth, score=0.9):
     depth = funnel_depth(prompt)
     if depth is None:
         depth = 0
@@ -211,7 +211,7 @@ def funnel_reply(prompt, max_depth):
                        funnel_children(depth, max_depth)]},
             separators=(",", ":"))
     if "Critique this candidate set" in prompt:
-        return json.dumps({"score": 0.9, "remove": [], "add": [], "issues": ""},
+        return json.dumps({"score": score, "remove": [], "add": [], "issues": ""},
                           separators=(",", ":"))
     if "select the final children set" in prompt:
         return json.dumps({"items": funnel_children(depth, max_depth)},
@@ -219,7 +219,7 @@ def funnel_reply(prompt, max_depth):
     return json.dumps({"items": ["One", "Two", "Three"]}, separators=(",", ":"))
 
 
-def handler_for_funnel(fake, max_depth):
+def handler_for_funnel(fake, max_depth, score=0.9):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -257,7 +257,7 @@ def handler_for_funnel(fake, max_depth):
             prompt = "\n".join(str(message.get("content", ""))
                                for message in messages
                                if message.get("role") == "user")
-            content = funnel_reply(prompt, max_depth)
+            content = funnel_reply(prompt, max_depth, score)
             usage = {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 12,
                      "completion_tokens": 8}
             self.send_json(200, {"id": "fake-chatcmpl", "object": "chat.completion",
@@ -272,3 +272,7 @@ def handler_for_funnel(fake, max_depth):
                                "headers": headers, "body": request,
                                "elapsed_ms": round((time.monotonic() - started) * 1000, 3)})
     return Handler
+
+
+if __name__ == "__main__":
+    main()

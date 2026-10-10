@@ -463,6 +463,23 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     writer.sync();
     impl_->options.budget.settle(*reservation, "0");
   }
+
+  // A campaign that finished by itself (stop rule, drained, budget) is
+  // closed: stop is final for the campaign record too.
+  if (result.end_reason == "stop rule" || result.end_reason == "drained" ||
+      result.end_reason == "budget") {
+    writer.submit(state::CommitTerminal{{make_record(
+        "CAMPAIGN", {{"id", spec.id},
+                     {"spec", {{"scope", spec.scope},
+                               {"loop_budget", spec.loop_budget},
+                               {"mode", spec.mode},
+                               {"gate", std::to_string(spec.gate)},
+                               {"floor", std::to_string(spec.floor)},
+                               {"chunk", spec.chunk},
+                               {"model", spec.model}}},
+                     {"state", "stopped"}})}});
+    writer.sync();
+  }
   return result;
 }
 

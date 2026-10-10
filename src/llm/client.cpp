@@ -2,6 +2,7 @@
 #include "platform/platform.hpp"
 
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -164,16 +165,33 @@ Result parse_result(CURLcode code, long status, long retry_after,
   else if (status == 503 || status >= 500) result.kind = Kind::ServerError;
   else if (status < 200 || status >= 300) result.kind = Kind::Transport;
   else {
-    result.finish_reason = json_string(body, "finish_reason");
-    result.content = json_string(body, "content");
-    const auto hit = json_uint(body, "prompt_cache_hit_tokens");
-    const auto miss = json_uint(body, "prompt_cache_miss_tokens");
-    const auto output = json_uint(body, "completion_tokens");
-    if (!hit || !miss || !output || result.finish_reason.empty()) result.kind = Kind::Malformed;
-    else {
-      result.in_hit = *hit; result.in_miss = *miss; result.out = *output;
-      result.kind = result.finish_reason == "length" ? Kind::Truncated : Kind::Ok;
+    // Parse the body properly: the assistant content is itself JSON text in
+    // every funnel reply, so a regex that stops at the first escaped quote
+    // silently truncates it (found in M3).
+    const auto json = nlohmann::json::parse(body, nullptr, false);
+    if (json.is_discarded() || !json.contains("choices") ||
+        !json["choices"].is_array() || json["choices"].empty() ||
+        !json["choices"][0].contains("message") ||
+        !json["choices"][0]["message"].contains("content") ||
+        !json.contains("usage")) {
+      result.kind = Kind::Malformed;
+      return result;
     }
+    result.finish_reason =
+        json["choices"][0].value("finish_reason", std::string{});
+    result.content =
+        json["choices"][0]["message"]["content"].get<std::string>();
+    const auto& usage = json["usage"];
+    if (!usage.contains("prompt_cache_hit_tokens") ||
+        !usage.contains("prompt_cache_miss_tokens") ||
+        !usage.contains("completion_tokens") || result.finish_reason.empty()) {
+      result.kind = Kind::Malformed;
+      return result;
+    }
+    result.in_hit = usage["prompt_cache_hit_tokens"].get<std::uint64_t>();
+    result.in_miss = usage["prompt_cache_miss_tokens"].get<std::uint64_t>();
+    result.out = usage["completion_tokens"].get<std::uint64_t>();
+    result.kind = result.finish_reason == "length" ? Kind::Truncated : Kind::Ok;
   }
   return result;
 }
