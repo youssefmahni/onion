@@ -1,4 +1,18 @@
 # Worklog (append-only, newest at top)
+## 2026-10-10T18:1xZ · m3 · M3 one-machine engine (full milestone)
+
+Result: in progress
+Evidence:
+- M2 merged as `24a90eb` (PR #4) with all 8 CI jobs green (run 38067005573), tagged `m2-rc`; legacy macOS flake fixed via PR #6 (`8f7217c`, CI 38066383814) and merged into m2 first.
+- Built, with tests: src/log (canonical JSON float-free, records, batches, HLC, segments with torn-tail cut, NullSigner), src/store (DESIGN schema + schema_version, WAL, subtree query, CSV export), src/state (single writer thread, ATTEMPT group-commit ≥1/s, deterministic fold, idempotent replay, crash hooks at commit steps 1/2), src/gate (fixed-first prompts, pre-check ≤400 tokens, strict parsers, deterministic checks incl. 0.85/0.95 ancestor thresholds, best-of-3 decide, funnel loop with temperatures 0/0.3/0.5, quality guard), src/sched (campaign spec + decision 0008, ticket ordering, stop rule, RESERVE chunks, G9 waiting reservations, review accept/retry/reject, self-closing campaigns), src/api (httplib server, token/Origin/Content-Type checks), CLI (node/campaign/review/dev-import/export-csv), dashboard on /api/state, fake server --funnel mode with depth-keyed deterministic replies.
+- Engine integration tests: 364-node offline campaign (drained), stop-rule campaign, review flows, waiting reservations, P7 log scan, forked-child crash tests.
+- E2E CLI run: 409 settled, stop-rule end, campaign closed, P7 scan clean, review accept via live API, dashboard served. Local suite 182/182.
+- Fixed M2 client bug: regex content extraction truncated escaped JSON (funnel replies); replaced with nlohmann parsing.
+- Incident: briefly killed the owner's deepseek_api_relay.py on port 18081 (mistook it for my fake server); its supervisor restarted it. Recorded in PROGRESS.md.
+Attempts: 1. sibling-title collisions in the deterministic funnel fake (palette rotation) → depth-banded palette so children never repeat siblings/ancestors · 2. 41 s engine test → O(1) index sets + node cache → 13 s · 3. api bound_port returned the bind bool → bind_to_any_port · 4. node run stalled with `[{` content → M2 client regex bug → nlohmann parse.
+Next step: push m3-engine, wait for CI green, real small campaign (≤10 nodes, ≤150 calls), gate report, PR, merge, m3-rc.
+
+
 
 > Session protocol: read `WORKLOG.md`, `PROGRESS.md`, `OWNER_ACTIONS.md` at the start of every session, then the AUTONOMOUS_GOAL.md section for the current milestone.
 

@@ -2,46 +2,25 @@
 
 ## Current
 
-- Milestone: M2 · branch m2-deepseek-client · started 2026-10-10
-- Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
+- Milestone: M3 · branch m3-engine · started 2026-10-10
+- M2 merged (`24a90eb`), tagged `m2-rc`
+- Tests: 182/182 new-tree on Linux (gtest + python) · legacy 98/98 · CI: pending push
 
 ## Log (newest first)
-- 2026-10-10: Added core-sized CPU reply-parsing pool and fixed-limit bench
-  controls · local fake-server capacity run completed 1,000 requests at limit
-  1,000; the limit-100 reuse run opened 100 connections for 1,000 requests;
-  half-budget run started 500 and refused 500 · no real calls
-- 2026-10-10: Corrected the sanitizer-only OpenCL switch and converted the
-  reset fixture to a raw local TCP reset listener, avoiding Python handler
-  queue delay · focused timeout/reset tests pass · no real calls
-- 2026-10-10: Added compressed 30-second adaptive traces for healthy,
-  rate-limited and slow-under-load observations · corrected first-baseline
-  scheduling so the initial probe is one hour later, not in the next window ·
-  no real calls
-- 2026-10-10: M2 timeout accounting: timed-out requests now retain their full
-  reservation as uncertain spend; added a 1,000-request one-second
-  accept-without-response regression that verifies Timeout classification and
-  breaker opening · no real calls
-- 2026-10-10: Diagnosed the 1,000-request client crash with ASan/UBSan as a queued-deque iterator use-after-free; fixed by draining ready tasks under the mutex before curl work · normal and sanitizer benchmarks now complete 1,000/1,000 against the fake server · added fake-server concurrency and transport-failure regression coverage · no real calls
-- 2026-10-10: TSan CI found a second construction-order race; reordered the client worker after its synchronization state and verified the focused suite locally · sanitizer CI disables POCL only because its external allocations leak under LSan · no real calls
-- 2026-10-10: Re-ran 1,000 fake requests after the TSan repair: normal 1,149.14 req/s and ASan/UBSan 307.235 req/s, both 1,000/1,000 successful · no real calls
 
-- 2026-10-10: M2 checkpoint: added standard-library fake DeepSeek server, scenarios and adaptive limiter tests · CI 56aa921 green on Linux, macOS arm64, macOS Intel compatibility build and Windows · no real calls; 1,000-request benchmark not started
-- 2026-10-10: M2 started from merged M1; no real DeepSeek completions approved or used · pricing source recorded in decision 0004
-- 2026-10-10: M1 tasks 7–9: added RFC and project golden vectors, confirmed CI on Linux/macOS/Windows, and completed decision records · local new 88/88 · legacy 98/98 plus controller 9/9 · gate report prepared
-- 2026-10-10: M1 task 6 checkpoint: corrected durable replacement semantics and platform sampler/key-store/data-directory coverage · local new 83/83 · CI green on all jobs
-- 2026-10-09: M1 task 6: implemented the platform data directory, durable append, atomic replace, sampler and staged key store · local new 81/81 · GPU tests cannot run in hosted CI on real fp64 hardware; full GPU validation needs the Mac Pro runner
-- 2026-10-10: M1 task 6 follow-up: battery sampling on macOS/Linux and GPU-load sampling are deferred to M5.
-- 2026-10-09: Corrected TLS policy: macOS SDK curl, Linux distribution OpenSSL curl, Windows pinned Schannel curl; minimum M2 curl version 7.66.0 · no real API calls
-- 2026-10-09: M1 task 3: added Linux, macOS arm64, macOS x86_64/12.0 compatibility-build, Windows, and legacy CI workflow jobs · local new smoke 1/1 · CI cannot be triggered because this checkout has no remote and no GitHub CLI
-- 2026-10-09: Started M1 task 1; confirmed the POCL cache failure was sandbox-only and the legacy suite passes 98/98 with `POCL_CACHE_DIR` in a temporary writable directory · no real API calls · M0 remains open and untagged by owner decision
+- 2026-10-10: M3 end-to-end offline campaign via the CLI: fake funnel server, dev-import root, `campaign start` with cost projection, `node run` → 409 settled nodes, ended by the stop rule, campaign closed; P7 log scan clean (no failed attempt committed for any settled node); review accept over the live API (token + Origin + Content-Type) moves the item to decided; dashboard served at `/` · no real calls
+- 2026-10-10: Found and fixed an M2 client bug: the assistant `content` was extracted with a regex that stopped at the first escaped quote, truncating JSON content (funnel replies are escaped JSON on the wire). Replaced with a nlohmann parse. All M2 client tests stay green.
+- 2026-10-10: M3 modules in place: log (records, batches, canonical JSON, HLC, segments, NullSigner), store (DESIGN schema, WAL, subtree query, CSV export), state (single state-writer thread, ATTEMPT group-commit, deterministic fold, replay), gate (prompts, pre-check, deterministic checks, best-of-3, funnel loop, quality guard), sched (campaign spec, ticket ordering, stop rule, RESERVE chunks, budget waiting, review flows), api (token/Origin/Content-Type checks), cli (node/campaign/review/dev-import/export-csv), dashboard, fake funnel mode · decision 0008 · local new-tree 182/182 · no real calls
+- 2026-10-10: Note for the owner: port 18081 on this machine is used by your own `deepseek_api_relay.py` (openclaw-relays). While testing the fake server I briefly killed it by mistake; its supervisor restarted it within seconds. I switched my tests to port 18091+.
+- 2026-10-10: M3 started from merged M2 (`m2-rc`); engine-level crash tests use forked children with `_exit` at each commit step.
 
 ## Real API usage
 
 | Date | Milestone | Purpose | Calls | Cost (USD) |
-|---|---|---|---:|---:|
+|---|---|---:|---:|
 | 2026-10-10 | M2 | Real-call validation (decision 0004 update): models list, request shape, usage fields, truncation, 401 | 5 (1 free /models, 1 unbilled 401, 4 billed) | $0.0000126 |
 | 2026-10-10 | M2 | Real concurrency probe (adaptive limiter start 4 / ceiling 50) | 100 | ≤ $0.0003 (upper-bound estimate; build predated per-run token totals) |
 
 ## Background processes started
 
-- none
+- none (the fake servers and node runs used for M3 exit evidence were stopped)
