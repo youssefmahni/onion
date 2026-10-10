@@ -69,3 +69,19 @@ Every rule touched by a milestone must have at least one passing test before tha
 | API: token, Origin, Content-Type checks on every POST; 127.0.0.1 only | `ApiTest.*` (401 / 403 / 415 / 200) | ✅ |
 | Dashboard reads /api/state with campaign panel and review buttons | `ApiTest.DashboardServesAtRoot` + live `/api/state` evidence | ✅ |
 | 1,000 requests in flight on ~20 threads (M2 carry-over) | M2 tests, still green | ✅ |
+
+## M4 scope: DESIGN.md › Device identity and ID slots, Op log format, Joining, Membership, Storage (checkpoints)
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| Device key generated on first start; device_id = first 16 hex of BLAKE2b-256(pubkey) | `DeviceKey.DeterministicIdentityFromSeed`, CLI key-store flow (`genesis_import.verify` needs the stored key) | ✅ |
+| Slot = top 20 bits; node ids = slot × 2^40 + counter, `TK%05lld` | `NodeIdAllocator.AllocatesFromSlotTimesTwoToTheForty`, `NodeIdAllocator.SlotBounds` | ✅ |
+| Batch 1 chains from BLAKE2b-256(public key); one signature per batch over prev ‖ hash | `SignedWriterChainsFromThePublicKeyHash`, `VerifyTest.ChainAcrossBatches` | ✅ |
+| Signer matches the M1 golden Monocypher signature (seed 00..1f) | `Ed25519Signer.MatchesMonocypherGoldenSignature` | ✅ |
+| Verification: bad signature, bad prev, bad hash, gap, non-member, past cutoff, unknown version — quarantined, never applied | `VerifyTest.*` (one test per rejection) | ✅ |
+| Torn tail: a cut at every byte offset of the last batch keeps exactly the complete batches | `StateWriterTest.TornTailAtEveryByteOffsetKeepsCompleteBatches` | ✅ |
+| Sealed segments (zstd) replay across restarts | `StateWriterTest.SealedSegmentsReplayAcrossRestart`, `SegmentsTest.RotatesWhenSealBytesWouldBeCrossed` | ✅ |
+| Checkpoints: VACUUM INTO, signed manifest with vector and Merkle root, keep the last 3 | `CheckpointTest.*`, decision 0009 | ✅ |
+| Admin keygen refuses the data directory, prints the public key | CLI evidence (gate report), `admin keygen` exit codes | ✅ |
+| Genesis import: duplicates need an approved resolution; counts per layer, parents, Merkle root verified | `genesis_import.verify` (fixture corpus with duplicates) | ✅ |
+| A lone eviction signature is rejected; an admin-signed one is accepted | `EvictionValid.LoneMemberSignatureIsRejected` | ✅ |
