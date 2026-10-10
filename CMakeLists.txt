@@ -164,11 +164,12 @@ target_link_libraries(swim INTERFACE onion::core onion::platform)
 target_link_libraries(profile INTERFACE onion::core onion::gpu onion::platform)
 
 # Engine layer
-onion_add_module(gate)
+onion_add_compiled_module(gate src/gate/gate.cpp)
+target_link_libraries(gate PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(gate PUBLIC onion::core onion::llm)
 onion_add_module(sched)
 onion_add_compiled_module(state src/state/state.cpp)
 target_link_libraries(state PUBLIC onion::core onion::log onion::store)
-target_link_libraries(gate INTERFACE onion::core onion::llm)
 target_link_libraries(sched INTERFACE onion::core onion::profile)
 
 # Interface layer
@@ -213,6 +214,10 @@ if(BUILD_TESTING)
   add_executable(onion_state_test tests/unit/state_test.cpp)
   target_link_libraries(onion_state_test PRIVATE onion::state GTest::gtest_main)
   gtest_discover_tests(onion_state_test)
+
+  add_executable(onion_gate_test tests/unit/gate_test.cpp)
+  target_link_libraries(onion_gate_test PRIVATE onion::gate GTest::gtest_main)
+  gtest_discover_tests(onion_gate_test)
 
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
