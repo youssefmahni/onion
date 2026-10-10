@@ -13,6 +13,10 @@ import sys
 import tempfile
 import time
 import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+FAKE_SERVER = str(ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py")
 
 
 def wait_for(predicate, timeout=60.0):
@@ -47,7 +51,7 @@ def main():
     root = tempfile.mkdtemp(prefix="onion_mp_")
 
     fake = subprocess.Popen(
-        [sys.executable, "tools/fake_deepseek/fake_deepseek.py",
+        [sys.executable, FAKE_SERVER,
          "--scenario", "tools/fake_deepseek/scenarios/healthy.json",
          "--record", os.path.join(root, "requests.jsonl"),
          "--port", "18101", "--funnel", "--funnel-max-depth", "3"],
