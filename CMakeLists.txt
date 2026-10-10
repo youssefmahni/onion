@@ -98,8 +98,8 @@ if(WIN32)
   set(CURL_USE_SECTRANSP OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
     curl
-    URL https://github.com/curl/curl/releases/download/curl-8_11_1/curl-8.11.1.tar.xz
-    URL_HASH SHA256=c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56
+    URL https://github.com/curl/curl/releases/download/curl-8_22_0/curl-8.22.0.tar.xz
+    URL_HASH SHA256=f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   FetchContent_MakeAvailable(curl)
   set(ONION_CURL_TARGET libcurl_static)
