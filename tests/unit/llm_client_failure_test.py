@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import socket
 from pathlib import Path
 
 
@@ -24,7 +25,12 @@ def main():
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
     if args.mode == "closed-port":
-        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", "http://127.0.0.1:9", "--requests", "1000", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        # Port 9 is sometimes silently filtered on hosted Windows runners.
+        # Reserve a loopback port then release it, guaranteeing no listener.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        completed = subprocess.run([str(args.binary), "llm", "bench", "--url", f"http://127.0.0.1:{port}", "--requests", "1000", "--timeout", "2"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         assert completed.returncode == 1, completed.stderr
         assert_transport(completed.stdout)
         return
