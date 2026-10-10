@@ -2,12 +2,13 @@
 
 ## Current
 
-- Milestone: M4 · branch m4-signed-log · started 2026-10-10
-- M3 merged (`1b3eee5`, PR #7), tagged `m3-rc`
-- Tests: 197/197 new-tree on Linux (gtest + python) · legacy 98/98 · CI: pending push
+- Milestone: M5 · branch m5-profiles-service · started 2026-10-10
+- M4 merged (`5b03cb4`, PR #8), tagged `m4-rc`; M3 merged (`1b3eee5`), tagged `m3-rc`
+- Tests: 199/199 new-tree on Linux · legacy 98/98 · CI green on the M4 merge
 
 ## Log (newest first)
 
+- 2026-10-10: M4 merged as PR #8 (`5b03cb4`), all 8 CI jobs green, tagged `m4-rc` · gate report docs/agent/gates/M4.md (signed log, torn-tail at every byte offset, checkpoints, genesis import verifier; corpus-copy import scripted as OA-10) · one legacy flake observed on Linux CI, passed on re-run, no product change · no real calls
 - 2026-10-10: M4 in place: device keys and Ed25519 (golden cross-check), full batch verification, zstd-sealed segments, verified torn-tail repair (tested at every byte offset), slot-scoped 64-bit TK ids, checkpoints with signed manifests and Merkle roots (decision 0009), the eviction-signature rule, admin keygen, the genesis import with duplicate proposal/resolution and a CSV verifier, CUTOVER.md and the weekly dry-run script · corpus-copy import is an owner action (OA-2 pending) · no real calls
 - 2026-10-10: M3 merged as PR #7 (`1b3eee5`), all 8 CI jobs green, tagged `m3-rc` · gate report docs/agent/gates/M3.md with the offline 409-node campaign, P7 scans, live review accept, cost projection, kill-at-every-commit-step and the real DeepSeek run ($0.0135)
 - 2026-10-10: M3 real campaign against DeepSeek: one node, 3 attempts (0.35/0.35/0.22), all below the floor → review, nothing committed; audit records carry real token counts and peak-priced cost ($0.0135) · hard crash found and fixed: the strict parsers threw on a reply whose `issues` field was an array instead of a string — parsers now reject malformed replies without throwing
