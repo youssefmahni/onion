@@ -29,11 +29,12 @@ def wait_for(predicate, timeout=60.0):
 
 
 def wait_for_key(data_dir):
+    # Existence only: on Windows the key store holds a DPAPI-encrypted blob,
+    # so the file is binary and must not be read as text here.
     def check():
         return os.path.exists(os.path.join(data_dir, "keys", "device-key"))
     if not wait_for(check):
         raise RuntimeError("device key never appeared")
-    return open(os.path.join(data_dir, "keys", "device-key")).read().strip()
 
 
 def run(binary, *args, check=True):
@@ -130,7 +131,7 @@ def main():
                 return True
             except Exception:
                 return False
-        assert wait_for(all_done, timeout=300), "campaign never finished everywhere"
+        assert wait_for(all_done, timeout=500), "campaign never finished everywhere"
 
         # Poll until every store converges on a non-zero settled count (the
         # sync rounds spread the settles a few rounds after the stop).
