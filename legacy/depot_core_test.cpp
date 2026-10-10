@@ -1029,7 +1029,8 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
     ::close(pipefd[0]);
     unsetenv("DEPOT_CONTROL_INTERVAL_MS");
     EXPECT_EQ(rc, 0);
-    EXPECT_NE(observed.find("THREADS\t3"), std::string::npos);  // manager raised workers to 3
+    EXPECT_NE(observed.find("THREADS\t3"), std::string::npos)
+        << "manager never raised the pool; captured run output:\n" << observed;
 }
 
 // ---------------- integration: run_llm traversal (hermetic, no network) ----------------
