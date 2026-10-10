@@ -105,6 +105,9 @@ class Segments {
   // Appends one batch as one JSON line and durably syncs. Rotates to a new
   // segment when the write would cross seal_bytes.
   bool append(const Batch& batch, std::string* error);
+  // Releases the open file handle so the directory can be removed (Windows
+  // keeps open files locked).
+  void close();
 
   std::uint64_t active_first_seq() const;
   std::uint64_t total_batches() const;

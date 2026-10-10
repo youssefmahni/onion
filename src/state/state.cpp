@@ -517,8 +517,9 @@ void StateWriter::stop() {
   }
   if (thread_.joinable()) thread_.join();
   started_ = false;
-  // Release the database so the data directory can be removed (Windows
-  // keeps the files locked while the handle is open).
+  // Release the database and the segment handle so the data directory can
+  // be removed (Windows keeps open files locked).
+  if (segments_) segments_->close();
   db_.close();
 }
 

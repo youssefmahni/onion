@@ -338,6 +338,11 @@ bool Segments::append(const Batch& batch, std::string* error) {
   return true;
 }
 
+void Segments::close() {
+  impl_->file = platform::AppendFile{};
+  impl_->opened = false;
+}
+
 std::uint64_t Segments::active_first_seq() const { return impl_->active_first_seq; }
 std::uint64_t Segments::total_batches() const { return impl_->batches; }
 std::filesystem::path Segments::active_path() const {
