@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -31,6 +32,12 @@ def main():
             assert status == 200 and models["data"][0]["id"] == "deepseek-flash"
             status, completion = request(f"http://127.0.0.1:{port}/chat/completions", "POST", {"messages": [{"role": "user", "content": "hello"}]})
             assert status == 200 and completion["choices"][0]["finish_reason"] == "stop"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if record.exists() and record.stat().st_size > 0:
+                    break
+                time.sleep(0.01)
+            assert record.exists() and record.stat().st_size > 0
             recorded = json.loads(record.read_text(encoding="utf-8").strip())
             assert "Authorization" not in recorded["headers"] and "authorization" not in recorded["headers"]
         finally:
