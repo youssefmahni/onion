@@ -171,6 +171,12 @@ target_link_libraries(store INTERFACE onion::core onion::platform)
 target_link_libraries(llm INTERFACE onion::core onion::platform)
 
 # Fleet layer
+FetchContent_Declare(
+  httplib
+  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
+  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(httplib)
 onion_add_compiled_module(sync src/sync/sync.cpp)
 target_include_directories(sync PUBLIC "${httplib_SOURCE_DIR}")
 target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion::state)
@@ -196,12 +202,6 @@ target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
 
 # Interface layer
-FetchContent_Declare(
-  httplib
-  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
-  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(httplib)
 onion_add_compiled_module(api src/api/api.cpp)
 # The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
 # httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
