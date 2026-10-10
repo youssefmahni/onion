@@ -60,6 +60,12 @@ class StateWriter {
     std::filesystem::path data_dir;   // contains onion.db and oplog/
     std::string origin{"dev0000000000000001"};
     std::unique_ptr<log::Signer> signer;
+    // When set (M4+), batch 1 chains from the public-key hash and the
+    // replay verifies every batch against this key; a torn or tampered
+    // tail is cut. When null, the NullSigner behaviour of M3 applies.
+    std::shared_ptr<const log::DeviceKey> device_key;
+    // Segment seal threshold (tests use small values to force rotation).
+    std::uint64_t seal_bytes{64u * 1024u * 1024u};
     // Test-only crash injection, called at the commit steps:
     // 1 = terminal batch durable, before the fold; 2 = after the fold.
     // Throwing (or terminating) from it simulates a power cut.

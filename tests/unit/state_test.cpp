@@ -291,3 +291,155 @@ TEST_F(StateWriterTest, CrashAfterFoldKeepsStoreAndLogConsistent) {
 #endif  // !_WIN32
 
 }  // namespace
+
+// ----------------------------------------------------- M4: signed replay
+
+namespace {
+std::vector<std::uint8_t> seed_00_1f() {
+  std::vector<std::uint8_t> seed(32);
+  for (std::size_t i = 0; i < seed.size(); ++i)
+    seed[i] = static_cast<std::uint8_t>(i);
+  return seed;
+}
+}  // namespace
+
+TEST_F(StateWriterTest, SignedWriterChainsFromThePublicKeyHash) {
+  writer_.reset();
+  auto key = std::make_shared<onion::log::DeviceKey>(
+      onion::log::DeviceKey::from_seed(seed_00_1f()));
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = key->device_id;
+  options.device_key = key;
+  options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+  writer->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer->sync();
+  // Batch 1's prev is the public-key hash, not empty.
+  std::ifstream in(writer->segments().active_path());
+  std::string line;
+  std::getline(in, line);
+  auto batch = nlohmann::json::parse(line);
+  EXPECT_EQ(batch["prev"].get<std::string>(), onion::log::genesis_prev(*key));
+  EXPECT_EQ(batch["o"].get<std::string>(), key->device_id);
+  EXPECT_EQ(batch["sig"].get<std::string>().size(), 128u);  // 64 bytes hex
+  writer->stop();
+}
+
+TEST_F(StateWriterTest, TornTailAtEveryByteOffsetKeepsCompleteBatches) {
+  writer_.reset();
+  auto key = std::make_shared<onion::log::DeviceKey>(
+      onion::log::DeviceKey::from_seed(seed_00_1f()));
+  const auto open_signed = [&]() {
+    StateWriter::Options options;
+    options.data_dir = dir_;
+    options.origin = key->device_id;
+    options.device_key = key;
+    options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
+    return std::make_unique<StateWriter>(std::move(options));
+  };
+  const auto settled_record = [](std::string path, onion::log::Hlc hlc) {
+    Record record;
+    record.type = "SETTLE";
+    record.payload = {{"path", path}, {"kept", 0}, {"end", "cannot split"}};
+    record.hlc = hlc;  // deterministic: identical bytes across runs
+    return record;
+  };
+
+  // Write two batches with fixed HLCs and capture the segment bytes.
+  std::string content;
+  {
+    auto writer = open_signed();
+    std::string error;
+    ASSERT_TRUE(writer->start(&error)) << error;
+    writer->submit(CommitTerminal{{
+        settled_record("P01-IN01", 1001),
+    }});
+    writer->sync();
+    writer->submit(CommitTerminal{{
+        settled_record("P01-IN02", 1002),
+    }});
+    writer->sync();
+    std::ifstream in(writer->segments().active_path(), std::ios::binary);
+    content.assign((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+    writer->stop();
+  }
+  const std::size_t second_line_start = content.find('\n') + 1;
+  ASSERT_LT(second_line_start, content.size());
+  const std::size_t second_line_length = content.size() - second_line_start;
+
+  // A torn write never reaches the store: simulate a crash at every byte
+  // offset of the last batch by truncating the log there and rebuilding the
+  // store from the surviving bytes (the corrupted-SQLite recovery path).
+  for (std::size_t cut = 0; cut < second_line_length; ++cut) {
+    std::error_code ec;
+    std::filesystem::remove(dir_ / "onion.db", ec);
+    std::filesystem::remove(dir_ / "onion.db-wal", ec);
+    std::filesystem::remove(dir_ / "onion.db-shm", ec);
+    {
+      const std::filesystem::path segment =
+          dir_ / "oplog" / key->device_id / "1.log";
+      std::ofstream truncated(segment, std::ios::binary | std::ios::trunc);
+      truncated.write(content.data(), static_cast<std::streamsize>(
+                                          second_line_start + cut));
+      truncated.close();
+    }
+    auto writer = open_signed();
+    std::string error;
+    ASSERT_TRUE(writer->start(&error)) << error << " at cut " << cut;
+    EXPECT_TRUE(writer->settled("P01-IN01")) << "at cut " << cut;
+    EXPECT_FALSE(writer->settled("P01-IN02")) << "at cut " << cut;
+    EXPECT_EQ(writer->next_batch(), 2u) << "at cut " << cut;
+    EXPECT_EQ(writer->segments().total_batches(), 1u) << "at cut " << cut;
+    writer->stop();
+  }
+}
+
+TEST_F(StateWriterTest, SealedSegmentsReplayAcrossRestart) {
+  writer_.reset();
+  auto key = std::make_shared<onion::log::DeviceKey>(
+      onion::log::DeviceKey::from_seed(seed_00_1f()));
+  const auto open_signed = [&](std::uint64_t seal_bytes = 64u * 1024u * 1024u) {
+    StateWriter::Options options;
+    options.data_dir = dir_;
+    options.origin = key->device_id;
+    options.device_key = key;
+    options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
+    options.seal_bytes = seal_bytes;
+    return std::make_unique<StateWriter>(std::move(options));
+  };
+  // A small seal threshold forces a rotation: the second batch seals
+  // segment 1 and lands in segment 2.
+  {
+    auto writer = open_signed(400);
+    std::string error;
+    ASSERT_TRUE(writer->start(&error)) << error;
+    writer->submit(CommitTerminal{{
+        make_record("SETTLE", {{"path", "P01-IN01"}, {"kept", 0},
+                               {"end", "cannot split"}}),
+    }});
+    writer->sync();
+    writer->submit(CommitTerminal{{
+        make_record("SETTLE", {{"path", "P01-IN02"}, {"kept", 0},
+                               {"end", "cannot split"}}),
+    }});
+    writer->sync();
+    writer->stop();
+  }
+  {
+    auto writer = open_signed();
+    std::string error;
+    ASSERT_TRUE(writer->start(&error)) << error;
+    EXPECT_TRUE(writer->settled("P01-IN01"));
+    EXPECT_TRUE(writer->settled("P01-IN02"));
+    EXPECT_EQ(writer->next_batch(), 3u);
+    EXPECT_EQ(writer->segments().sealed_first_seqs().size(), 1u);
+    writer->stop();
+  }
+}
