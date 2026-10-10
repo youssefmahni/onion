@@ -126,15 +126,20 @@ int Statement::integer_int(int column) const {
 }
 
 Db::Db(std::filesystem::path path) : path_(std::move(path)) {}
-Db::~Db() {
-  if (handle_) sqlite3_close(handle_);
+Db::~Db() { close(); }
+
+void Db::close() {
+  if (handle_) {
+    sqlite3_close(handle_);
+    handle_ = nullptr;
+  }
 }
 Db::Db(Db&& other) noexcept : path_(std::move(other.path_)), handle_(other.handle_) {
   other.handle_ = nullptr;
 }
 Db& Db::operator=(Db&& other) noexcept {
   if (this != &other) {
-    if (handle_) sqlite3_close(handle_);
+    close();
     path_ = std::move(other.path_);
     handle_ = other.handle_;
     other.handle_ = nullptr;

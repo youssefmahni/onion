@@ -124,6 +124,9 @@ class Db {
 
   // Creates the schema (idempotent) and applies pending migrations.
   bool open(std::string* error);
+  // Closes the handle so the file can be deleted (needed on Windows, where
+  // an open database keeps its files locked).
+  void close();
 
   // Plain SQL with no results.
   bool exec(std::string_view sql, std::string* error);

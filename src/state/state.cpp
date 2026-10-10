@@ -517,6 +517,9 @@ void StateWriter::stop() {
   }
   if (thread_.joinable()) thread_.join();
   started_ = false;
+  // Release the database so the data directory can be removed (Windows
+  // keeps the files locked while the handle is open).
+  db_.close();
 }
 
 const store::Db& StateWriter::db() const { return db_; }

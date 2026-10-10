@@ -182,7 +182,15 @@ FetchContent_Declare(
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(httplib)
 onion_add_compiled_module(api src/api/api.cpp)
-target_link_libraries(api PUBLIC httplib::httplib nlohmann_json::nlohmann_json)
+# The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
+# httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
+# httplib::httplib CMake target would pull a Homebrew OpenSSL that cannot
+# link the Intel macOS 12 compatibility build.
+target_include_directories(api PUBLIC "${httplib_SOURCE_DIR}")
+target_link_libraries(api PUBLIC nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(api PUBLIC ws2_32)
+endif()
 target_link_libraries(api PUBLIC onion::state)
 onion_add_module(cli)
 target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
