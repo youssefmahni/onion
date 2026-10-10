@@ -11,6 +11,7 @@
 #include <sstream>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -24,10 +25,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(__APPLE__)
-#include <ifaddrs.h>
 #include <mach/mach.h>
 #include <net/if.h>
-#include <net/if_dl.h>
+#include <net/route.h>
 #include <sys/sysctl.h>
 #else
 #include <sys/sysinfo.h>
@@ -256,15 +256,23 @@ Sample sample() {
   vm_size_t page_size = 0;
   if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS && host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS)
     result.ram_avail_gb = static_cast<double>(vm.free_count + vm.inactive_count) * page_size / (1024.0 * 1024.0 * 1024.0);
-  struct ifaddrs* addresses = nullptr;
-  if (getifaddrs(&addresses) == 0) {
-    unsigned long long rx = 0, tx = 0;
-    for (auto* address = addresses; address != nullptr; address = address->ifa_next)
-      if (address->ifa_addr != nullptr && address->ifa_addr->sa_family == AF_LINK && address->ifa_data != nullptr) { const auto* data = static_cast<if_data*>(address->ifa_data); rx += data->ifi_ibytes; tx += data->ifi_obytes; }
-    struct Net { unsigned long long rx, tx; std::chrono::steady_clock::time_point at; }; static std::optional<Net> previous;
-    const auto now = std::chrono::steady_clock::now();
-    if (previous) { const double seconds = std::chrono::duration<double>(now - previous->at).count(); if (seconds > 0) { result.net_rx_mbps = 8.0 * (rx - previous->rx) / seconds / 1'000'000.0; result.net_tx_mbps = 8.0 * (tx - previous->tx) / seconds / 1'000'000.0; } }
-    previous = Net{rx, tx, now}; freeifaddrs(addresses);
+  int mib[] = {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0};
+  std::size_t bytes = 0;
+  if (::sysctl(mib, 6, nullptr, &bytes, nullptr, 0) == 0 && bytes > 0) {
+    std::vector<char> buffer(bytes);
+    if (::sysctl(mib, 6, buffer.data(), &bytes, nullptr, 0) == 0) {
+      unsigned long long rx = 0, tx = 0;
+      for (char* cursor = buffer.data(); cursor < buffer.data() + bytes;) {
+        const auto* header = reinterpret_cast<const if_msghdr2*>(cursor);
+        if (header->ifm_msglen == 0) break;
+        if (header->ifm_type == RTM_IFINFO2) { rx += header->ifm_data.ifi_ibytes; tx += header->ifm_data.ifi_obytes; }
+        cursor += header->ifm_msglen;
+      }
+      struct Net { unsigned long long rx, tx; std::chrono::steady_clock::time_point at; }; static std::optional<Net> previous;
+      const auto now = std::chrono::steady_clock::now();
+      if (previous && rx >= previous->rx && tx >= previous->tx) { const double seconds = std::chrono::duration<double>(now - previous->at).count(); if (seconds > 0) { result.net_rx_mbps = 8.0 * (rx - previous->rx) / seconds / 1'000'000.0; result.net_tx_mbps = 8.0 * (tx - previous->tx) / seconds / 1'000'000.0; } }
+      previous = Net{rx, tx, now};
+    }
   }
 #else
   std::ifstream load("/proc/loadavg"); double load1 = 0.0;
@@ -305,6 +313,11 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
 }
 std::optional<std::string> KeyStore::get(std::string_view name) const {
   if (!valid_name(name)) return std::nullopt;
+#ifndef _WIN32
+  struct stat status{};
+  const auto path = directory_ / std::string(name);
+  if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0) return std::nullopt;
+#endif
   std::ifstream file(directory_ / std::string(name), std::ios::binary);
   if (!file) return std::nullopt;
   const std::string encrypted((std::istreambuf_iterator<char>(file)), {});
