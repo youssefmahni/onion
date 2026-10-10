@@ -51,3 +51,16 @@ Evidence:
 - Gate report drafted: docs/agent/gates/M2.md.
 
 Next step: confirm the final CI run (fc2724d) is green on all 8 jobs, fill the CI link into gates/M2.md, open the PR, merge checklist, merge, tag m2-rc, update main, create m3-engine.
+
+## 2026-10-10T16:4xZ · m2 · unblock merge: legacy macOS flake, PR #4 final head
+
+Result: in progress
+Evidence:
+- The merged head `238a800` failed only in Legacy (macOS): `FunnelFixture.PoolResizesFromControlFile (10638 ms)`, line 1032 — the synthesizer's 10 s bounded wait expired before a clock-stalled manager announced `THREADS\t3` (control loop `cv.wait_for` at legacy/depot_io.cpp:1025). Two further test-only commits existed on `fix-legacy-pool-test-3`: `a24e7db` (diagnosis output) and `217764a` (bound 10 s → 120 s; assertion unchanged).
+- Opened PR #6 (fix-legacy-pool-test-3 → main), CI 38066383814 all 6 main-workflow jobs green, merged `8f7217c` with merge commit.
+- Merged main into m2: `b83414b`. Push CI 38066565411 and PR #4 CI 38066568216: all 8 jobs green (incl. Legacy macOS 21 s, ASan+UBSan, TSan).
+- Merge checklist: TRACEABILITY covers DESIGN.md › LLM provider/keys/budgets and › Concurrency; gate report has owner checklist; deviations recorded (decision 0007); owner actions OA-1/2/3 open; no stray files; TODO grep hits are false positives (`\uXXXX` escape comment).
+- gates/M2.md CI link updated to 38066568216 (final PR head).
+
+Next step: merge PR #4 with a merge commit, tag `m2-rc`, fast-forward main, create `m3-engine` from main.
+
