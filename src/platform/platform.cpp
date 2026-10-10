@@ -18,13 +18,15 @@
 #ifndef WINVER
 #define WINVER 0x0600
 #endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x06000000
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <wincrypt.h>
 #include <iphlpapi.h>
-#include <netioapi.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
