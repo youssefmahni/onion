@@ -41,6 +41,7 @@ def main():
         listener.bind(("127.0.0.1", 0)); listener.listen(2048)
         port = listener.getsockname()[1]
         stop = threading.Event()
+        held = []
         def accept():
             while not stop.is_set():
                 try:
@@ -50,7 +51,10 @@ def main():
                                               struct.pack("ii", 1, 0))
                         connection.close()
                     else:
-                        threading.Thread(target=lambda connection=connection: (stop.wait(), connection.close()), daemon=True).start()
+                        # Keep each accepted stream open without creating a
+                        # thread per socket.  That lets the test accept all
+                        # 1,000 connections promptly even on macOS CI.
+                        held.append(connection)
                 except socket.timeout: pass
         thread = threading.Thread(target=accept, daemon=True); thread.start()
         try:
@@ -63,7 +67,9 @@ def main():
                 assert "timeouts_uncertain_billed=1000" in completed.stdout, completed.stdout
                 assert "breaker_open=true" in completed.stdout, completed.stdout
         finally:
-            stop.set(); listener.close()
+            stop.set()
+            for connection in held: connection.close()
+            listener.close()
         return
     with tempfile.TemporaryDirectory() as temporary:
         if args.mode in ("auth", "balance"):
