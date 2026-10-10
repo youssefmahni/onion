@@ -1,0 +1,45 @@
+# Onion Engine task log
+
+This Markdown file is the presentation-oriented record of completed work. New
+completed tasks will be appended chronologically; it is not a replacement for
+the technical progress log in `docs/agent/PROGRESS.md`.
+
+## Completed
+
+### M1 — Foundations
+
+- Created the new repository layout, CMake presets and layered targets.
+- Moved the 67 pure-core and 8 GPU tests into the new tree; retained all 98
+  legacy tests.
+- Added cross-platform CI: Linux, macOS arm64, macOS x86_64 targeting 12.0,
+  and Windows; GPU tests run on Linux and are skipped where no runtime exists.
+- Added platform data-directory precedence, durable append, atomic replace,
+  sampling and key-store foundations.
+- Added pinned dependency records, TLS-backend decision, canonical JSON,
+  BLAKE2b-256 and Ed25519 golden vectors.
+- Merged as M1 and tagged on the M1 merge commit.
+
+### M2 — DeepSeek client checkpoint (in progress)
+
+- Added a Python-standard-library fake DeepSeek server with healthy,
+  rate-limited, truncating and slow-under-load scenarios.
+- Added request recording that omits Authorization values, plus a portable
+  smoke test.
+- Implemented and tested the adaptive request limiter: 429/503 and timeout
+  pressure halve its limit; healthy latency adds four; latency pressure holds;
+  the configured ceiling and a floor of one are enforced.
+- Changed latency baselining to the lowest successful 30-second median in the
+  trailing hour (`35c2cf5`), so normal peak-hour latency can adapt gradually.
+- Recorded and approved peak/off-peak pricing policy (`fd82539`): requests
+  entirely within one window use that window's rate, crossing requests use the
+  higher rate, and reservations always use the maximum rate.
+- Stabilized the legacy pool-resize test on a dedicated branch using 20 ms fake
+  replies; merged through PR #2 (`a76cdc1`) and into M2 (`9e8e636`). A final
+  20-repeat local verification passed.
+- CI checkpoint passed on all jobs for `35c2cf5`:
+  https://github.com/youssefmahni/onion/actions/runs/38020639289
+
+## Next approved task
+
+- Await owner approval before starting the M2 1,000-request benchmark or any
+  real DeepSeek call.
