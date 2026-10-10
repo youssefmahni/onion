@@ -51,7 +51,7 @@ struct Request {
   double temperature{};
 };
 
-enum class Kind { Ok, Transport, Truncated, RateLimited, ServerError, Timeout, Malformed };
+enum class Kind { Ok, Transport, Truncated, RateLimited, ServerError, Timeout, ClientError, AuthError, BalanceError, Malformed };
 
 struct Result {
   Kind kind{Kind::Transport};
@@ -102,9 +102,12 @@ class CircuitBreaker {
   void on_result(Kind kind);
   bool open() const;
   int consecutive_transport_failures() const;
+  std::string reason() const;
 
  private:
   int failures_{};
+  int credentials_{};
+  std::string reason_;
 };
 
 class Client {

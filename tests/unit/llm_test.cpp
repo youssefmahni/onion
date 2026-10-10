@@ -45,4 +45,19 @@ TEST(CircuitBreaker, OpensAfterTwentyConsecutiveTransportFailures) {
   breaker.on_result(onion::llm::Kind::Ok);
   EXPECT_FALSE(breaker.open());
 }
+TEST(CircuitBreaker, TimeoutsCountAndRateLimitsDoNot) {
+  onion::llm::CircuitBreaker breaker;
+  for (int index = 0; index < 30; ++index) breaker.on_result(onion::llm::Kind::RateLimited);
+  EXPECT_FALSE(breaker.open());
+  for (int index = 0; index < 20; ++index) breaker.on_result(onion::llm::Kind::Timeout);
+  EXPECT_TRUE(breaker.open());
+}
+TEST(CircuitBreaker, AuthAndBalanceOpenAfterThreeWithReason) {
+  onion::llm::CircuitBreaker auth;
+  for (int index = 0; index < 3; ++index) auth.on_result(onion::llm::Kind::AuthError);
+  EXPECT_TRUE(auth.open()); EXPECT_EQ(auth.reason(), "authentication");
+  onion::llm::CircuitBreaker balance;
+  for (int index = 0; index < 3; ++index) balance.on_result(onion::llm::Kind::BalanceError);
+  EXPECT_TRUE(balance.open()); EXPECT_EQ(balance.reason(), "balance");
+}
 }  // namespace

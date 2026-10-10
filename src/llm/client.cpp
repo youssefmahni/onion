@@ -159,9 +159,17 @@ std::string Budget::spent_usd() const { std::lock_guard<std::mutex> lock(impl_->
 std::string Budget::reserved_usd() const { std::lock_guard<std::mutex> lock(impl_->mutex); return money_string(impl_->reserved); }
 std::string Budget::remaining_usd() const { std::lock_guard<std::mutex> lock(impl_->mutex); return money_string(impl_->limit - impl_->spent - impl_->reserved); }
 
-void CircuitBreaker::on_result(Kind kind) { failures_ = kind == Kind::Transport ? failures_ + 1 : 0; }
-bool CircuitBreaker::open() const { return failures_ >= 20; }
+void CircuitBreaker::on_result(Kind kind) {
+  if (kind == Kind::Ok || kind == Kind::Truncated) { failures_ = 0; credentials_ = 0; reason_.clear(); return; }
+  if (kind == Kind::RateLimited) return;
+  if (kind == Kind::AuthError || kind == Kind::BalanceError) {
+    ++credentials_; reason_ = kind == Kind::AuthError ? "authentication" : "balance"; return;
+  }
+  ++failures_; reason_ = "provider-or-transport";
+}
+bool CircuitBreaker::open() const { return failures_ >= 20 || credentials_ >= 3; }
 int CircuitBreaker::consecutive_transport_failures() const { return failures_; }
+std::string CircuitBreaker::reason() const { return open() ? reason_ : std::string{}; }
 
 struct Client::Impl {
   struct Task { Request request; std::function<void(Result)> done; int attempts{}; Clock::time_point ready{}; };
@@ -238,6 +246,9 @@ struct Client::Impl {
     if (code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
     else if (code != CURLE_OK) result.kind = Kind::Transport;
     else if (status == 429) result.kind = Kind::RateLimited;
+    else if (status == 401) result.kind = Kind::AuthError;
+    else if (status == 402) result.kind = Kind::BalanceError;
+    else if (status == 400 || status == 422) result.kind = Kind::ClientError;
     else if (status == 503 || status >= 500) result.kind = Kind::ServerError;
     else if (status < 200 || status >= 300) result.kind = Kind::Transport;
     else { result.finish_reason = json_string(item.body, "finish_reason"); result.content = json_string(item.body, "content");
