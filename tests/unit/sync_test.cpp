@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
+#include <thread>
 #include <memory>
 #include <string>
 
 #include "sync/sync.hpp"
+#include <httplib.h>
 
 namespace {
 
@@ -175,33 +178,56 @@ TEST_F(SyncTest, OneRoundConvergesBothSettlesAndNodes) {
 }
 
 TEST_F(SyncTest, VerificationFailureQuarantinesAndDoesNotApply) {
+  // Serve a tampered batch directly from a stub peer (Windows keeps open
+  // files locked, so corrupting the live writer's segment is not portable):
+  // the client must quarantine it and apply nothing.
   writer_a_->submit(CommitTerminal{{
       make_record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 0},
                              {"end", "cannot split"}}),
   }});
   writer_a_->sync();
 
-  // Corrupt the last byte of the batch line in A's segment: the hash check
-  // must quarantine it on B.
-  {
-    const auto path = writer_a_->segments().active_path();
-    std::ifstream in(path, std::ios::binary);
-    std::string content((std::istreambuf_iterator<char>(in)),
-                        std::istreambuf_iterator<char>());
-    in.close();
-    content[content.size() - 2] = '0';
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out << content;
-    out.close();
-  }
+  // The tampered batch: B's real first batch is valid, but we serve a
+  // broken line (bad hash) for the vector's origin.
+  auto bad = writer_a_->segments().active_path();
+  httplib::Server stub;
+  stub.Get("/sync/v1/vector", [&](const httplib::Request&,
+                                  httplib::Response& response) {
+    nlohmann::json json;
+    json["device_id"] = key_a_->device_id;
+    json["vector"] = {{key_a_->device_id, 1}};
+    response.set_content(json.dump(), "application/json");
+  });
+  stub.Get("/sync/v1/log/(.*)", [&](const httplib::Request&,
+                                    httplib::Response& response) {
+    response.set_content(
+        "{\"v\":1,\"o\":\"" + key_a_->device_id +
+            "\",\"b\":1,\"prev\":\"00\",\"hash\":\"00\","
+            "\"sig\":\"00\",\"recs\":[{\"s\":1,\"h\":1,"
+            "\"t\":\"SETTLE\",\"p\":{\"path\":\"P01-IN01-T01\","
+            "\"kept\":0,\"end\":\"cannot split\"}}]}\n",
+        "application/x-ndjson");
+  });
+  const int stub_port = stub.bind_to_any_port("127.0.0.1");
+  std::atomic<bool> stub_running{true};
+  std::thread stub_thread([&] {
+    while (stub_running.load())
+      if (!stub.listen_after_bind()) break;
+  });
+  (void)bad;
 
-  start_server_a();
   SyncClient client = make_client_b();
   std::map<std::string, std::string> quarantined;
   std::string error;
+  std::fprintf(stderr, "test: running round\n");
   const int applied = client.run_round(
-      "127.0.0.1:" + std::to_string(server_->bound_port()), &quarantined,
-      &error);
+      "127.0.0.1:" + std::to_string(stub_port), &quarantined, &error);
+  std::fprintf(stderr, "test: round done applied=%d\n", applied);
+  stub_running.store(false);
+  stub.stop();
+  std::fprintf(stderr, "test: stub stopped\n");
+  stub_thread.join();
+  std::fprintf(stderr, "test: thread joined\n");
   EXPECT_EQ(applied, 0);
   EXPECT_FALSE(quarantined.empty());
   EXPECT_FALSE(writer_b_->settled("P01-IN01-T01"));

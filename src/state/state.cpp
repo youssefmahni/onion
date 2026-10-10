@@ -774,9 +774,12 @@ void StateWriter::stop() {
   }
   if (thread_.joinable()) thread_.join();
   started_ = false;
-  // Release the database and the segment handle so the data directory can
-  // be removed (Windows keeps open files locked).
+  // Release the database and every segment handle so the data directory
+  // can be removed (Windows keeps open files locked).
   if (segments_) segments_->close();
+  for (auto& [origin, foreign] : foreign_segments_)
+    if (foreign) foreign->close();
+  foreign_segments_.clear();
   db_.close();
 }
 
