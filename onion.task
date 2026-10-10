@@ -56,6 +56,10 @@ the technical progress log in `docs/agent/PROGRESS.md`.
 - Added benchmark reporting for latency percentiles, curl connection reuse,
   negotiated HTTP version, runtime HTTP/2 support, process thread count and
   budget reservation/settlement totals.
+- Implemented timeout-safe accounting: a timed-out request consumes its full
+  reservation as uncertain spend and is marked in the benchmark metering log.
+- Added a 1,000-request accept-without-response regression: every request
+  times out at one second and the circuit breaker opens after 20 failures.
 
 ## Next approved task
 

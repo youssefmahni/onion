@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
   onion::llm::Client client({url, {}, timeout_s, 1});
   onion::llm::CircuitBreaker breaker;
   onion::llm::Budget budget("10");
-  std::mutex mutex; std::condition_variable done; int completed = 0; int failed = 0; int transport = 0; std::vector<double> latencies;
+  std::mutex mutex; std::condition_variable done; int completed = 0; int failed = 0; int transport = 0; int timeouts = 0; std::vector<double> latencies;
   const auto started = std::chrono::steady_clock::now();
   int reserved = 0;
   for (int index = 0; index < requests; ++index) {
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     if (!reservation) break;
     ++reserved;
     client.submit({"fake", "fixed instruction", "bench request", 32, 0.0},
-      [&, reservation = *reservation](onion::llm::Result result) { budget.settle(reservation, result.kind == onion::llm::Kind::Ok ? "0.001" : "0"); std::lock_guard<std::mutex> lock(mutex); latencies.push_back(result.latency_s); breaker.on_result(result.kind); if (result.kind != onion::llm::Kind::Ok) ++failed; if (result.kind == onion::llm::Kind::Transport) ++transport; if (++completed == reserved) done.notify_one(); });
+      [&, reservation = *reservation](onion::llm::Result result) { budget.settle(reservation, result.kind == onion::llm::Kind::Timeout ? reservation.reserved_usd : result.kind == onion::llm::Kind::Ok ? "0.001" : "0"); std::lock_guard<std::mutex> lock(mutex); latencies.push_back(result.latency_s); breaker.on_result(result.kind); if (result.kind != onion::llm::Kind::Ok) ++failed; if (result.kind == onion::llm::Kind::Transport) ++transport; if (result.kind == onion::llm::Kind::Timeout) ++timeouts; if (++completed == reserved) done.notify_one(); });
   }
   std::unique_lock<std::mutex> lock(mutex);
   done.wait(lock, [&] { return completed == reserved; });
@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
   std::cout << "curl_version=" << onion::llm::curl_version() << " curl_http2=" << (onion::llm::curl_supports_http2() ? "true" : "false") << " process_threads=" << process_threads() << "\n";
   std::cout << "budget_reserved=" << budget.reserved_usd() << " budget_spent=" << budget.spent_usd() << " budget_remaining=" << budget.remaining_usd() << "\n";
   std::cout << "transport=" << transport << "\n";
+  std::cout << "timeouts_uncertain_billed=" << timeouts << "\n";
   std::cout << "breaker_open=" << (breaker.open() ? "true" : "false") << "\n";
   return failed == 0 ? 0 : 1;
 }

@@ -29,6 +29,14 @@ TEST(Budget, SettlementReleasesUnusedReservation) {
   EXPECT_EQ(budget.reserved_usd(), "0");
   EXPECT_EQ(budget.remaining_usd(), "0.75");
 }
+TEST(Budget, TimeoutKeepsFullReservationAsUncertainSpend) {
+  onion::llm::Budget budget("1.00");
+  auto reservation = budget.reserve("0.80");
+  ASSERT_TRUE(reservation);
+  budget.settle(*reservation, reservation->reserved_usd);
+  EXPECT_EQ(budget.spent_usd(), "0.8");
+  EXPECT_EQ(budget.remaining_usd(), "0.2");
+}
 
 TEST(Metering, UsesOffpeakOnlyForCallsInsideOneWindow) {
   onion::llm::PriceSchedule prices{{"1", "0.5", "2"}, {"0.1", "0.05", "0.2"}};

@@ -6,6 +6,10 @@
 - Tests: legacy 98/98 · new 95/95 on Linux (87 passed + 8 skipped on macOS/Windows) · CI: M2 green
 
 ## Log (newest first)
+- 2026-10-10: M2 timeout accounting: timed-out requests now retain their full
+  reservation as uncertain spend; added a 1,000-request one-second
+  accept-without-response regression that verifies Timeout classification and
+  breaker opening · no real calls
 - 2026-10-10: Diagnosed the 1,000-request client crash with ASan/UBSan as a queued-deque iterator use-after-free; fixed by draining ready tasks under the mutex before curl work · normal and sanitizer benchmarks now complete 1,000/1,000 against the fake server · added fake-server concurrency and transport-failure regression coverage · no real calls
 - 2026-10-10: TSan CI found a second construction-order race; reordered the client worker after its synchronization state and verified the focused suite locally · sanitizer CI disables POCL only because its external allocations leak under LSan · no real calls
 - 2026-10-10: Re-ran 1,000 fake requests after the TSan repair: normal 1,149.14 req/s and ASan/UBSan 307.235 req/s, both 1,000/1,000 successful · no real calls
