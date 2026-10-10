@@ -30,16 +30,24 @@ int process_threads() {
 namespace {
 int limiter_trace(int argc, char** argv) {
   std::string scenario;
+  bool csv = false;
   for (int index = 3; index < argc; ++index) {
     if (std::string(argv[index]) == "--scenario" && index + 1 < argc) scenario = argv[++index];
+    else if (std::string(argv[index]) == "--csv") csv = true;
   }
   if (scenario != "healthy" && scenario != "rate_limited" && scenario != "slow_under_load") {
     std::cerr << "limiter-trace requires --scenario healthy|rate_limited|slow_under_load\n";
     return 2;
   }
   onion::llm::Limiter limiter(16, 2000);
+  // Compressed trace: a handful of real 30-second windows, then the hourly
+  // probe at t=3600 and its aftermath.  The limit is never reset between
+  // samples, so every row is the exact limiter state for that window.
   std::vector<std::uint64_t> starts{0, 30, 60, 90, 120, 150, 3600, 3630, 3660};
+  if (csv)
+    std::cout << "window_start_s,window_end_s,limit_used,probe,rate_limited,median_latency_s,limit_after\n";
   for (const auto started_at_s : starts) {
+    const int before = limiter.limit();
     const int used = limiter.begin_window(started_at_s);
     onion::llm::LimitWindow window;
     window.ended_at_s = started_at_s + 30;
@@ -48,10 +56,16 @@ int limiter_trace(int argc, char** argv) {
     if (scenario == "rate_limited" && started_at_s == 60) window.rate_limited = 1;
     if (scenario == "slow_under_load" && started_at_s >= 30 && started_at_s < 3600) window.median_latency_s = 0.2;
     limiter.on_window(window);
-    std::cout << "window_s=" << started_at_s << " used_limit=" << used
-              << " rate_limited=" << window.rate_limited
-              << " median_latency_s=" << window.median_latency_s
-              << " next_limit=" << limiter.limit() << "\n";
+    if (csv) {
+      std::cout << started_at_s << "," << started_at_s + 30 << "," << used << ","
+                << (used != before ? "1" : "0") << "," << window.rate_limited << ","
+                << window.median_latency_s << "," << limiter.limit() << "\n";
+    } else {
+      std::cout << "window_s=" << started_at_s << " used_limit=" << used
+                << " rate_limited=" << window.rate_limited
+                << " median_latency_s=" << window.median_latency_s
+                << " next_limit=" << limiter.limit() << "\n";
+    }
   }
   return 0;
 }

@@ -1,0 +1,8 @@
+requests_started=1000 requests_refused_budget=0 failed=0 elapsed_s=1.42247 throughput=703.003 peak_queued_or_active=1000 peak_active=1000 configured_limit=1000
+latency_p50_s=0.831182 latency_p95_s=1.34487 latency_p99_s=1.38636
+connections_opened=1000 http_version=2
+curl_version=8.22.0 curl_http2=true process_threads=14 fd_request_ceiling=524224
+budget_reserved=0 budget_spent=1 budget_remaining=99
+transport=0
+timeouts_uncertain_billed=0
+breaker_open=false breaker_reason=
