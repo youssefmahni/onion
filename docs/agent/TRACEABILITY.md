@@ -39,3 +39,33 @@ Every rule touched by a milestone must have at least one passing test before tha
 ## M1 scope (kept from M1 gate)
 
 - Golden vectors and platform rules: see `docs/agent/gates/M1.md`.
+
+## M3 scope: DESIGN.md › Storage, Op log, Campaigns, Work scheduling, Quality gate, Depth, Concurrency
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| SQLite schema exactly as DESIGN.md › Storage + schema_version | `StoreTest.*` (schema, WAL, subtree, CSV export, newer-schema refusal) | ✅ |
+| Subtree query: `T01` never matches `T010` | `StoreTest.SubtreeQueryNeverCrossesSiblingPrefixes` | ✅ |
+| One JSON line per batch, LF only, one durable write per batch | `SegmentsTest.*`, `StateWriterTest.TerminalBatchCommitsDurablyAndFolds` | ✅ |
+| Canonical bytes: sorted keys, no whitespace, exact int64 decimal, no floats | `CanonicalJson.*`, `Records.CanonicalBytesAreStable` | ✅ |
+| HLC = (ms << 16) \| counter, monotonic | `HlcClock.IsStrictlyMonotonic` | ✅ |
+| Records never contain floats | `CanonicalJson.RejectsFloats` (throws) | ✅ |
+| ATTEMPT group-commit, flush ≥ 1/s (decision 0000) | `StateWriterTest.AttemptsGroupCommitIntoOneBatch` | ✅ |
+| Terminal batches carry children, CRITIQUE, ATOMIC, SETTLE last — nothing committed before the gate decision (P7) | `EngineTest.RunsAThreeHundredNodeCampaignOffline` (log scan: no failed attempt for any settled node), `GateDecide.*` | ✅ |
+| Pre-check ≤ 400 tokens; a clear no makes a leaf without spending an attempt | `GateFunnel.PreCheckNoMakesALeafWithoutSpendingAnAttempt`, `GatePrompts.PrecheckPromptIsAtMostFourHundredTokensApprox` | ✅ |
+| Checks: complete reply, valid JSON, 3–100 children, no repeats (node/ancestor/sibling/existing), style gates | `GateChecks.*`, `GateParsers.*`, `GateFunnel.TruncatedReplyIsAFailedAttempt` | ✅ |
+| Ancestor check: parent ≥ 0.85, higher ancestors ≥ 0.95 | `GateChecks.AncestorSimilarityThresholds` | ✅ |
+| Best-of-3: commit ≥ 0.7, retry with issues + raised temperature, leaf when no 3 valid children, floor 0.5, NEEDS_REVIEW below floor | `GateDecide.*`, `GateFunnel.RetryInjectsPreviousIssuesAndCommitsBetterAttempt`, `GateFunnel.NeedsReviewBelowFloorSpendsNothingMore` | ✅ |
+| Temperatures 0 → 0.3 → 0.5 | `GateFunnel.RetryInjectsPreviousIssuesAndCommitsBetterAttempt` | ✅ |
+| Quality guard flags outliers | `QualityGuard.*` | ✅ |
+| Campaigns: spec file, start/pause/resume/stop, stop is final | `ParseCampaign.*`, `StateWriterTest.CampaignFoldAndStopIsFinal`, `EngineTest.StopIsFinal` | ✅ |
+| Cost projection before start | `ProjectCost.ScalesLinearlyInExactDecimals` + CLI evidence | ✅ |
+| Ticket ordering: breadth/deepest first, ties by path; scope, settled, leaf and review exclusions; review pauses the subtree | `OrderTickets.*` | ✅ |
+| Loop budget in RESERVE chunks (default 50) | `EngineTest.*` (RESERVE records in the log of every campaign run) | ✅ |
+| Stop rule: last 50 settled ≥ 90% atomic and average score ≥ 0.8 | `StopRule.*`, `EngineTest.StopRuleEndsAnAtomicFrontierCampaign` | ✅ |
+| Waiting reservations: a ticket that does not fit waits and starts after a release (G9) | `EngineTest.WaitingTicketStartsWhenTheReservationIsReleased` | ✅ |
+| Review queue: accept settles without spending, retry re-queues, reject tombstones (decision 0008) | `EngineTest.ReviewAcceptSettlesWithoutSpending`, `EngineTest.ReviewRejectTombstonesTheSubtree` | ✅ |
+| Kill at every commit step loses no committed work | `StateWriterTest.CrashBetweenDurableWriteAndFoldLosesNothing`, `StateWriterTest.CrashAfterFoldKeepsStoreAndLogConsistent` (forked child, real `_exit`) | ✅ |
+| API: token, Origin, Content-Type checks on every POST; 127.0.0.1 only | `ApiTest.*` (401 / 403 / 415 / 200) | ✅ |
+| Dashboard reads /api/state with campaign panel and review buttons | `ApiTest.DashboardServesAtRoot` + live `/api/state` evidence | ✅ |
+| 1,000 requests in flight on ~20 threads (M2 carry-over) | M2 tests, still green | ✅ |
