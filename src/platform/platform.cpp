@@ -70,6 +70,14 @@ bool write_all(int fd, std::string_view bytes) {
   }
   return true;
 }
+
+bool sync_file_descriptor(int fd) {
+#if defined(__APPLE__)
+  return ::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0;
+#else
+  return ::fsync(fd) == 0;
+#endif
+}
 #endif
 bool private_dir(const std::filesystem::path& path) {
   std::error_code error;
@@ -175,11 +183,11 @@ bool AppendFile::sync() {
   return ok;
 #elif defined(__APPLE__)
   if (fd_ < 0) return false;
-  const bool ok = ::fcntl(fd_, F_FULLFSYNC) == 0 || ::fsync(fd_) == 0;
+  const bool ok = sync_file_descriptor(fd_);
   if (ok) ++sync_counts.file;
   return ok;
 #else
-  const bool ok = fd_ >= 0 && ::fsync(fd_) == 0;
+  const bool ok = fd_ >= 0 && sync_file_descriptor(fd_);
   if (ok) ++sync_counts.file;
   return ok;
 #endif
@@ -194,7 +202,7 @@ bool atomic_replace(const std::filesystem::path& tmp, const std::filesystem::pat
 #else
   const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
-  const bool synced = ::fsync(fd) == 0;
+  const bool synced = sync_file_descriptor(fd);
   ::close(fd);
   if (!synced) return false;
   ++sync_counts.file;
