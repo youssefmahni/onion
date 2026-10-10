@@ -2,9 +2,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -941,11 +945,18 @@ TEST_F(FunnelFixture, LowScoreNodeIsRetriedAndFixed) {
 
 // ---------------- live-resizable pool ----------------
 TEST_F(FunnelFixture, PoolResizesFromControlFile) {
-    // fake that answers a slow-ish 6-round funnel for TD1 then drains
+    // Deterministic synchronization: the synthesizer reply holds the funnel
+    // open until the manager has demonstrably announced "THREADS\t3" on the
+    // run's stdout.  A reader thread watches a pipe copy of stdout and
+    // releases the synthesizer only after it sees the announcement.  This
+    // removes the wall-clock race that made the test flake on loaded CI
+    // runners (the manager could be starved for the whole funnel window).
+    std::atomic<bool> raised{false};
+    std::mutex synth_mutex;
+    std::condition_variable synth_cv;
     depot::AskFn fake = [&](const std::string& payload) -> std::string {
-        // The control loop polls every 50 ms in this test.  Keep each fake
-        // reply comfortably beyond that interval so slow hosted macOS runners
-        // cannot drain the ticket before the resize is observed.
+        // Slow-ish replies keep the funnel itself well beyond one control
+        // interval, as in the original timing-based test.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (payload.find("Plan the knowledge coverage") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"items\": [\"A1\", \"A2\"]}"}}]})";
@@ -953,8 +964,14 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
             return R"({"choices":[{"message":{"content":"{\"items\": [\"Alpha\"]}"}}]})";
         if (payload.find("Critique this candidate set") != std::string::npos)
             return R"({"choices":[{"message":{"content":"{\"score\": 0.9, \"remove\": [], \"add\": [], \"issues\": \"\"}"}}]})";
-        if (payload.find("select the final children set") != std::string::npos)
+        if (payload.find("select the final children set") != std::string::npos) {
+            // Bounded wait: if the manager never raises, the run still ends
+            // and the assertion below reports the real failure (no hang).
+            std::unique_lock<std::mutex> lock(synth_mutex);
+            synth_cv.wait_for(lock, std::chrono::seconds(10),
+                              [&] { return raised.load(); });
             return R"({"choices":[{"message":{"content":"{\"items\": [{\"title\": \"Alpha\", \"atomic\": true}]}"}}]})";
+        }
         return R"({"choices":[{"message":{"content":"{\"items\": []}"}}]})";
     };
     // control dir + initial target 1 -> then raise to 3 mid-run
@@ -964,13 +981,55 @@ TEST_F(FunnelFixture, PoolResizesFromControlFile) {
         f << "3\n";  // raise 1 -> 3 workers
     }
     setenv("DEPOT_CONTROL_INTERVAL_MS", "50", 1);
-    testing::internal::CaptureStdout();
-    int rc = depot::run_funnel("P01-IN01-", 10, 1, false, true, "deepseek-v4-pro",
-                               "sk-fake", dir_.string(), fake);
-    std::string out = testing::internal::GetCapturedStdout();
+    // Route the run's stdout through a pipe so the reader can watch for the
+    // manager's announcement without racing the test's own thread.
+    int pipefd[2];
+    ASSERT_EQ(::pipe(pipefd), 0);
+    std::cout << std::flush;
+    ::fflush(stdout);
+    const int saved_stdout = ::dup(1);
+    ASSERT_GE(saved_stdout, 0);
+    ASSERT_EQ(::dup2(pipefd[1], 1), 1);
+
+    std::string observed;
+    std::atomic<bool> run_done{false};
+    std::thread reader([&] {
+        char buffer[4096];
+        while (!run_done.load()) {
+            const ssize_t n = ::read(pipefd[0], buffer, sizeof(buffer));
+            if (n > 0) {
+                observed.append(buffer, static_cast<std::size_t>(n));
+                if (!raised.load() &&
+                    observed.find("THREADS\t3") != std::string::npos) {
+                    raised.store(true);
+                    synth_cv.notify_all();
+                }
+            } else if (n == 0) {
+                break;  // every writer closed
+            }
+        }
+        for (;;) {  // drain anything left until EOF
+            const ssize_t n = ::read(pipefd[0], buffer, sizeof(buffer));
+            if (n <= 0) break;
+            observed.append(buffer, static_cast<std::size_t>(n));
+        }
+    });
+
+    const int rc = depot::run_funnel("P01-IN01-", 10, 1, false, true,
+                                     "deepseek-v4-pro", "sk-fake", dir_.string(),
+                                     fake);
+
+    std::cout << std::flush;
+    ::fflush(stdout);
+    run_done.store(true);
+    ::close(pipefd[1]);
+    ::dup2(saved_stdout, 1);
+    ::close(saved_stdout);
+    reader.join();
+    ::close(pipefd[0]);
     unsetenv("DEPOT_CONTROL_INTERVAL_MS");
     EXPECT_EQ(rc, 0);
-    EXPECT_NE(out.find("THREADS\t3"), std::string::npos);  // manager raised workers to 3
+    EXPECT_NE(observed.find("THREADS\t3"), std::string::npos);  // manager raised workers to 3
 }
 
 // ---------------- integration: run_llm traversal (hermetic, no network) ----------------
