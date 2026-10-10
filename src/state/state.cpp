@@ -271,9 +271,14 @@ void StateWriter::replay(std::string* error) {
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
       if (!entry.is_regular_file()) continue;
       if (entry.path().extension() == ".zst") sealed_files.push_back(entry.path());
-      else active_file = entry.path();
+      else if (active_file.empty() || entry.path() > active_file)
+        active_file = entry.path();  // the newest raw segment wins
     }
   std::sort(sealed_files.begin(), sealed_files.end());
+  if (std::getenv("ONION_REPLAY_DEBUG")) {
+    std::fprintf(stderr, "replay: sealed=%zu active=%s\n",
+                 sealed_files.size(), active_file.string().c_str());
+  }
 
   std::int64_t expected_first = 1;
   std::string expected_prev =
