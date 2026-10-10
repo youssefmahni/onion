@@ -131,7 +131,15 @@ def main():
                 return True
             except Exception:
                 return False
-        assert wait_for(all_done, timeout=500), "campaign never finished everywhere"
+        if not wait_for(all_done, timeout=500):
+            for index in (1, 2, 3):
+                try:
+                    state = http_json(
+                        "http://127.0.0.1:%d/api/state" % (18110 + index))
+                    print("device %d state: %s" % (index, json.dumps(state)))
+                except Exception as exc:
+                    print("device %d unreachable: %s" % (index, exc))
+            raise AssertionError("campaign never finished everywhere")
 
         # Poll until every store converges on a non-zero settled count (the
         # sync rounds spread the settles a few rounds after the stop).
