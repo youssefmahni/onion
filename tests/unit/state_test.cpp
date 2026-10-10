@@ -3,6 +3,11 @@
 #include <chrono>
 #include <fstream>
 #include <string>
+#include <thread>
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "state/state.hpp"
 
@@ -205,5 +210,84 @@ TEST_F(StateWriterTest, DevImportWritesStoreWithoutLog) {
   const auto subtree = writer_->db().nodes_in_subtree("P01", &query_error);
   ASSERT_EQ(subtree.size(), 2u);
 }
+
+// Crash injection at each commit step: the hook is armed inside a forked
+// child, which dies at the step with _exit — a real power cut. The parent
+// then reopens the data directory and checks the replay.
+#ifndef _WIN32
+namespace {
+int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
+  const pid_t child = fork();
+  if (child != 0) {
+    int status = 0;
+    waitpid(child, &status, 0);
+    return status;
+  }
+  StateWriter::Options options;
+  options.data_dir = dir;
+  options.origin = "dev0000000000000001";
+  options.crash_hook = [crash_step](int step) {
+    if (step == crash_step) _exit(3);
+  };
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  std::string error;
+  if (!writer->start(&error)) _exit(4);
+  writer->submit(CommitTerminal{{
+      Record{0, 0, "ADD_NODE",
+             {{"path", "P01-IN01-T01-TK00001"}, {"layer", 4},
+              {"title", "Committed"}}},
+      Record{0, 0, "SETTLE",
+             {{"path", "P01-IN01-T01"}, {"kept", 1}, {"end", "children"}}},
+  }});
+  for (int i = 0; i < 200; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (writer->next_batch() == 2) break;
+  }
+  _exit(5);  // the hook never fired: test failure
+}
+}  // namespace
+
+TEST_F(StateWriterTest, CrashBetweenDurableWriteAndFoldLosesNothing) {
+  writer_.reset();  // release the fixture writer before the fork
+  const int status = run_writer_until_crash(dir_, 1);
+  EXPECT_EQ(WEXITSTATUS(status), 3);
+
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
+  std::string query_error;
+  const auto node = writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error);
+  ASSERT_TRUE(node.has_value()) << query_error;
+  EXPECT_EQ(node->title, "Committed");
+  writer->stop();
+}
+
+TEST_F(StateWriterTest, CrashAfterFoldKeepsStoreAndLogConsistent) {
+  writer_.reset();
+  const int status = run_writer_until_crash(dir_, 2);
+  EXPECT_EQ(WEXITSTATUS(status), 3);
+
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
+  std::string query_error;
+  const auto node = writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error);
+  ASSERT_TRUE(node.has_value()) << query_error;
+  EXPECT_EQ(node->title, "Committed");
+  // The idempotent replay does not duplicate the node: the subtree holds
+  // exactly the one committed child (the parent itself has no node row).
+  const auto subtree = writer->db().nodes_in_subtree("P01-IN01-T01", &query_error);
+  EXPECT_EQ(subtree.size(), 1u);
+  writer->stop();
+}
+#endif  // !_WIN32
 
 }  // namespace

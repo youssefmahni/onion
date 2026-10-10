@@ -362,8 +362,10 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   ++next_batch_;
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;
+  if (options_.crash_hook) options_.crash_hook(1);  // batch durable, store stale
   for (const log::Record& record : records) fold(record, error);
   if (error && !error->empty()) return false;
+  if (options_.crash_hook) options_.crash_hook(2);  // fold done
   return true;
 }
 

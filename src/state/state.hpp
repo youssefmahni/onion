@@ -59,6 +59,10 @@ class StateWriter {
     std::filesystem::path data_dir;   // contains onion.db and oplog/
     std::string origin{"dev0000000000000001"};
     std::unique_ptr<log::Signer> signer;
+    // Test-only crash injection, called at the commit steps:
+    // 1 = terminal batch durable, before the fold; 2 = after the fold.
+    // Throwing (or terminating) from it simulates a power cut.
+    std::function<void(int)> crash_hook;
   };
 
   explicit StateWriter(Options options);
