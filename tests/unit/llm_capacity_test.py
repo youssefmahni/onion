@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Wiring test: the limiter follows a mid-run capacity shift (decision 0011,
-plateau probe adoption).  On Windows the Python fake server's own throughput
-(about 30 concurrent requests) caps below the shift's target, so the shift
-cannot be observed there: the test skips (exit 77)."""
+plateau probe adoption).  The Python fake server's own throughput caps below
+the shift's target on the hosted macOS and Windows runners, so the shift is
+only observable on Linux; elsewhere the test skips (exit 77)."""
 import argparse
 import re
 import sys
@@ -32,9 +32,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
-    if sys.platform == "win32":
-        print("capacity_shift skipped on Windows: the fake server's own "
-              "throughput caps below the shift's plateau")
+    # The Python fake server's own throughput caps well below the shift's
+    # target on the hosted macOS and Windows runners (about 28-30 concurrent
+    # requests there), so the shift is only observable on Linux.
+    if sys.platform != "linux":
+        print("capacity_shift skipped on this platform: the fake server's "
+              "own throughput caps below the shift's plateau")
         sys.exit(77)
     out = run_adaptive(args.binary, "capacity_shift.json", 5000, 4, 200)
     seen = windows(out)
