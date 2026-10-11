@@ -662,7 +662,12 @@ int node_cmd(int argc, char** argv) {
             client_members[entry.device_id] = entry;
           onion::sync::SyncClient client(
               {*writer, device_key, std::move(client_members)});
-          client.run_round(peer, &quarantined, &sync_error);
+          const int applied =
+              client.run_round(peer, &quarantined, &sync_error);
+          if (std::getenv("ONION_SYNC_DEBUG"))
+            std::fprintf(stderr, "sync round to %s: applied=%d error=%s\n",
+                         peer.c_str(), applied,
+                         sync_error.empty() ? "none" : sync_error.c_str());
         }
       }
     }
