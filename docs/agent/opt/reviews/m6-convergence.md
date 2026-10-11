@@ -42,15 +42,16 @@ check is `>= budget`), but M7/M8 work on budget chips, spillover and
 exhaustion detection should not trust the fold's value to be exactly the
 budget.
 
-### L2. Budget-exhaustion detection across nodes — SOUND, but sync-latency sensitive
+### L2. Budget-exhaustion detection across nodes — SOUND; one-round propagation
 Evidence: a device with empty local tickets and `reserved_total < budget`
 ends its campaign pass with `end_reason = "drained"` and sleeps 250 ms
-(`src/sched/sched.cpp:346-356`, `src/cli/commands.cpp:654,692`); the RESERVE
-records arrive through one random peer per 15 s sync round
-(`src/sync/sync.cpp:324+`). With 3 devices, the campaign record and the
-RESERVEs from device 1 reach device 3 in up to 2 rounds (~30 s). The test's
-work window is `max(60, deadline − 90)` s (line 171). The mechanism is
-liveness-correct; the margin is timing, not logic.
+(`src/sched/sched.cpp:346-356`, `src/cli/commands.cpp:654,692`); the sync
+loop calls `run_round` against **every** member each 15 s round
+(`src/cli/commands.cpp:672-690`), so a RESERVE written on device 1 is
+fetched by the others within roughly one round (~15 s), not two. The
+mechanism is liveness-correct; the remaining exposure to the test's 60 s
+work window (`max(60, deadline − 90)`, line 171) is the sync round cadence
+itself plus load, not the hop count.
 
 ### L3. Lane ownership of tickets that remain open — SOUND for this test
 Evidence: each device erases every ticket whose `lane_owner != self`
