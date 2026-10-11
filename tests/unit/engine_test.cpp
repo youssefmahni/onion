@@ -299,3 +299,36 @@ TEST_F(EngineTest, KillAtEveryCommitStepLosesNoCommittedWork) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------- M6 liveness (0010)
+
+TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
+  seed_root();
+  // Fleet mode: the device owns everything (huge weight), budget 2.
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(2), budget, 1,
+                                "dev0000000000000001", "0.001", std::nullopt,
+                                0,
+                                {{"dev0000000000000001", 100.0},
+                                 {"dev0000000000000002", 0.1}},
+                                "dev0000000000000001"});
+  CampaignSpec tiny = spec();
+  tiny.loop_budget = 2;
+  tiny.chunk = 1;
+  tiny.mode = "breadth-first";
+
+  const Engine::RunResult first = engine.run(tiny, nullptr);
+  EXPECT_EQ(first.end_reason, "budget");  // exhausted, not stopped
+  // Decision 0010: exhaustion never closes the campaign record.
+  ASSERT_TRUE(writer_->campaign("c1").has_value());
+  EXPECT_EQ(writer_->campaign("c1")->state, "running");
+  const int settled_after_exhaustion = first.settled;
+  EXPECT_GT(settled_after_exhaustion, 0);
+
+  // Raising the loop budget resumes the open tickets.
+  tiny.loop_budget = 1000;
+  tiny.chunk = 50;
+  const Engine::RunResult second = engine.run(tiny, nullptr);
+  EXPECT_EQ(second.end_reason, "drained");  // the resumed tickets finished
+  EXPECT_GT(second.settled, 0);
+}

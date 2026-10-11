@@ -266,3 +266,56 @@ TEST_F(SyncTest, RepeatedRoundsAreIdempotent) {
   std::string query_error;
   EXPECT_EQ(writer_b_->db().settles(&query_error).size(), 1u);
 }
+
+TEST_F(SyncTest, MidChainPullContinuesTheLocalChainHead) {
+  // A writes two batches. B first holds only batch 1 (as if synced in an
+  // earlier round), then a sync round must continue from that chain head
+  // and pull batch 2 — the liveness property fixed in M6.
+  writer_a_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_a_->sync();
+  writer_a_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01-T02"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_a_->sync();
+
+  // Hand B the first batch only, as the previous round did.
+  {
+    std::ifstream in(writer_a_->segments().active_path());
+    std::string line;
+    std::getline(in, line);
+    auto batch_json = nlohmann::json::parse(line);
+    onion::log::Batch batch;
+    batch.version = batch_json.value("v", 0);
+    batch.origin = batch_json.value("o", std::string{});
+    batch.number = batch_json.value("b", std::uint64_t{0});
+    batch.prev = batch_json.value("prev", std::string{});
+    batch.hash = batch_json.value("hash", std::string{});
+    batch.sig = batch_json.value("sig", std::string{});
+    for (const auto& record_json : batch_json["recs"])
+      batch.records.push_back(onion::log::Record::from_json(record_json));
+    // The precondition: the first line of A's active segment is batch 1 of
+    // A (no auto genesis batch, no sealing at default sizes).
+    EXPECT_EQ(batch.number, 1u);
+    EXPECT_EQ(batch.origin, key_a_->device_id);
+    writer_b_->submit(onion::state::AppendForeign{std::move(batch)});
+    writer_b_->sync();
+  }
+  EXPECT_TRUE(writer_b_->settled("P01-IN01-T01"));
+  EXPECT_FALSE(writer_b_->settled("P01-IN01-T02"));
+
+  start_server_a();
+  SyncClient client = make_client_b();
+  std::map<std::string, std::string> quarantined;
+  std::string error;
+  const int applied = client.run_round(
+      "127.0.0.1:" + std::to_string(server_->bound_port()), &quarantined,
+      &error);
+  ASSERT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(quarantined.empty());
+  EXPECT_EQ(applied, 1);  // the second batch
+  EXPECT_TRUE(writer_b_->settled("P01-IN01-T02"));
+}

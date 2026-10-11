@@ -14,9 +14,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import platform
 import urllib.request
 from pathlib import Path
-import platform
 
 ROOT = Path(__file__).resolve().parents[2]
 FAKE_SERVER = str(ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py")
