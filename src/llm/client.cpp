@@ -108,16 +108,38 @@ struct UrlParts { std::string host; std::uint16_t port{}; };
 UrlParts split_url(std::string_view url) {
   UrlParts parts;
   const std::size_t scheme = url.find("://");
-  const std::size_t host_begin = scheme == std::string_view::npos ? 0 : scheme + 3;
-  const std::size_t host_end = url.find_first_of(":/", host_begin);
+  std::size_t host_begin = scheme == std::string_view::npos ? 0 : scheme + 3;
+  std::size_t host_end = url.find_first_of(":/", host_begin);
+  // A bracketed IPv6 host ([::1]:8080) ends at the closing bracket.
+  if (host_begin < url.size() && url[host_begin] == '[') {
+    const std::size_t close = url.find(']', host_begin);
+    if (close != std::string_view::npos) {
+      host_begin += 1;
+      host_end = close;
+    }
+  }
   parts.host = std::string(url.substr(host_begin, host_end == std::string_view::npos
                                                    ? std::string_view::npos
                                                    : host_end - host_begin));
   const bool https = scheme != std::string_view::npos && url.substr(0, scheme) == "https";
-  if (host_end != std::string_view::npos && url[host_end] == ':')
-    parts.port = static_cast<std::uint16_t>(std::atoi(std::string(url.substr(host_end + 1)).c_str()));
-  else
+  std::size_t port_colon = std::string_view::npos;
+  if (host_end != std::string_view::npos && url[host_end] == ':') {
+    port_colon = host_end;
+  } else if (host_end != std::string_view::npos && host_end + 1 < url.size() &&
+             url[host_end + 1] == ':') {
+    port_colon = host_end + 1;  // "[::1]:8080"
+  }
+  if (port_colon != std::string_view::npos) {
+    char* end = nullptr;
+    const std::string digits(url.substr(port_colon + 1));
+    const long parsed = std::strtol(digits.c_str(), &end, 10);
+    if (end != nullptr && *end == '\0' && parsed > 0 && parsed < 65536)
+      parts.port = static_cast<std::uint16_t>(parsed);
+    else
+      parts.port = https ? 443 : 80;
+  } else {
     parts.port = https ? 443 : 80;
+  }
   return parts;
 }
 
@@ -306,6 +328,7 @@ struct Client::Impl {
     if (options.max_total_connections > 0)
       curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, options.max_total_connections);
     share = curl_share_init();
+    if (!share) throw std::runtime_error("curl_share_init failed");
     curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock);
     curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock);
     curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
@@ -372,7 +395,9 @@ struct Client::Impl {
     const std::string address = resolve(url_parts.host, url_parts.port);
     if (options.dns_resolver && address.empty()) {
       // Resolution failed: fail the request as a Transport error without
-      // handing it to libcurl (decision 0011, dns_fail_burst).
+      // handing it to libcurl (decision 0011, dns_fail_burst).  The ramp
+      // token consumed for this handle is refunded: no connection opened.
+      bucket.settle(0);
       Result result;
       result.kind = Kind::Transport;
       result.latency_s = 0.0;
