@@ -21,7 +21,9 @@ ROOT = Path(__file__).resolve().parents[2]
 FAKE_SERVER = str(ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py")
 HEALTHY_SCENARIO = str(ROOT / "tools" / "fake_deepseek" / "scenarios" / "healthy.json")
 
-HARD_DEADLINE_S = 120.0
+# The local verification loop runs at 120 s; the CI sanitizer and hosted
+# macOS jobs are slower, so ctest overrides this through the environment.
+HARD_DEADLINE_S = float(os.environ.get("ONION_MP_DEADLINE_S", "120"))
 SYNC_ROUND_S = 15.0
 
 
