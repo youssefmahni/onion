@@ -1,6 +1,8 @@
 #include "llm/llm.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -69,3 +71,36 @@ TEST(CircuitBreaker, AuthAndBalanceOpenAfterThreeWithReason) {
   EXPECT_TRUE(balance.open()); EXPECT_EQ(balance.reason(), "balance");
 }
 }  // namespace
+
+TEST(ClientHygiene, ResolverMemoExpiresPerTtl) {
+  // The resolver hook memoizes per host for the TTL.  The requests fail at
+  // connect (nothing listens on port 1) but the hook count is what matters.
+  onion::llm::Client::Options options;
+  options.base_url = "http://127.0.0.1:1";
+  options.timeout_s = 5;
+  options.connect_timeout_s = 5;
+  options.max_in_flight = 4;
+  options.dns_cache_ttl_s = 1;
+  std::atomic<int> calls{0};
+  options.dns_resolver = [&calls](const std::string&, std::uint16_t) {
+    ++calls;
+    return "127.0.0.1";
+  };
+  onion::llm::Client client(std::move(options));
+  const auto run_one = [&] {
+    std::promise<void> completed;
+    auto future = completed.get_future();
+    client.submit({"m", "", "hi", 8, 0.0},
+                  [&](onion::llm::Result) { completed.set_value(); });
+    future.wait();
+  };
+  run_one();
+  EXPECT_EQ(client.dns_lookups(), 1);
+  run_one();  // inside the TTL: memoized, no fresh lookup
+  EXPECT_EQ(client.dns_lookups(), 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  run_one();  // TTL expired: one fresh lookup
+  EXPECT_EQ(client.dns_lookups(), 2);
+  run_one();  // memoized again
+  EXPECT_EQ(client.dns_lookups(), 2);
+}

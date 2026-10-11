@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <algorithm>
 #include <atomic>
@@ -99,10 +100,21 @@ int llm_models(int argc, char** argv) {
   return status == 200 ? 0 : 1;
 }
 
+// The test resolver: localhost and loopback literals resolve to 127.0.0.1;
+// anything else fails, which the client surfaces as a Transport outcome.
+std::string test_resolve(const std::string& host) {
+  if (host == "localhost" || host == "127.0.0.1" || host == "::1") return "127.0.0.1";
+  return {};
+}
+
 int llm_probe(int argc, char** argv) {
   std::string url, model = "deepseek-flash", system = "You answer briefly.", user = "Reply with the single word: ok";
   int max_tokens = 64, requests = 1, timeout_s = 120;
   bool invalid_key = false;
+  bool test_resolver = false;
+  int resolver_fail_first = 0;
+  int new_connections_per_s = 50;
+  long dns_ttl_s = 600;
   for (int index = 3; index < argc; ++index) {
     const std::string arg(argv[index]);
     if (arg == "--url" && index + 1 < argc) url = argv[++index];
@@ -112,13 +124,30 @@ int llm_probe(int argc, char** argv) {
     else if (arg == "--max-tokens" && index + 1 < argc) max_tokens = std::atoi(argv[++index]);
     else if (arg == "--requests" && index + 1 < argc) requests = std::atoi(argv[++index]);
     else if (arg == "--timeout" && index + 1 < argc) timeout_s = std::atoi(argv[++index]);
+    else if (arg == "--new-connections-per-s" && index + 1 < argc) new_connections_per_s = std::max(0, std::atoi(argv[++index]));
+    else if (arg == "--dns-ttl" && index + 1 < argc) dns_ttl_s = std::max(1L, std::atol(argv[++index]));
+    else if (arg == "--test-resolver") test_resolver = true;
+    else if (arg == "--resolver-fail-first" && index + 1 < argc) resolver_fail_first = std::atoi(argv[++index]);
     else if (arg == "--invalid-key") invalid_key = true;
   }
   if (url.empty()) { std::cerr << "probe requires --url <base-url>\n"; return 2; }
   const char* key = std::getenv("DEEPSEEK_API_KEY");
   if (!invalid_key && (!key || !*key)) { std::cout << "key=missing\n"; return 2; }
-  onion::llm::Client probe_client({url, invalid_key ? std::string("sk-invalid-key") : std::string(key),
-                                   timeout_s, 10, 1, 8});
+  onion::llm::Client::Options options{url, invalid_key ? std::string("sk-invalid-key") : std::string(key),
+                                      timeout_s, 10, 1, 8};
+  options.new_connections_per_s = static_cast<std::size_t>(new_connections_per_s);
+  options.dns_cache_ttl_s = dns_ttl_s;
+  if (test_resolver) {
+    options.dns_resolver = [](const std::string& host, std::uint16_t) { return test_resolve(host); };
+  }
+  auto resolver_failures = std::make_shared<std::atomic<int>>(resolver_fail_first);
+  if (resolver_fail_first > 0) {
+    options.dns_resolver = [resolver_failures](const std::string& host, std::uint16_t) mutable -> std::string {
+      if (resolver_failures->fetch_sub(1) > 0) return {};
+      return test_resolve(host);
+    };
+  }
+  onion::llm::Client probe_client(std::move(options));
   onion::llm::CircuitBreaker breaker;
   std::mutex mutex; std::condition_variable done; int completed = 0;
   for (int index = 0; index < requests; ++index) {
@@ -140,6 +169,7 @@ int llm_probe(int argc, char** argv) {
   done.wait(lock, [&] { return completed == requests; });
   std::cout << "http_version=" << probe_client.negotiated_http_version()
             << " connections_opened=" << probe_client.connections_opened()
+            << " dns_lookups=" << probe_client.dns_lookups()
             << " curl_version=" << onion::llm::curl_version()
             << " curl_http2=" << (onion::llm::curl_supports_http2() ? "true" : "false")
             << " breaker_open=" << (breaker.open() ? "true" : "false")

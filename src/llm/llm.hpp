@@ -139,6 +139,18 @@ class Client {
     int connect_timeout_s{10};
     int worker_threads{1};
     std::size_t max_in_flight{1000};
+    // Client hygiene (decision 0011).
+    std::size_t max_concurrent_streams{100};
+    std::size_t max_host_connections{0};
+    std::size_t max_total_connections{0};
+    std::size_t new_connections_per_s{50};  // 0 = no ramp
+    long dns_cache_ttl_s{600};
+    // Test-only hook: resolves (host, port) to an IP address.  When set, the
+    // client memoizes resolutions per host for dns_cache_ttl_s and pins every
+    // handle with CURLOPT_RESOLVE; an empty return fails the request as a
+    // Transport error.  In production this is empty and the shared curl DNS
+    // cache provides the same property.
+    std::function<std::string(const std::string& host, std::uint16_t port)> dns_resolver;
   };
   explicit Client(Options options);
   ~Client();
@@ -149,6 +161,7 @@ class Client {
   std::size_t peak_in_flight() const;
   std::size_t peak_active_requests() const;
   std::size_t connections_opened() const;
+  std::size_t dns_lookups() const;
   long negotiated_http_version() const;
 
  private:
