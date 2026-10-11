@@ -3,7 +3,8 @@
 ## Current
 
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
-- First unit landed: `src/swim` membership core (ping/ack, 2 indirect probes, SUSPECT, refutation via incarnation+1, DEAD after the suspicion timeout, piggybacked gossip, 5 s beacon timer, 8 states, injectable transport+clock) — 22 deterministic tests, CI green 8/8 (run 38152532336); reviewed twice (2 CRITICAL/HIGH-class findings fixed: synchronous-transport iterator invalidation, malformed-datagram exceptions, suspicion-deadline reset, seq collisions, self-suspect refutation, positive-ack race)
+- Landed so far: `src/swim` membership core (22 tests, run 38152532336 green) + the real UDP transport (`platform::UdpSocket` POSIX/Windows + `swim::UdpTransport`, replies to registered host:port addresses, bounded poll drain, decision 0013) — 260/260 local, CI green 8/8 (run 38155206858); one CI build-break cycle fixed (macOS `ip_mreq.imr_interface`, winsock-free header sentinel)
+- Earlier: `src/swim` membership core (ping/ack, 2 indirect probes, SUSPECT, refutation via incarnation+1, DEAD after the suspicion timeout, piggybacked gossip, 5 s beacon timer, 8 states, injectable transport+clock) — 22 deterministic tests, CI green 8/8 (run 38152532336); reviewed twice (2 CRITICAL/HIGH-class findings fixed: synchronous-transport iterator invalidation, malformed-datagram exceptions, suspicion-deadline reset, seq collisions, self-suspect refutation, positive-ack race)
 - Next units: UDP 7946 transport + signed multicast beacon (decision 0013), invite/join, majority & eviction, stealing, chaos tools, multi-process join/kill scenarios
 - M6 merged (`1f5176a`, PR #12), tagged `m6-rc`; M5 merged (`c074d9e`), tagged `m5-rc`
 - Tests: 224/224 new-tree on Linux · legacy 98/98 · CI green on the M6 merge
