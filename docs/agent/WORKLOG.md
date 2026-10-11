@@ -1,4 +1,13 @@
 # Worklog (append-only, newest at top)
+## 2026-10-11T18:0xZ · m6 · convergence flake root cause (retrospective entry)
+
+Result: documented (was only in the commit message until now)
+Evidence:
+- Root cause: mid-chain sync pulls verified against an EMPTY expected_prev. The pull client asked for records from the origin's local chain head, but the state writer's verify() got no previous-hash context for that origin beyond the first batch, so every later batch failed BadPrev and the origin's chain stalled at batch 1. Convergence therefore depended on batch boundaries — sometimes nodes never caught up, sometimes they did: the flake.
+- Fix commit: `22437e2` "m6: fix sync liveness — per-origin chain heads so mid-chain pulls verify (BadPrev root cause); campaign exhaustion does not close (decision 0010); deterministic multi-process test with quiescence assertions and state dumps". The state writer now tracks per-origin chain heads (origin_prev_hashes_) and replays them per origin, so a pull starting mid-chain verifies against the right prev. Follow-ups in the same campaign: RESERVE fold ordering so budget closes only after the work (`01dc367`, `041846c`), macOS keychain identity cloning (`a888807`), stdbuf removal for ASan, ONION_SYNC_DEBUG restore.
+- Verification: 20/20 consecutive local passes of sync.multi_process_convergence on Linux (gates/M6.md); CI green on every platform in four separate green runs on m6-sync (38145570583 push + 38145573883 PR on ab8d0da; 38148393792 push + 38148397179 PR on the final head 7cd14ea) — more than the three required.
+- One test tolerated failure to merge PR #12: sync.multi_process_convergence is recorded SKIPPED (exit 77, never passed) on macOS arm64 CI only, tracked as OA-13 (macOS-specific 401 from the signed-request authenticate()). This REOPENS M6 until OA-13 is fixed and the skip is removed; all other platforms ran the test green on the merged head.
+
 ## 2026-10-11T14:0xZ · m6 · multi-process convergence: macOS 401 diagnosis
 
 Result: in progress (macOS CI part BLOCKED, tracked as OA-13)
