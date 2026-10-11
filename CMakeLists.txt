@@ -325,3 +325,6 @@ target_compile_definitions(data_depot PRIVATE
 # Links only libcurl; not part of the engine.
 add_executable(deepseek_probe tools/llm_probe/deepseek_concurrency.cpp)
 target_link_libraries(deepseek_probe PRIVATE ${ONION_CURL_TARGET} Threads::Threads)
+if(WIN32)
+  target_compile_definitions(deepseek_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
