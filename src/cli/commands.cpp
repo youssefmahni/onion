@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #endif
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -22,6 +23,7 @@
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
 #include "sync/sync.hpp"
+#include "store/checkpoint.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
 #include "platform/platform.hpp"
@@ -130,11 +132,23 @@ json state_json(onion::state::StateWriter& writer, int api_port,
   result["node"]["running"] = *running;
   result["node"]["api_port"] = api_port;
   result["spend_usd"] = writer.db().spend_usd(&error);
+  // Convergence observables: the applied vector and the Merkle root.
+  json vector = json::object();
+  for (const auto& [origin, seq] : writer.vector()) vector[origin] = seq;
+  result["vector"] = std::move(vector);
+  const auto all_nodes = writer.db().all_nodes(&error);
+  result["merkle_root"] = onion::store::merkle_root(all_nodes);
   json campaigns = json::array();
   for (const auto& campaign : writer.campaigns()) {
     json entry;
     entry["id"] = campaign.id;
     entry["state"] = campaign.state;
+    entry["reserved"] = writer.reserved_total(campaign.id);
+    json reserved_by_origin = json::object();
+    for (const auto& [origin, total] :
+         writer.reserved_by_origin(campaign.id))
+      reserved_by_origin[origin] = total;
+    entry["reserved_by_origin"] = std::move(reserved_by_origin);
     try {
       entry["spec"] = json::parse(campaign.spec);
     } catch (const std::exception&) {
@@ -221,6 +235,135 @@ int node_cmd(int argc, char** argv) {
     std::cout << "device_id=" << key->device_id << "\n"
               << "public_key=" << public_key_hex << "\n"
               << "slot=" << key->slot << "\n";
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "debug-state") {
+    // Read-only diagnostic dump: campaigns, open tickets with their lane
+    // owners, per-origin reserves, the applied vector and recent attempts.
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    const std::string members_path = flag(argc, argv, "--members", "");
+    std::vector<onion::sched::LaneMember> lane_members;
+    if (!members_path.empty()) {
+      std::ifstream members_file(members_path);
+      auto members_json = json::parse(members_file, nullptr, false);
+      if (members_json.is_array())
+        for (const auto& member : members_json)
+          if (member.contains("device_id"))
+            lane_members.push_back(
+                {member["device_id"].get<std::string>(),
+                 member.value("weight", 1.0)});
+    }
+    onion::store::Db db(dir / "onion.db");
+    std::string error;
+    if (!db.open(&error)) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    json out;
+    json campaigns = json::array();
+    for (const auto& campaign : db.campaigns(&error)) {
+      json entry;
+      entry["id"] = campaign.id;
+      entry["state"] = campaign.state;
+      try {
+        entry["spec"] = json::parse(campaign.spec);
+      } catch (const std::exception&) {
+        entry["spec"] = json::object();
+      }
+      // Open tickets for this campaign with their lane owners.
+      auto spec = onion::sched::parse_campaign(entry["spec"], &error);
+      if (spec) {
+        const auto nodes = db.all_nodes(&error);
+        std::vector<std::string> reviews;
+        for (const auto& review : db.open_reviews(&error))
+          if (review.state == "open" || review.state.empty())
+            reviews.push_back(review.path);
+        json tickets = json::array();
+        std::string t_error;
+        auto statement = db.prepare(
+            "SELECT path FROM settles;", &t_error);
+        std::set<std::string> settled;
+        if (statement) {
+          std::string step_error;
+          while (statement->step_row(&step_error))
+            settled.insert(statement->text(0));
+        }
+        for (const auto& ticket : onion::sched::order_tickets(
+                 nodes,
+                 [&](std::string_view path) { return settled.count(std::string(path)) > 0; },
+                 [](std::string_view) { return false; }, reviews, *spec)) {
+          json t;
+          t["path"] = ticket.path;
+          t["layer"] = ticket.layer;
+          const auto owner = onion::sched::lane_owner(ticket.path, lane_members);
+          t["owner"] = owner ? *owner : "none";
+          tickets.push_back(std::move(t));
+        }
+        entry["open_tickets"] = std::move(tickets);
+      }
+      campaigns.push_back(std::move(entry));
+    }
+    out["campaigns"] = std::move(campaigns);
+    // Per-origin RESERVE records, scanned from every oplog (read-only).
+    {
+      json reserves = json::object();
+      std::error_code ec;
+      const auto oplog = dir / "oplog";
+      if (std::filesystem::exists(oplog))
+        for (const auto& origin_dir :
+             std::filesystem::directory_iterator(oplog, ec)) {
+          if (!origin_dir.is_directory()) continue;
+          const std::string origin = origin_dir.path().filename().string();
+          json per_campaign = json::object();
+          for (const auto& file :
+               std::filesystem::directory_iterator(origin_dir.path(), ec)) {
+            if (!file.is_regular_file()) continue;
+            std::ifstream in(file.path(), std::ios::binary);
+            std::string line;
+            while (std::getline(in, line)) {
+              if (line.empty()) continue;
+              auto batch = json::parse(line, nullptr, false);
+              if (batch.is_discarded() || !batch.contains("recs")) continue;
+              for (const auto& record : batch["recs"]) {
+                if (record.value("t", std::string{}) != "RESERVE") continue;
+                const auto& p = record["p"];
+                const std::string campaign =
+                    p.value("campaign", std::string{});
+                per_campaign[campaign] =
+                    per_campaign.value(campaign, 0) +
+                    p.value("attempts", 0);
+              }
+            }
+          }
+          reserves[origin] = std::move(per_campaign);
+        }
+      out["reserves_by_origin"] = std::move(reserves);
+    }
+    {
+      json vector = json::object();
+      auto statement = db.prepare(
+          "SELECT origin, seq FROM applied ORDER BY origin;", &error);
+      if (statement) {
+        std::string step_error;
+        while (statement->step_row(&step_error))
+          vector[statement->text(0)] = statement->integer(1);
+      }
+      out["vector"] = std::move(vector);
+    }
+    {
+      auto statement = db.prepare(
+          "SELECT COUNT(*) FROM attempts WHERE hlc > "
+          "(CAST(strftime('%s','now') AS INTEGER) - 60) * 65536;",
+          &error);
+      if (statement) {
+        std::string step_error;
+        if (statement->step_row(&step_error))
+          out["attempts_last_60s"] = statement->integer(0);
+      }
+    }
+    out["settled_nodes"] = db.settles(&error).size();
+    out["merkle_root"] = onion::store::merkle_root(db.all_nodes(&error));
+    std::cout << out.dump() << "\n";
     return 0;
   }
   if (argc >= 3 && std::string(argv[2]) == "key") {
@@ -494,6 +637,11 @@ int node_cmd(int argc, char** argv) {
                 << " settled=" << result.settled
                 << " attempts=" << result.attempts
                 << " calls=" << result.calls << "\n";
+      // Exhausted and drained lanes are not finished (decision 0010): the
+      // loop sleeps instead of spinning until sync brings work or the
+      // fleet-wide close arrives.
+      if (result.end_reason == "budget" || result.end_reason == "drained")
+        worked = false;
       if (stop_flag.load()) break;
     }
     // Sync round every 15 s when the member list is present.

@@ -327,22 +327,6 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       result.end_reason = "stop rule";
       break;
     }
-    // A spent chunk asks for the next one; when nothing fits the fleet
-    // budget anymore, the campaign is over.
-    if (used_in_chunk >= current_chunk_size_) {
-      const std::int64_t reserved = writer.reserved_total(spec.id);
-      const std::int64_t take =
-          std::min(spec.chunk, spec.loop_budget - reserved);
-      if (take <= 0) {
-        result.end_reason = "budget";
-        break;
-      }
-      current_chunk_size_ = take;
-      used_in_chunk = 0;
-      writer.submit(state::CommitTerminal{{make_record(
-          "RESERVE", {{"campaign", spec.id}, {"attempts", take}})}});
-    }
-
     std::vector<Ticket> tickets = refresh_tickets();
     // M6: only the tickets whose home lane is this device are worked; the
     // rest stay for their owners.
@@ -358,8 +342,31 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     }
     if (tickets.empty() && waiting.empty()) cache_valid = false;
     if (tickets.empty() && waiting.empty()) {
-      result.end_reason = "drained";
+      // No work here. In fleet mode the campaign is over once the fleet
+      // budget is exhausted (the synced RESERVE records say so); otherwise
+      // the device waits for the next sync round to bring lane work.
+      if (!impl_->options.members.empty() &&
+          writer.reserved_total(spec.id) >= spec.loop_budget) {
+        result.end_reason = "budget";
+      } else {
+        result.end_reason = "drained";
+      }
       break;
+    }
+
+    // A spent chunk asks for the next one, only now that work exists.
+    if (used_in_chunk >= current_chunk_size_) {
+      const std::int64_t reserved = writer.reserved_total(spec.id);
+      const std::int64_t take =
+          std::min(spec.chunk, spec.loop_budget - reserved);
+      if (take <= 0) {
+        result.end_reason = "budget";
+        break;
+      }
+      current_chunk_size_ = take;
+      used_in_chunk = 0;
+      writer.submit(state::CommitTerminal{{make_record(
+          "RESERVE", {{"campaign", spec.id}, {"attempts", take}})}});
     }
 
     (void)0;
@@ -527,12 +534,12 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     impl_->options.budget.settle(*reservation, "0");
   }
 
-  // A campaign that finished by itself (stop rule, drained, budget) is
-  // closed: stop is final for the campaign record too. In fleet mode a
-  // drained lane is not a finished campaign — the device waits for sync
-  // to bring more of its lane (or the fleet-wide stop record).
+  // Only a real finish closes the campaign record (decision 0010): the
+  // stop rule, or a drain in single-device mode. Exhaustion ("budget")
+  // never closes it — open tickets resume if the budget is raised, and a
+  // drained fleet lane waits for sync.
   const bool fleet = !impl_->options.members.empty();
-  if (result.end_reason == "stop rule" || result.end_reason == "budget" ||
+  if (result.end_reason == "stop rule" ||
       (result.end_reason == "drained" && !fleet)) {
     writer.submit(state::CommitTerminal{{make_record(
         "CAMPAIGN", {{"id", spec.id},

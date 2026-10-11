@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Multi-process M6 test: three real node processes sync and converge.
 
-One node runs a campaign against the fake funnel server; the other two sync
-from it. After settling, all three stores must hold the same Merkle root
-(the campaign work) and the same node count.
+Deterministic: every device key comes from a fixed seed, so the HRW lanes
+are identical on every run. After the campaign's work finishes, the test
+waits for quiescence (no new records for three sync rounds), then asserts
+that every device sees the campaign finished (exhausted or stopped per
+decision 0010), the same settled count and the same Merkle root.
 """
 import json
 import os
@@ -17,24 +19,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FAKE_SERVER = str(ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py")
+HEALTHY_SCENARIO = str(ROOT / "tools" / "fake_deepseek" / "scenarios" / "healthy.json")
+
+HARD_DEADLINE_S = 120.0
+SYNC_ROUND_S = 15.0
 
 
-def wait_for(predicate, timeout=60.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+class DeadlineExceeded(Exception):
+    pass
+
+
+def seed_hex(base):
+    return "".join("%02x" % ((base + i) % 256) for i in range(32))
+
+
+def wait_for(predicate, timeout, deadline, what):
+    end = time.time() + timeout
+    while time.time() < end:
+        if time.time() > deadline:
+            raise DeadlineExceeded(what)
         if predicate():
             return True
         time.sleep(0.5)
     return False
 
 
-def wait_for_key(data_dir):
-    # Existence only: on Windows the key store holds a DPAPI-encrypted blob,
-    # so the file is binary and must not be read as text here.
-    def check():
-        return os.path.exists(os.path.join(data_dir, "keys", "device-key"))
-    if not wait_for(check):
-        raise RuntimeError("device key never appeared")
+def http_json(url, timeout=10):
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read())
 
 
 def run(binary, *args, check=True):
@@ -42,124 +54,157 @@ def run(binary, *args, check=True):
                           text=True)
 
 
-def http_json(url):
-    with urllib.request.urlopen(url, timeout=10) as response:
-        return json.loads(response.read())
+def node_state(port):
+    return http_json("http://127.0.0.1:%d/api/state" % port)
+
+
+def dump_debug_state(binary, data, members_path):
+    return run(binary, "node", "debug-state", "--data-dir", data,
+               "--members", members_path).stdout
 
 
 def main():
     binary = sys.argv[1]
+    started = time.time()
+    deadline = started + HARD_DEADLINE_S
     root = tempfile.mkdtemp(prefix="onion_mp_")
 
     fake = subprocess.Popen(
-        [sys.executable, FAKE_SERVER,
-         "--scenario", "tools/fake_deepseek/scenarios/healthy.json",
+        [sys.executable, FAKE_SERVER, "--scenario", HEALTHY_SCENARIO,
          "--record", os.path.join(root, "requests.jsonl"),
          "--port", "18101", "--funnel", "--funnel-max-depth", "3"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.7)
 
-    # Bootstrap: three data directories, one seed root per device.
     devices = {}
-    for index in (1, 2, 3):
-        data = os.path.join(root, f"d{index}")
-        os.makedirs(os.path.join(data, "keys"))
-        corpus = os.path.join(root, f"corpus{index}")
-        os.makedirs(corpus)
-        with open(os.path.join(corpus, "Onion - level_00.csv"), "w") as f:
-            f.write(f"code,title\nP0{index},Phase {index}\n")
-        run(binary, "dev-import", "--root", corpus, "--data-dir", data)
-
-        boot = subprocess.Popen(
-            [binary, "node", "run", "--data-dir", data,
-             "--base-url", "http://127.0.0.1:9", "--api-port",
-             str(18110 + index)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        wait_for_key(data)
-        boot.terminate()
-        boot.wait(timeout=10)
-
-        identity = run(binary, "node", "identity", "--data-dir", data).stdout
-        fields = dict(line.split("=", 1) for line in identity.strip().splitlines())
-        devices[index] = {"data": data, "device_id": fields["device_id"],
-                          "public_key": fields["public_key"]}
-
-    # members.json with all three devices; node 1 runs the campaign.
-    members = [
-        {"device_id": d["device_id"], "public_key": d["public_key"],
-         "url": "127.0.0.1:%d" % (18201 + i), "weight": 1.0}
-        for i, d in [(1, devices[1]), (2, devices[2]), (3, devices[3])]
-    ]
-    for index in (1, 2, 3):
-        with open(os.path.join(root, f"d{index}", "members.json"), "w") as f:
-            json.dump(members, f)
-
-    # A small loop budget closes the campaign fleet-wide (each device stops
-    # when its chunk reservations exhaust the budget); the stop rule needs
-    # 50 settled nodes per device, which lane splitting never reaches.
-    campaign = {"id": "mp1", "scope": ["P01", "P02", "P03"],
-                "loop_budget": 10, "mode": "breadth-first", "chunk": 50,
-                "model": "deepseek-flash"}
-    with open(os.path.join(root, "campaign.json"), "w") as f:
-        json.dump(campaign, f)
-    run(binary, "campaign", "start", os.path.join(root, "campaign.json"),
-        "--data-dir", devices[1]["data"], "--yes")
-
-    nodes = []
-    for index in (1, 2, 3):
-        data = devices[index]["data"]
-        nodes.append(subprocess.Popen(
-            [binary, "node", "run", "--data-dir", data,
-             "--base-url", "http://127.0.0.1:18101",
-             "--members", os.path.join(data, "members.json"),
-             "--host", "127.0.0.1",
-             "--sync-port", str(18201 + index),
-             "--api-port", str(18110 + index)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-
     try:
-        # The campaign's roots hash to home lanes across all three devices;
-        # wait until every node has stopped the campaign and at least one
-        # settled something.
-        def all_done():
+        for index in (1, 2, 3):
+            data = os.path.join(root, f"d{index}")
+            os.makedirs(os.path.join(data, "keys"))
+            corpus = os.path.join(root, f"corpus{index}")
+            os.makedirs(corpus)
+            with open(os.path.join(corpus, "Onion - level_00.csv"), "w") as f:
+                f.write(f"code,title\nP0{index},Phase {index}\n")
+            # Fixed seed: the device identity (and so the lanes) are the
+            # same on every run.
+            run(binary, "node", "key", "set", "device-key",
+                seed_hex(index * 16), "--data-dir", data)
+            run(binary, "genesis-import", "--root", corpus, "--data-dir", data)
+            identity = run(binary, "node", "identity", "--data-dir", data).stdout
+            fields = dict(line.split("=", 1)
+                          for line in identity.strip().splitlines())
+            devices[index] = {"data": data, "device_id": fields["device_id"],
+                              "public_key": fields["public_key"]}
+
+        members = [
+            {"device_id": devices[i]["device_id"],
+             "public_key": devices[i]["public_key"],
+             "url": "127.0.0.1:%d" % (18201 + i), "weight": 1.0}
+            for i in (1, 2, 3)
+        ]
+        for index in (1, 2, 3):
+            with open(os.path.join(root, f"d{index}", "members.json"), "w") as f:
+                json.dump(members, f)
+
+        campaign = {"id": "mp1", "scope": ["P01", "P02", "P03"],
+                    "loop_budget": 100, "mode": "breadth-first", "chunk": 50,
+                    "model": "deepseek-flash"}
+        with open(os.path.join(root, "campaign.json"), "w") as f:
+            json.dump(campaign, f)
+        run(binary, "campaign", "start", os.path.join(root, "campaign.json"),
+            "--data-dir", devices[1]["data"], "--yes")
+
+        nodes = []
+        for index in (1, 2, 3):
+            data = devices[index]["data"]
+            nodes.append(subprocess.Popen(
+                ["stdbuf", "-oL", "-eL", binary, "node", "run",
+                 "--data-dir", data, "--base-url", "http://127.0.0.1:18101",
+                 "--members", os.path.join(data, "members.json"),
+                 "--host", "127.0.0.1", "--sync-port", str(18201 + index),
+                 "--api-port", str(18110 + index)],
+                stdout=open(os.path.join(root, f"node{index}.log"), "w"),
+                stderr=subprocess.STDOUT))
+
+        # 1. Wait for the campaign to finish on every device (decision
+        #    0010: exhausted, i.e. its RESERVE fold reaches the budget, or
+        #    stopped — never a raw timer).
+        def finished_everywhere():
             try:
                 for index in (1, 2, 3):
-                    state = http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
+                    state = node_state(18110 + index)
                     campaigns = state.get("campaigns", [])
-                    if not any(c["state"] == "stopped" for c in campaigns):
+                    campaign_state = campaigns[0] if campaigns else None
+                    if campaign_state is None:
+                        return False
+                    if campaign_state["state"] == "stopped":
+                        continue
+                    budget = (campaign_state.get("spec") or {}).get(
+                        "loop_budget", 0)
+                    if campaign_state.get("reserved", 0) < budget:
                         return False
                 return True
             except Exception:
                 return False
-        if not wait_for(all_done, timeout=500):
-            for index in (1, 2, 3):
-                try:
-                    state = http_json(
-                        "http://127.0.0.1:%d/api/state" % (18110 + index))
-                    print("device %d state: %s" % (index, json.dumps(state)))
-                except Exception as exc:
-                    print("device %d unreachable: %s" % (index, exc))
+        if not wait_for(finished_everywhere, 90, deadline,
+                        "campaign never finished"):
             raise AssertionError("campaign never finished everywhere")
 
-        # Poll until every store converges on a non-zero settled count (the
-        # sync rounds spread the settles a few rounds after the stop).
-        def converged():
+        # 2. Quiescence: no node may write a new record for three sync
+        #    rounds, so the last batch has reached every replica.
+        def vector_signature():
+            signature = []
+            for index in (1, 2, 3):
+                state = node_state(18110 + index)
+                signature.append(tuple(sorted(state.get("vector", {}).items())))
+            return signature
+
+        previous = None
+        quiescent_rounds = 0
+        while quiescent_rounds < 3:
+            if time.time() > deadline:
+                raise DeadlineExceeded("quiescence")
+            time.sleep(SYNC_ROUND_S)
+            current = vector_signature()
+            if current == previous and previous is not None:
+                quiescent_rounds += 1
+            else:
+                quiescent_rounds = 0
+            previous = current
+
+        # 3. Convergence assertions.
+        states = [node_state(18110 + index) for index in (1, 2, 3)]
+        for index, state in enumerate(states, start=1):
+            campaigns = state.get("campaigns", [])
+            campaign_state = campaigns[0] if campaigns else {}
+            budget = (campaign_state.get("spec") or {}).get("loop_budget", 0)
+            finished = (campaign_state.get("state") == "stopped" or
+                        campaign_state.get("reserved", 0) >= budget)
+            assert finished, f"device {index} not finished: {campaign_state}"
+        settled = [state["settled_nodes"] for state in states]
+        assert max(settled) > 0, "nothing settled anywhere"
+        assert settled[0] == settled[1] == settled[2], settled
+        merkle = [state["merkle_root"] for state in states]
+        assert merkle[0] == merkle[1] == merkle[2], merkle
+        print("multi-process convergence: PASS settled=%s merkle=%s"
+              % (settled, merkle[0][:16]))
+    except (AssertionError, DeadlineExceeded) as error:
+        print("FAILED: %s" % error)
+        for index in (1, 2, 3):
+            data = devices.get(index, {}).get("data")
+            if not data:
+                continue
+            print("--- device %d debug-state ---" % index)
             try:
-                counts = [
-                    http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
-                    ["settled_nodes"]
-                    for index in (1, 2, 3)
-                ]
-                return max(counts) > 0 and counts[0] == counts[1] == counts[2]
-            except Exception:
-                return False
-        assert wait_for(converged, timeout=150), "the stores never converged"
-        counts = [
-            http_json("http://127.0.0.1:%d/api/state" % (18110 + index))
-            ["settled_nodes"]
-            for index in (1, 2, 3)
-        ]
-        print("multi-process convergence: PASS", counts)
+                print(dump_debug_state(
+                    binary, data, os.path.join(root, f"d{index}", "members.json")))
+            except Exception as exc:
+                print("unreachable: %s" % exc)
+            log_path = os.path.join(root, f"node{index}.log")
+            if os.path.exists(log_path):
+                print("--- device %d log tail ---" % index)
+                print(open(log_path).read()[-1500:])
+        raise
     finally:
         for node in nodes:
             node.terminate()

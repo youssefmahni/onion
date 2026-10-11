@@ -326,6 +326,10 @@ int SyncClient::run_round(std::string_view peer_base_url,
                           std::string* error) {
   int applied = 0;
   httplib::Client client(std::string(peer_base_url).c_str());
+  // A stalled peer must never block the node loop: bounded timeouts.
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
 
   // 1. Compare vectors.
   const std::string self = impl_->options.key->device_id;
@@ -383,10 +387,13 @@ int SyncClient::run_round(std::string_view peer_base_url,
       continue;
     }
 
-    // 4. Verify and append each batch.
+    // 4. Verify and append each batch, continuing the origin's LOCAL
+    //    chain (a mid-chain pull must link to the last batch we already
+    //    hold — starting empty only works for batch 1).
     std::istringstream in(log_response->body);
     std::string line;
-    std::string expected_prev;
+    std::string expected_prev =
+        impl_->options.writer.origin_prev_hash(origin).value_or("");
     std::int64_t expected_first = local_last + 1;
     while (std::getline(in, line)) {
       if (line.empty()) continue;
@@ -441,7 +448,9 @@ int SyncClient::run_round(std::string_view peer_base_url,
       }
       expected_prev = batch.hash;
       expected_first =
-          static_cast<std::int64_t>(batch.records.back().seq) + 1;
+          batch.records.empty()
+              ? expected_first
+              : static_cast<std::int64_t>(batch.records.back().seq) + 1;
 
       impl_->options.writer.submit(state::AppendForeign{std::move(batch)});
       applied++;

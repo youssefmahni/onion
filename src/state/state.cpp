@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #include <zstd.h>
@@ -267,31 +268,44 @@ void StateWriter::replay(std::string* error) {
   // write and the store update recovers exactly. With a device key, each
   // batch is verified against the chain; the first failing line is a torn
   // tail and is cut from the active segment.
-  std::vector<std::filesystem::path> sealed_files;
-  std::filesystem::path active_file;
+  // Walk every origin directory under oplog/ (the own origin and the
+  // synced copies), maintaining per-origin chains.
+  std::map<std::string, std::vector<std::filesystem::path>> sealed_by_origin;
+  std::map<std::string, std::filesystem::path> active_by_origin;
   std::error_code ec;
-  const std::filesystem::path dir = segments_->active_path().parent_path();
-  if (std::filesystem::exists(dir))
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-      if (!entry.is_regular_file()) continue;
-      if (entry.path().extension() == ".zst") sealed_files.push_back(entry.path());
-      else if (active_file.empty() || entry.path() > active_file)
-        active_file = entry.path();  // the newest raw segment wins
+  const std::filesystem::path oplog = segments_->active_path().parent_path().parent_path();
+  if (std::filesystem::exists(oplog))
+    for (const auto& origin_dir :
+         std::filesystem::directory_iterator(oplog, ec)) {
+      if (!origin_dir.is_directory()) continue;
+      const std::string origin = origin_dir.path().filename().string();
+      for (const auto& entry :
+           std::filesystem::directory_iterator(origin_dir.path(), ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == ".zst")
+          sealed_by_origin[origin].push_back(entry.path());
+        else if (active_by_origin[origin].empty() ||
+                 entry.path() > active_by_origin[origin])
+          active_by_origin[origin] = entry.path();
+      }
+      std::sort(sealed_by_origin[origin].begin(),
+                sealed_by_origin[origin].end());
     }
-  std::sort(sealed_files.begin(), sealed_files.end());
   if (std::getenv("ONION_REPLAY_DEBUG")) {
-    std::fprintf(stderr, "replay: sealed=%zu active=%s\n",
-                 sealed_files.size(), active_file.string().c_str());
+    std::fprintf(stderr, "replay: %zu origins\n", active_by_origin.size());
   }
 
-  std::int64_t expected_first = 1;
-  std::string expected_prev =
-      options_.device_key ? log::genesis_prev(*options_.device_key)
-                          : std::string{};
   std::vector<std::string> members{options_.origin};
-  std::uint64_t expected_batch = 1;
 
-  const auto process_line = [&](const std::string& line, std::string* line_error) {
+  // process_line verifies one batch against the per-origin chain. For the
+  // own origin the full Ed25519 check applies; foreign origins are
+  // chain-checked only (their keys arrive with M7 gossip — the batches
+  // were signature-verified when they were received).
+  const auto process_line = [&](const std::string& line,
+                                const std::string& origin,
+                                std::string& expected_prev,
+                                std::int64_t& expected_first,
+                                std::string* line_error) {
     auto batch_json = nlohmann::json::parse(line, nullptr, false);
     if (batch_json.is_discarded() || !batch_json.contains("recs")) {
       if (line_error) *line_error = "unparseable batch line";
@@ -312,7 +326,7 @@ void StateWriter::replay(std::string* error) {
       }
       batch.records.push_back(log::Record::from_json(record_json));
     }
-    if (options_.device_key) {
+    if (origin == options_.origin && options_.device_key) {
       log::VerifyContext context;
       context.version = 1;
       context.expected_prev = expected_prev;
@@ -326,10 +340,22 @@ void StateWriter::replay(std::string* error) {
                         std::to_string(static_cast<int>(verified)) + ")";
         return false;
       }
-    }
-    if (batch.number != expected_batch && options_.device_key) {
-      if (line_error) *line_error = "batch number gap";
-      return false;
+    } else {
+      // Chain-only checks: hash, contiguity, and the prev link (skipped
+      // for the unknown batch 1 of a foreign origin).
+      if (batch.hash != log::hash_records_hex(batch.records)) {
+        if (line_error) *line_error = "bad hash";
+        return false;
+      }
+      if (!batch.records.empty() &&
+          batch.records.front().seq != expected_first) {
+        if (line_error) *line_error = "gap";
+        return false;
+      }
+      if (batch.number > 1 && batch.prev != expected_prev) {
+        if (line_error) *line_error = "bad prev";
+        return false;
+      }
     }
     for (const log::Record& record : batch.records) {
       if (record.seq >= static_cast<std::int64_t>(next_seq_))
@@ -338,62 +364,93 @@ void StateWriter::replay(std::string* error) {
     }
     update_applied(batch.origin, batch.records);
     applied_since_checkpoint_ += batch.records.size();
-    next_batch_ = batch.number + 1;
-    expected_batch = batch.number + 1;
+    if (origin == options_.origin) {
+      next_batch_ = batch.number + 1;
+      prev_hash_ = batch.hash;
+    }
     expected_prev = batch.hash;
-    expected_first = static_cast<std::int64_t>(next_seq_.load());
-    prev_hash_ = batch.hash;
+    expected_first =
+        batch.records.empty()
+            ? expected_first
+            : static_cast<std::int64_t>(batch.records.back().seq) + 1;
+    {
+      std::unique_lock chain_lock(chain_mutex_);
+      origin_prev_hashes_[origin] = batch.hash;
+    }
     return true;
   };
 
-  for (const auto& file : sealed_files) {
-    const std::string content = decompress_segment(file);
-    if (content.empty()) {
-      if (error) *error = "cannot decompress sealed segment " + file.string();
-      return;
-    }
-    std::istringstream in(content);
-    std::string line;
-    while (std::getline(in, line)) {
-      if (line.empty()) continue;
-      std::string line_error;
-      if (!process_line(line, &line_error)) {
-        if (error)
-          *error = "sealed segment " + file.string() +
-                   " failed verification: " + line_error +
-                   " (corruption, not a torn tail)";
-        return;
-      }
-    }
-  }
+  const auto origins = [&]() {
+    std::set<std::string> all;
+    for (const auto& [origin, files] : sealed_by_origin) all.insert(origin);
+    for (const auto& [origin, file] : active_by_origin) all.insert(origin);
+    return all;
+  }();
 
-  if (!active_file.empty()) {
-    std::ifstream in(active_file, std::ios::binary);
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(in, line)) lines.push_back(line);
-    in.close();
-    std::size_t good = 0;
-    for (; good < lines.size(); ++good) {
-      if (lines[good].empty()) {
-        good++;
-        continue;
+  for (const std::string& origin : origins) {
+    // One chain per origin: sealed segments first, then the active one,
+    // sharing the same expected_prev / expected_first.
+    std::string expected_prev =
+        origin == options_.origin && options_.device_key
+            ? log::genesis_prev(*options_.device_key)
+            : std::string{};
+    std::int64_t expected_first = 1;
+
+    auto sealed = sealed_by_origin.find(origin);
+    if (sealed != sealed_by_origin.end()) {
+      for (const auto& file : sealed->second) {
+        const std::string content = decompress_segment(file);
+        if (content.empty()) {
+          if (error)
+            *error = "cannot decompress sealed segment " + file.string();
+          return;
+        }
+        std::istringstream in(content);
+        std::string line;
+        while (std::getline(in, line)) {
+          if (line.empty()) continue;
+          std::string line_error;
+          if (!process_line(line, origin, expected_prev, expected_first,
+                            &line_error)) {
+            if (error)
+              *error = "sealed segment " + file.string() +
+                       " failed verification: " + line_error +
+                       " (corruption, not a torn tail)";
+            return;
+          }
+        }
       }
-      std::string line_error;
-      if (!process_line(lines[good], &line_error)) break;
     }
-    // A failing tail line is a torn tail: cut it (and anything after).
-    if (good < lines.size()) {
-      std::uint64_t keep = 0;
-      for (std::size_t i = 0; i < good; ++i) keep += lines[i].size() + 1;
-      std::filesystem::resize_file(active_file, keep, ec);
-      if (ec) {
-        if (error) *error = "cannot cut torn tail: " + ec.message();
-        return;
+
+    auto active = active_by_origin.find(origin);
+    if (active != active_by_origin.end()) {
+      const std::filesystem::path& active_file = active->second;
+      std::ifstream in(active_file, std::ios::binary);
+      std::vector<std::string> lines;
+      std::string line;
+      while (std::getline(in, line)) lines.push_back(line);
+      in.close();
+      std::size_t good = 0;
+      for (; good < lines.size(); ++good) {
+        if (lines[good].empty()) continue;
+        std::string line_error;
+        if (!process_line(lines[good], origin, expected_prev, expected_first,
+                          &line_error))
+          break;
       }
-      std::fprintf(stderr,
-                   "state writer: cut a torn tail of %zu batch(es) from %s\n",
-                   lines.size() - good, active_file.string().c_str());
+      // A failing tail line is a torn tail: cut it (and anything after).
+      if (good < lines.size()) {
+        std::uint64_t keep = 0;
+        for (std::size_t i = 0; i < good; ++i) keep += lines[i].size() + 1;
+        std::filesystem::resize_file(active_file, keep, ec);
+        if (ec) {
+          if (error) *error = "cannot cut torn tail: " + ec.message();
+          return;
+        }
+        std::fprintf(stderr,
+                     "state writer: cut a torn tail of %zu batch(es) from %s\n",
+                     lines.size() - good, active_file.string().c_str());
+      }
     }
   }
   rebuild_index();
@@ -415,6 +472,7 @@ void StateWriter::rebuild_index() {
   for (const store::Campaign& campaign : db_.campaigns(&error))
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
   reserved_by_campaign_.clear();
+  reserved_by_origin_campaign_.clear();
   seen_reserve_keys_.clear();
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
@@ -477,8 +535,10 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     const std::int64_t attempts = payload.value("attempts", std::int64_t{0});
     const std::string key = origin + ":" + std::to_string(record.hlc);
     std::unique_lock lock(index_mutex_);
-    if (seen_reserve_keys_.insert(key).second)
+    if (seen_reserve_keys_.insert(key).second) {
       reserved_by_campaign_[campaign] += attempts;
+      reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
+    }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
     auto statement = db_.prepare(
@@ -669,6 +729,10 @@ void StateWriter::run() {
         for (const log::Record& record : command.foreign.records)
           fold(record, command.foreign.origin, &error);
         update_applied(command.foreign.origin, command.foreign.records);
+        {
+          std::unique_lock chain_lock(chain_mutex_);
+          origin_prev_hashes_[command.foreign.origin] = command.foreign.hash;
+        }
         break;
       }
       case Command::Kind::Import: {
@@ -827,6 +891,27 @@ std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
   std::shared_lock lock(index_mutex_);
   const auto found = reserved_by_campaign_.find(std::string(campaign));
   return found == reserved_by_campaign_.end() ? 0 : found->second;
+}
+
+std::optional<std::string> StateWriter::origin_prev_hash(
+    std::string_view origin) const {
+  std::shared_lock chain_lock(chain_mutex_);
+  const auto found = origin_prev_hashes_.find(std::string(origin));
+  if (found == origin_prev_hashes_.end()) return std::nullopt;
+  return found->second;
+}
+
+std::map<std::string, std::int64_t> StateWriter::reserved_by_origin(
+    std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  std::map<std::string, std::int64_t> result;
+  const std::string suffix = "|" + std::string(campaign);
+  for (const auto& [key, total] : reserved_by_origin_campaign_) {
+    if (key.size() >= suffix.size() &&
+        key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
+      result[key.substr(0, key.size() - suffix.size())] = total;
+  }
+  return result;
 }
 
 std::uint64_t StateWriter::next_seq() const { return next_seq_.load(); }

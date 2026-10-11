@@ -99,6 +99,9 @@ class StateWriter {
 
   // The applied vector (origin -> last record seq).
   std::map<std::string, std::int64_t> vector() const;
+  // The head hash of an origin's local chain (empty when nothing is known;
+  // batch 1 then chains from the genesis public-key hash).
+  std::optional<std::string> origin_prev_hash(std::string_view origin) const;
   // Read side (any thread; WAL reads plus a shared index).
   const store::Db& db() const;
   log::Segments& segments();
@@ -109,6 +112,9 @@ class StateWriter {
   // Fleet-wide RESERVE totals per campaign (folded from every synced log,
   // replay-safe and deduplicated by origin + hlc).
   std::int64_t reserved_total(std::string_view campaign) const;
+  // Per-origin RESERVE totals for one campaign, for diagnostics.
+  std::map<std::string, std::int64_t> reserved_by_origin(
+      std::string_view campaign) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
@@ -128,6 +134,9 @@ class StateWriter {
   void update_applied(std::string_view origin,
                       const std::vector<log::Record>& records);
   std::map<std::string, std::unique_ptr<log::Segments>> foreign_segments_;
+  // Per-origin chain heads (own origin included) for sync continuation.
+  mutable std::shared_mutex chain_mutex_;
+  std::map<std::string, std::string> origin_prev_hashes_;
   void fold(const log::Record& record, std::string_view batch_origin,
             std::string* error);
   void rebuild_index();
@@ -165,6 +174,7 @@ class StateWriter {
   std::unordered_set<std::string> review_paths_;  // needs_review, state open
   std::vector<CampaignInfo> campaigns_;
   std::map<std::string, std::int64_t> reserved_by_campaign_;
+  std::map<std::string, std::int64_t> reserved_by_origin_campaign_;  // origin|campaign
   std::unordered_set<std::string> seen_reserve_keys_;  // origin:hlc
 };
 
