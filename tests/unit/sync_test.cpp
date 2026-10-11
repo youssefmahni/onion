@@ -104,23 +104,37 @@ class SyncTest : public ::testing::Test {
 
 TEST_F(SyncTest, RequestSignatureRoundTripAndRejections) {
   Ed25519Signer signer(*key_a_);
-  const std::string signature = sign_request(key_a_->device_id, "GET",
-                                             "/sync/v1/vector", "body", 1000,
-                                             signer);
+  const std::string nonce = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+  const std::string signature = sign_request(
+      key_a_->device_id, "GET", "/sync/v1/vector", "body", nonce, 1000,
+      signer);
   EXPECT_TRUE(request_signature_valid(key_a_->device_id, "GET",
-                                      "/sync/v1/vector", "body", signature,
-                                      key_a_->public_key, 1000, 1000));
+                                      "/sync/v1/vector", "body", nonce,
+                                      signature, key_a_->public_key, 1000,
+                                      1000));
+  // The nonce is part of the signed bytes: any change breaks the check.
+  EXPECT_FALSE(request_signature_valid(key_a_->device_id, "GET",
+                                       "/sync/v1/vector", "body", "deadbeef",
+                                       signature, key_a_->public_key, 1000,
+                                       1000));
+  // Missing nonce.
+  EXPECT_FALSE(request_signature_valid(key_a_->device_id, "GET",
+                                       "/sync/v1/vector", "body", "",
+                                       signature, key_a_->public_key, 1000,
+                                       1000));
   // Stale timestamp.
   EXPECT_FALSE(request_signature_valid(key_a_->device_id, "GET",
-                                       "/sync/v1/vector", "body", signature,
-                                       key_a_->public_key, 1000, 2000));
+                                       "/sync/v1/vector", "body", nonce,
+                                       signature, key_a_->public_key, 1000,
+                                       2000));
   // Wrong public key.
   EXPECT_FALSE(request_signature_valid(key_a_->device_id, "GET",
-                                       "/sync/v1/vector", "body", signature,
-                                       key_b_->public_key, 1000, 1000));
+                                       "/sync/v1/vector", "body", nonce,
+                                       signature, key_b_->public_key, 1000,
+                                       1000));
   // Tampered body.
   EXPECT_FALSE(request_signature_valid(key_a_->device_id, "GET",
-                                       "/sync/v1/vector", "tampered",
+                                       "/sync/v1/vector", "tampered", nonce,
                                        signature, key_a_->public_key, 1000,
                                        1000));
 }
@@ -330,14 +344,15 @@ TEST(SyncGolden, FixedKeyAndRequestGiveFixedSignatureOnEveryOS) {
       "000102030405060708090a0b0c0d0e0f"
       "101112131415161718191a1b1c1d1e1f");
   onion::log::Ed25519Signer signer(key);
+  const std::string nonce = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
   const std::string signature = onion::sync::sign_request(
-      key.device_id, "GET", "/sync/v1/vector", "", 1700000000, signer);
+      key.device_id, "GET", "/sync/v1/vector", "", nonce, 1700000000,
+      signer);
   EXPECT_EQ(key.device_id, "9d24e2eeaf27c2a0");
   EXPECT_EQ(signature.size(), 128u);
   EXPECT_TRUE(onion::sync::request_signature_valid(
-      key.device_id, "GET", "/sync/v1/vector", "", signature,
+      key.device_id, "GET", "/sync/v1/vector", "", nonce, signature,
       key.public_key, 1700000000, 1700000000));
   // The exact pinned bytes:
-  EXPECT_EQ(signature,
-            "a95f84b38c90acfcf19ec1b37e39cbed2b5b4dbc1f41c5bf8667a92c81da63d2a9309209a557abe17d5dac3ca63c410ebaa35f5c47ea0d46ec5b793b40822908");
+  EXPECT_EQ(signature, "e6b2f03b22e37545bad7b7399c3a70d9125357b473bb5e81564bc685f7c7a16650a77d36ad123e2acda972ac5cdf8fdd3de616b35987201360e62fa85cd9e00c");
 }

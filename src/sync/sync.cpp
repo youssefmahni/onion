@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <thread>
 
@@ -22,12 +23,14 @@ namespace {
 
 std::string signed_bytes(std::string_view device_id, std::string_view method,
                          std::string_view path, std::string_view body,
+                         std::string_view nonce,
                          std::int64_t timestamp_s) {
   std::ostringstream out;
   out << device_id << '\n'
       << method << '\n'
       << path << '\n'
       << onion::log::blake2b_hex(body) << '\n'
+      << nonce << '\n'
       << timestamp_s;
   return out.str();
 }
@@ -43,10 +46,10 @@ std::int64_t now_s() {
 // rejected request: compare Linux vs macOS byte for byte.
 std::string signed_bytes_hex(std::string_view device_id,
                              std::string_view method, std::string_view path,
-                             std::string_view body,
+                             std::string_view body, std::string_view nonce,
                              std::int64_t timestamp_s) {
-  const std::string bytes = signed_bytes(device_id, method, path, body,
-                                         timestamp_s);
+  const std::string bytes =
+      signed_bytes(device_id, method, path, body, nonce, timestamp_s);
   static const char* digits = "0123456789abcdef";
   std::string hex;
   hex.reserve(bytes.size() * 2);
@@ -61,19 +64,22 @@ std::string signed_bytes_hex(std::string_view device_id,
 
 std::string sign_request(std::string_view device_id, std::string_view method,
                          std::string_view path, std::string_view body,
-                         std::int64_t timestamp_s, log::Signer& signer) {
-  return signer.sign(signed_bytes(device_id, method, path, body, timestamp_s));
+                         std::string_view nonce, std::int64_t timestamp_s,
+                         log::Signer& signer) {
+  return signer.sign(
+      signed_bytes(device_id, method, path, body, nonce, timestamp_s));
 }
 
-bool request_signature_valid(std::string_view device_id,
-                             std::string_view method, std::string_view path,
-                             std::string_view body, std::string_view signature,
-                             const std::vector<std::uint8_t>& public_key,
-                             std::int64_t timestamp_s, std::int64_t now_s) {
+bool request_signature_valid(
+    std::string_view device_id, std::string_view method,
+    std::string_view path, std::string_view body, std::string_view nonce,
+    std::string_view signature, const std::vector<std::uint8_t>& public_key,
+    std::int64_t timestamp_s, std::int64_t now_s) {
   if (public_key.size() != 32) return false;
+  if (nonce.empty() || nonce.size() > 64) return false;
   if (timestamp_s < now_s - 60 || timestamp_s > now_s + 60) return false;
   const std::string message =
-      signed_bytes(device_id, method, path, body, timestamp_s);
+      signed_bytes(device_id, method, path, body, nonce, timestamp_s);
   const std::vector<std::uint8_t> signature_bytes =
       [] (std::string_view hex) {
         std::vector<std::uint8_t> raw;
@@ -98,8 +104,8 @@ bool request_signature_valid(std::string_view device_id,
 }
 
 bool NonceCache::seen_and_add(std::string_view device_id,
-                              std::string_view signature, std::int64_t now_s) {
-  const std::string key = std::string(device_id) + ":" + std::string(signature);
+                              std::string_view nonce, std::int64_t now_s) {
+  const std::string key = std::string(device_id) + ":" + std::string(nonce);
   const std::int64_t window = now_s / 60;
   // Prune old windows.
   for (auto it = seen_.begin(); it != seen_.end();)
@@ -151,18 +157,20 @@ bool SyncServer::start(std::string* error) {
     const std::string device_id = request.get_header_value("X-Onion-Device");
     const std::string timestamp = request.get_header_value("X-Onion-Time");
     const std::string signature = request.get_header_value("X-Onion-Sig");
+    const std::string nonce = request.get_header_value("X-Onion-Nonce");
     const auto reject = [&](const char* reason) -> const MemberKey* {
       if (std::getenv("ONION_SYNC_DEBUG"))
         std::fprintf(stderr,
                      "[sync-auth] REJECT %s: device=%s ts-header=%s "
-                     "sig-header=%s target=%s body-hash=%s now=%lld "
-                     "signed-bytes-hex=%s\n",
+                     "sig-header=%s nonce-header=%s target=%s body-hash=%s "
+                     "now=%lld signed-bytes-hex=%s\n",
                      reason, device_id.c_str(), timestamp.c_str(),
-                     signature.c_str(), request.target.c_str(),
+                     signature.c_str(), nonce.c_str(),
+                     request.target.c_str(),
                      onion::log::blake2b_hex(request.body).c_str(),
                      static_cast<long long>(now_s()),
                      signed_bytes_hex(device_id, "GET", request.target,
-                                      request.body,
+                                      request.body, nonce,
                                       std::atoll(timestamp.c_str()))
                          .c_str());
       response.status = 401;
@@ -171,7 +179,8 @@ bool SyncServer::start(std::string* error) {
                            "application/json");
       return nullptr;
     };
-    if (device_id.empty() || timestamp.empty() || signature.empty())
+    if (device_id.empty() || timestamp.empty() || signature.empty() ||
+        nonce.empty())
       return reject("missing auth header");
     const MemberKey* member = find_member(impl_->options.members, device_id);
     if (!member) return reject("unknown device");
@@ -179,9 +188,10 @@ bool SyncServer::start(std::string* error) {
     // The signature covers the full target (path + query); httplib keeps
     // the query only in request.target.
     if (!request_signature_valid(device_id, "GET", request.target, request.body,
-                                 signature, member->public_key, ts, now_s()))
+                                 nonce, signature, member->public_key, ts,
+                                 now_s()))
       return reject("bad signature");
-    if (impl_->nonces.seen_and_add(device_id, signature, now_s()))
+    if (impl_->nonces.seen_and_add(device_id, nonce, now_s()))
       return reject("replayed nonce");
     return member;
   };
@@ -366,17 +376,30 @@ int SyncClient::run_round(std::string_view peer_base_url,
   const std::int64_t ts = now_s();
   log::Ed25519Signer signer(*impl_->options.key);
   auto request_headers = [&](std::string_view path) {
-    const std::string signature = sign_request(self, "GET", path, "", ts, signer);
+    // A fresh random nonce per ATTEMPT: a transport retry signs a new
+    // nonce, so the anti-replay cache never rejects a legitimate retry
+    // (the macOS 401 root cause: httplib retried with the same bytes).
+    std::random_device entropy;
+    std::mt19937_64 generator(entropy());
+    std::uniform_int_distribution<std::uint64_t> distribution;
+    std::ostringstream nonce_stream;
+    nonce_stream << std::hex << distribution(generator)
+                 << distribution(generator);
+    const std::string nonce = nonce_stream.str();
+    const std::string signature =
+        sign_request(self, "GET", path, "", nonce, ts, signer);
     if (std::getenv("ONION_SYNC_DEBUG"))
       std::fprintf(stderr,
-                   "[sync-client] device=%s path=%s ts=%lld body-hash=%s "
-                   "sig=%s signed-bytes-hex=%s\n",
+                   "[sync-client] device=%s path=%s ts=%lld nonce=%s "
+                   "body-hash=%s sig=%s signed-bytes-hex=%s\n",
                    self.c_str(), std::string(path).c_str(),
-                   static_cast<long long>(ts),
+                   static_cast<long long>(ts), nonce.c_str(),
                    onion::log::blake2b_hex("").c_str(), signature.c_str(),
-                   signed_bytes_hex(self, "GET", path, "", ts).c_str());
+                   signed_bytes_hex(self, "GET", path, "", nonce, ts)
+                       .c_str());
     return httplib::Headers{{"X-Onion-Device", self},
                             {"X-Onion-Time", std::to_string(ts)},
+                            {"X-Onion-Nonce", nonce},
                             {"X-Onion-Sig", signature}};
   };
   auto response = client.Get("/sync/v1/vector",
