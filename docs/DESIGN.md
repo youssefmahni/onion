@@ -568,7 +568,7 @@ requests do not count), not the median, because the real measurements show
 that past the provider's peak the median barely moves while throughput falls
 and p99 nearly triples.
 
-- **Ramp.** From the starting limit, or after a backoff or hold, the limit
+- **Ramp.** From the starting limit, or after a backoff, the limit
   multiplies by 1.25 per window while goodput keeps rising at least 5% per
   increase, up to the ceiling.
 - **Plateau.** An increase that fails to raise goodput by 5% is undone: the

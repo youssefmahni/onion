@@ -44,11 +44,13 @@ unchanged.
    state: the step-back plays the role of a revert, so the ramp cannot blindly
    re-increase into the danger zone, and the plateau probe keeps tracking
    capacity recovery. While the p95 stays above the threshold the guard keeps
-   stepping down, one ×0.9 per non-hold window.
+   stepping down, one ×0.9 per window; once the p95 recovers, the hold passes
+   before the plateau counter starts.
 4. **Plateau probe.** After 10 consecutive plateau windows, one probe window
    at min(ceiling, ⌊limit × 1.1⌋): if G rose at least 5% over the plateau's
-   entry signal, adopt the probed limit and resume ramping; otherwise return
-   to the plateau limit and restart the counter.
+   entry signal, adopt the probed limit and the ramp resumes with the next
+   window's unassessed increase; otherwise return to the plateau limit and
+   restart the counter.
 5. **Ramp.** The first successful window after the starting limit or a backoff
    performs an unassessed increase. After any increase, the next successful
    window assesses it: if G ≥ 1.05 × G at the moment of the increase, increase
