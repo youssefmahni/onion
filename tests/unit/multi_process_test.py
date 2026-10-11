@@ -120,7 +120,7 @@ def main():
         for index in (1, 2, 3):
             data = devices[index]["data"]
             nodes.append(subprocess.Popen(
-                ["stdbuf", "-oL", "-eL", binary, "node", "run",
+                [binary, "node", "run",
                  "--data-dir", data, "--base-url", "http://127.0.0.1:18101",
                  "--members", os.path.join(data, "members.json"),
                  "--host", "127.0.0.1", "--sync-port", str(18201 + index),
