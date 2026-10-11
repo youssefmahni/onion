@@ -88,14 +88,9 @@ TEST(DataDirTest, EnvironmentPrecedence) {
 }
 TEST_F(PlatformTest, KeyStoreRoundTripsAndRejectsTraversal) {
   onion::platform::KeyStore store(root_ / "keys");
-#ifdef __APPLE__
-  // The Keychain backend needs an unlocked login keychain; hosted runners
-  // have none, so the round trip is validated on real Macs (OA-12).
-  if (!store.put("device.key", "secret"))
-    GTEST_SKIP() << "no usable Keychain on this runner";
-  EXPECT_EQ(store.get("device.key"), std::optional<std::string>("secret"));
-  EXPECT_FALSE(store.put("../outside", "bad"));
-#else
+  // The 0600 file is the source of truth on every OS (macOS included:
+  // the keychain is only a migration fallback, so no unlocked login
+  // keychain is needed — this test runs everywhere, no skip).
   ASSERT_TRUE(store.put("device.key", "secret"));
   EXPECT_EQ(store.get("device.key"), std::optional<std::string>("secret"));
   EXPECT_FALSE(store.put("../outside", "bad"));
@@ -107,7 +102,6 @@ TEST_F(PlatformTest, KeyStoreRoundTripsAndRejectsTraversal) {
   EXPECT_EQ(key.st_mode & 0777, 0600);
   ASSERT_EQ(::chmod((root_ / "keys" / "device.key").c_str(), 0644), 0);
   EXPECT_FALSE(store.get("device.key"));
-#endif
 #endif
 }
 TEST(PlatformSampleTest, OSValuesArePresent) {
@@ -131,3 +125,54 @@ TEST(PlatformFileLimits, RaisesMacOSSoftLimitToAtLeast4096) {
 }
 #endif
 }  // namespace
+
+TEST(PlatformUdpTest, LoopbackSendAndRecv) {
+  onion::platform::UdpSocket a;
+  onion::platform::UdpSocket b;
+  std::string error;
+  ASSERT_TRUE(a.bind(0, &error)) << error;
+  ASSERT_TRUE(b.bind(0, &error)) << error;
+  const auto a_port = a.port();
+  const auto b_port = b.port();
+  ASSERT_TRUE(a_port.has_value());
+  ASSERT_TRUE(b_port.has_value());
+  ASSERT_NE(*a_port, *b_port);
+
+  const std::string ping = R"({"t":"ping","from":"dev-a","seq":1})";
+  ASSERT_TRUE(a.send("127.0.0.1", *b_port, ping));
+  // Loopback delivery can lag a loaded runner: wait bounded, then read.
+  std::optional<onion::platform::UdpSocket::Datagram> datagram;
+  for (int attempt = 0; attempt < 200 && !datagram; attempt++) {
+    datagram = b.recv();
+    if (!datagram)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(datagram.has_value());
+  EXPECT_EQ(datagram->bytes, ping);
+  EXPECT_EQ(datagram->from_address, "127.0.0.1");
+
+  // And back the other way.
+  const std::string ack = R"({"t":"ack","from":"dev-b","seq":1})";
+  ASSERT_TRUE(b.send("127.0.0.1", *a_port, ack));
+  std::optional<onion::platform::UdpSocket::Datagram> reply;
+  for (int attempt = 0; attempt < 200 && !reply; attempt++) {
+    reply = a.recv();
+    if (!reply)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(reply.has_value());
+  EXPECT_EQ(reply->bytes, ack);
+  // An empty socket polls clean.
+  EXPECT_FALSE(b.recv().has_value());
+}
+
+TEST(PlatformUdpTest, MulticastJoinFailsGracefullyWithoutTheGroup) {
+  onion::platform::UdpSocket socket;
+  std::string error;
+  ASSERT_TRUE(socket.bind(0, &error)) << error;
+  // Whether the host can join the group depends on the environment
+  // (containers often lack multicast); either way the call must not
+  // crash and must report a reason on failure.
+  if (!socket.join_group("239.255.77.31", &error))
+    EXPECT_FALSE(error.empty());
+}

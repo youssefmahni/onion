@@ -5,6 +5,7 @@
 #include <string>
 
 #include "log/log.hpp"
+#include "log/invite.hpp"
 
 namespace {
 
@@ -402,3 +403,87 @@ TEST(EvictionValid, LoneMemberSignatureIsRejected) {
   record.payload["sigs"] = json::array({signer_a.sign(admin_bytes)});
   EXPECT_FALSE(onion::log::eviction_valid(record, members, pub(key_admin)));
 }
+
+namespace {
+TEST(InviteToken, RoundTrip) {
+  const auto inviter = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  onion::log::Ed25519Signer signer(inviter);
+  const auto invitee = onion::log::DeviceKey::from_seed_hex(
+      "202122232425262728292a2b2c2d2e2f"
+      "303132333435363738393a3b3c3d3e3f");
+  std::string pubkey_hex;
+  for (const std::uint8_t byte : invitee.public_key) {
+    pubkey_hex += "0123456789abcdef"[byte >> 4];
+    pubkey_hex += "0123456789abcdef"[byte & 0x0f];
+  }
+
+  const std::int64_t now = 1'700'000'000;
+  const auto token = onion::log::issue_invite(
+      pubkey_hex, inviter.device_id, 3600, "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      now, signer);
+  EXPECT_EQ(token.expires_at_s, now + 3600);
+
+  std::string error;
+  const auto parsed = onion::log::parse_invite(
+      onion::log::invite_to_string(token), now + 100, inviter.public_key,
+      &error);
+  ASSERT_TRUE(parsed.has_value()) << error;
+  EXPECT_EQ(parsed->pubkey_hex, pubkey_hex);
+  EXPECT_EQ(parsed->nonce, "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+
+  EXPECT_FALSE(onion::log::parse_invite(onion::log::invite_to_string(token),
+                                        now + 3601, inviter.public_key,
+                                        &error)
+                   .has_value());
+  EXPECT_FALSE(onion::log::parse_invite(onion::log::invite_to_string(token),
+                                        now + 100, invitee.public_key,
+                                        &error)
+                   .has_value());
+  nlohmann::json tampered =
+      nlohmann::json::parse(onion::log::invite_to_string(token));
+  tampered["nonce"] = "deadbeefdeadbeefdeadbeefdeadbeef";
+  EXPECT_FALSE(onion::log::parse_invite(tampered.dump(), now + 100,
+                                        inviter.public_key, &error)
+                   .has_value());
+  EXPECT_FALSE(onion::log::parse_invite("{nope", now, inviter.public_key,
+                                        &error)
+                   .has_value());
+  // Expiry at exactly expires_at_s rejects (the inviter checks the token
+  // on its own clock; no cross-machine grace window).
+  EXPECT_FALSE(onion::log::parse_invite(onion::log::invite_to_string(token),
+                                        now + 3600, inviter.public_key,
+                                        &error)
+                   .has_value());
+  // A token with extra fields still verifies: the signature covers the
+  // rebuilt canonical payload, not the received bytes.
+  nlohmann::json with_extras =
+      nlohmann::json::parse(onion::log::invite_to_string(token));
+  with_extras["comment"] = "ignored";
+  EXPECT_TRUE(onion::log::parse_invite(with_extras.dump(), now + 100,
+                                       inviter.public_key, &error)
+                  .has_value());
+  // Odd-length nonce: two distinct strings must never decode identically.
+  nlohmann::json odd = nlohmann::json::parse(onion::log::invite_to_string(token));
+  odd["nonce"] = "abc";  // 1.5 bytes of hex
+  EXPECT_FALSE(onion::log::parse_invite(odd.dump(), now + 100,
+                                        inviter.public_key, &error)
+                   .has_value());
+}
+
+TEST(InviteToken, TtlParsesShorthands) {
+  std::string error;
+  EXPECT_EQ(onion::log::parse_ttl("24h", &error), 86400);
+  EXPECT_EQ(onion::log::parse_ttl("30m", &error), 1800);
+  EXPECT_EQ(onion::log::parse_ttl("1d", &error), 86400);
+  EXPECT_EQ(onion::log::parse_ttl("90", &error), 90);
+  EXPECT_FALSE(onion::log::parse_ttl("", &error).has_value());
+  EXPECT_FALSE(onion::log::parse_ttl("h", &error).has_value());
+  EXPECT_FALSE(onion::log::parse_ttl("-5h", &error).has_value());
+  EXPECT_FALSE(onion::log::parse_ttl("0", &error).has_value());
+  EXPECT_FALSE(onion::log::parse_ttl("9999999999999h", &error).has_value());
+  EXPECT_FALSE(onion::log::parse_ttl("+5", &error).has_value());
+  EXPECT_EQ(onion::log::parse_ttl(" 5 ", &error), 5);
+}
+}  // namespace

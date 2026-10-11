@@ -78,7 +78,7 @@ endif()
 onion_add_compiled_module(platform src/platform/platform.cpp)
 if(WIN32)
   # platform is static, so consumers must receive the Windows API import libs.
-  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi)
+  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi ws2_32)
   target_compile_definitions(platform PRIVATE
     _WIN32_WINNT=0x0A00
     NOMINMAX
@@ -129,7 +129,7 @@ set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
 
 # Data layer
-onion_add_compiled_module(log src/log/log.cpp)
+onion_add_compiled_module(log src/log/log.cpp src/log/invite.cpp)
 target_include_directories(log PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)
@@ -183,12 +183,11 @@ target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion:
 if(WIN32)
   target_link_libraries(sync PUBLIC ws2_32)
 endif()
-onion_add_module(swim)
+onion_add_compiled_module(swim src/swim/membership.cpp src/swim/swim.cpp src/swim/udp_transport.cpp src/swim/beacon.cpp)
+target_link_libraries(swim PUBLIC nlohmann_json::nlohmann_json onion::core onion::platform onion::log)
 onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
 target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onion::log onion::llm)
-
-target_link_libraries(swim INTERFACE onion::core onion::platform)
 
 # Engine layer
 onion_add_compiled_module(gate src/gate/gate.cpp)
@@ -275,6 +274,10 @@ if(BUILD_TESTING)
   target_link_libraries(onion_profile_test PRIVATE onion::profile GTest::gtest_main)
   gtest_discover_tests(onion_profile_test)
 
+  add_executable(onion_swim_test tests/unit/swim_test.cpp)
+  target_link_libraries(onion_swim_test PRIVATE onion::swim GTest::gtest_main)
+  gtest_discover_tests(onion_swim_test)
+
   add_executable(onion_sync_test tests/unit/sync_test.cpp)
   target_link_libraries(onion_sync_test PRIVATE onion::sync GTest::gtest_main)
   gtest_discover_tests(onion_sync_test)
@@ -341,7 +344,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 

@@ -19,25 +19,30 @@ namespace onion::sync {
 inline constexpr std::string_view component_name{"sync"};
 
 // Signed sync requests (DESIGN › Sync protocol › Request auth): an Ed25519
-// signature over method ‖ path ‖ body-hash ‖ timestamp, valid for ±60 s,
-// with a per-key nonce cache so a replay in the window is dropped.
+// signature over device ‖ method ‖ path ‖ body-hash ‖ nonce ‖ timestamp,
+// valid for ±60 s, with a per-key nonce cache so a replayed nonce in the
+// window is dropped. The nonce is a fresh random hex value PER REQUEST
+// ATTEMPT (not per round): a legitimate transport retry signs a new nonce,
+// while a replayed request carries a seen nonce and is rejected.
 std::string sign_request(std::string_view device_id, std::string_view method,
                          std::string_view path, std::string_view body,
-                         std::int64_t timestamp_s, log::Signer& signer);
+                         std::string_view nonce, std::int64_t timestamp_s,
+                         log::Signer& signer);
 
 // Pure signature check (no cache): the bytes signed are the canonical
-// concatenation method + '\n' + path + '\n' + body_hash + '\n' + timestamp.
-bool request_signature_valid(std::string_view device_id,
-                             std::string_view method, std::string_view path,
-                             std::string_view body, std::string_view signature,
-                             const std::vector<std::uint8_t>& public_key,
-                             std::int64_t timestamp_s, std::int64_t now_s);
+// concatenation device '\n' method '\n' path '\n' body_hash '\n'
+// nonce '\n' timestamp.
+bool request_signature_valid(
+    std::string_view device_id, std::string_view method,
+    std::string_view path, std::string_view body, std::string_view nonce,
+    std::string_view signature, const std::vector<std::uint8_t>& public_key,
+    std::int64_t timestamp_s, std::int64_t now_s);
 
-// Sliding nonce cache: a (device_id, signature) pair is accepted once per
+// Sliding nonce cache: a (device_id, nonce) pair is accepted once per
 // 60-second window; older entries are pruned.
 class NonceCache {
  public:
-  bool seen_and_add(std::string_view device_id, std::string_view signature,
+  bool seen_and_add(std::string_view device_id, std::string_view nonce,
                     std::int64_t now_s);
 
  private:

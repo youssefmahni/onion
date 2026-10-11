@@ -28,6 +28,11 @@
 #include <unistd.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <cstring>
 #if defined(__APPLE__)
 #include <limits.h>
 #include <mach/mach.h>
@@ -446,20 +451,27 @@ std::optional<std::string> KeyStore::get(std::string_view name) const {
   if (!valid_name(name)) return std::nullopt;
 #if defined(__APPLE__)
   {
-    auto keychain = security_tool({"find-generic-password", "-s", "onion", "-a",
-                                   std::string(name), "-w"},
-                                  true);
-    if (keychain) return keychain;
-  }
-  {
+    // The 0600 file is the source of truth (deterministic, permission
+    // checked): the shared login keychain on CI runners survives across
+    // jobs and machines, and parallel nodes on one machine collide on the
+    // same service/account item — reading it first silently returned
+    // another device's key (the macOS BadSig root cause). When the file
+    // exists it is authoritative: bad permissions or an unreadable file
+    // fail CLOSED (the keychain must never bypass the permission gate).
+    // The keychain is consulted only when the file is absent — a
+    // migration fallback for installs that predate the file.
     struct stat status{};
     const auto path = directory_ / std::string(name);
-    if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0)
-      return std::nullopt;
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return std::nullopt;
-    return std::string((std::istreambuf_iterator<char>(file)), {});
+    if (::stat(path.c_str(), &status) == 0) {
+      if ((status.st_mode & 0077) != 0) return std::nullopt;
+      std::ifstream file(path, std::ios::binary);
+      if (!file) return std::nullopt;
+      return std::string((std::istreambuf_iterator<char>(file)), {});
+    }
   }
+  return security_tool({"find-generic-password", "-s", "onion", "-a",
+                        std::string(name), "-w"},
+                       true);
 #elif defined(_WIN32)
   std::ifstream file(directory_ / std::string(name), std::ios::binary);
   if (!file) return std::nullopt;
@@ -564,3 +576,250 @@ std::optional<double> link_speed_mbps() {
 }
 
 }  // namespace onion::platform
+
+// ---------------------------------------------------------------------------
+// UdpSocket (SWIM gossip + LAN beacon)
+// ---------------------------------------------------------------------------
+
+namespace onion::platform {
+
+namespace {
+
+#ifdef _WIN32
+void ensure_winsock() {
+  static bool initialized = [] {
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  }();
+  (void)initialized;
+}
+
+std::string last_socket_error() {
+  const int code = WSAGetLastError();
+  return "winsock error " + std::to_string(code);
+}
+#else
+std::string last_socket_error() { return std::strerror(errno); }
+
+// Fill the sockaddr for an IPv4 host string; returns false on garbage.
+bool ipv4_sockaddr(const std::string& address, std::uint16_t port,
+                   sockaddr_in* out, std::string* error) {
+  sockaddr_in target{};
+  target.sin_family = AF_INET;
+  target.sin_port = htons(port);
+  if (inet_pton(AF_INET, address.c_str(), &target.sin_addr) == 1) {
+    *out = target;
+    return true;
+  }
+  // Not a literal address: resolve as a host name.
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  addrinfo* result = nullptr;
+  if (getaddrinfo(address.c_str(), nullptr, &hints, &result) != 0 ||
+      result == nullptr) {
+    if (error) *error = "unresolvable address: " + address;
+    return false;
+  }
+  target.sin_addr =
+      reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr;
+  freeaddrinfo(result);
+  *out = target;
+  return true;
+}
+#endif
+
+}  // namespace
+
+UdpSocket::UdpSocket() = default;
+
+void UdpSocket::close() {
+#ifdef _WIN32
+  if (socket_ != INVALID_SOCKET) {
+    closesocket(socket_);
+    socket_ = INVALID_SOCKET;
+  }
+#else
+  if (socket_ >= 0) {
+    ::close(socket_);
+    socket_ = -1;
+  }
+#endif
+}
+
+UdpSocket::~UdpSocket() { close(); }
+
+UdpSocket::UdpSocket(UdpSocket&& other) noexcept : socket_(other.socket_) {
+#ifdef _WIN32
+  other.socket_ = INVALID_SOCKET;
+#else
+  other.socket_ = -1;
+#endif
+}
+
+UdpSocket& UdpSocket::operator=(UdpSocket&& other) noexcept {
+  if (this != &other) {
+    close();
+    socket_ = other.socket_;
+#ifdef _WIN32
+    other.socket_ = INVALID_SOCKET;
+#else
+    other.socket_ = -1;
+#endif
+  }
+  return *this;
+}
+
+bool UdpSocket::bind(std::uint16_t port, std::string* error) {
+  close();  // a re-bind replaces any previous socket
+#ifdef _WIN32
+  ensure_winsock();
+  socket_ = static_cast<std::uintptr_t>(
+      ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+  if (socket_ == INVALID_SOCKET) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  u_long nonblocking = 1;
+  if (::ioctlsocket(socket_, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+    if (error) *error = last_socket_error();
+    close();
+    return false;
+  }
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = htonl(INADDR_ANY);
+  local.sin_port = htons(port);
+  if (::bind(socket_, reinterpret_cast<sockaddr*>(&local),
+             sizeof(local)) == SOCKET_ERROR) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  return true;
+#else
+  socket_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (socket_ < 0) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  // Non-blocking so the node loop can poll between ticks.
+  const int flags = ::fcntl(socket_, F_GETFL, 0);
+  ::fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = htonl(INADDR_ANY);
+  local.sin_port = htons(port);
+  if (::bind(socket_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) !=
+      0) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  return true;
+#endif
+}
+
+bool UdpSocket::join_group(const std::string& group, std::string* error) {
+#ifdef _WIN32
+  ip_mreq membership{};
+  membership.imr_multiaddr.s_addr = ::inet_addr(group.c_str());
+  membership.imr_interface.s_addr = htonl(INADDR_ANY);
+  if (::setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&membership),
+                   sizeof(membership)) == SOCKET_ERROR) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  return true;
+#else
+#if defined(__linux__)
+  ip_mreqn membership{};
+  membership.imr_multiaddr.s_addr = ::inet_addr(group.c_str());
+  membership.imr_address.s_addr = htonl(INADDR_ANY);
+  membership.imr_ifindex = 0;
+#else
+  // macOS and other BSDs only define ip_mreq (whose interface field is
+  // imr_interface, not ip_mreqn's imr_address).
+  ip_mreq membership{};
+  membership.imr_multiaddr.s_addr = ::inet_addr(group.c_str());
+  membership.imr_interface.s_addr = htonl(INADDR_ANY);
+#endif
+  if (::setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership,
+                   sizeof(membership)) != 0) {
+    if (error) *error = last_socket_error();
+    return false;
+  }
+  return true;
+#endif
+}
+
+bool UdpSocket::send(const std::string& address, std::uint16_t port,
+                     std::string_view bytes) {
+#ifdef _WIN32
+  sockaddr_in target{};
+  target.sin_family = AF_INET;
+  target.sin_port = htons(port);
+  target.sin_addr.s_addr = ::inet_addr(address.c_str());
+  if (target.sin_addr.s_addr == INADDR_NONE) return false;
+  return ::sendto(socket_, bytes.data(), static_cast<int>(bytes.size()), 0,
+                  reinterpret_cast<sockaddr*>(&target), sizeof(target)) !=
+         SOCKET_ERROR;
+#else
+  sockaddr_in target{};
+  std::string resolve_error;
+  if (!ipv4_sockaddr(address, port, &target, &resolve_error)) return false;
+  // Datagrams are atomic: sendto either queues the whole datagram or
+  // fails; a partial send never happens for SOCK_DGRAM.
+  const ssize_t sent =
+      ::sendto(socket_, bytes.data(), bytes.size(), 0,
+               reinterpret_cast<sockaddr*>(&target), sizeof(target));
+  return sent == static_cast<ssize_t>(bytes.size());
+#endif
+}
+
+std::optional<std::uint16_t> UdpSocket::port() const {
+#ifdef _WIN32
+  sockaddr_in local{};
+  int length = sizeof(local);
+  if (::getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &length) ==
+      SOCKET_ERROR)
+    return std::nullopt;
+#else
+  sockaddr_in local{};
+  socklen_t length = sizeof(local);
+  if (::getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &length) !=
+      0)
+    return std::nullopt;
+#endif
+  return ntohs(local.sin_port);
+}
+
+std::optional<UdpSocket::Datagram> UdpSocket::recv() {
+  char buffer[65536];
+#ifdef _WIN32
+  sockaddr_in from{};
+  int from_length = sizeof(from);
+  const int received =
+      ::recvfrom(socket_, buffer, sizeof(buffer), 0,
+                 reinterpret_cast<sockaddr*>(&from), &from_length);
+  if (received == SOCKET_ERROR) return std::nullopt;
+  Datagram datagram;
+  datagram.from_address = ::inet_ntoa(from.sin_addr);
+  datagram.bytes.assign(buffer, static_cast<std::size_t>(received));
+  return datagram;
+#else
+  sockaddr_in from{};
+  socklen_t from_length = sizeof(from);
+  const ssize_t received =
+      ::recvfrom(socket_, buffer, sizeof(buffer), 0,
+                 reinterpret_cast<sockaddr*>(&from), &from_length);
+  if (received < 0) return std::nullopt;  // EAGAIN/EWOULDBLOCK or an error
+  Datagram datagram;
+  char host[INET_ADDRSTRLEN]{};
+  ::inet_ntop(AF_INET, &from.sin_addr, host, sizeof(host));
+  datagram.from_address = host;
+  datagram.bytes.assign(buffer, static_cast<std::size_t>(received));
+  return datagram;
+#endif
+}
+
+}  // namespace onion::platform (udp)

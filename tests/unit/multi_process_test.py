@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import platform
 import urllib.request
 from pathlib import Path
 
@@ -68,19 +67,7 @@ def dump_debug_state(binary, data, members_path):
 
 def main():
     binary = sys.argv[1]
-    # OA-13: on the hosted macOS arm64 CI runners every sync round is
-    # rejected with 401 by the signed-request authenticate() — diagnosed in
-    # WORKLOG.md, revisited in M7. The skip is scoped to those runners only
-    # (real Macs and other platforms keep running the test), is recorded as
-    # SKIPPED (exit 77, not a pass), and can be overridden to reproduce the
-    # failure with ONION_MP_ALLOW_MACOS=1.
-    if (sys.platform == "darwin" and platform.machine() == "arm64"
-            and os.environ.get("GITHUB_ACTIONS")
-            and not os.environ.get("ONION_MP_ALLOW_MACOS")):
-        print("SKIP (OA-13): macOS arm64 CI signed-request auth fails "
-              "(401 on every sync round); tracked in docs/agent/WORKLOG.md "
-              "and OWNER_ACTIONS.md, revisited in M7")
-        sys.exit(77)
+    started = time.time()
     started = time.time()
     deadline = started + HARD_DEADLINE_S
     root = tempfile.mkdtemp(prefix="onion_mp_")
@@ -88,9 +75,10 @@ def main():
     fake = subprocess.Popen(
         [sys.executable, FAKE_SERVER, "--scenario", HEALTHY_SCENARIO,
          "--record", os.path.join(root, "requests.jsonl"),
-         "--port", "18101", "--funnel", "--funnel-max-depth", "3"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.7)
+         "--port", "0", "--funnel", "--funnel-max-depth", "3"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    fake_port = int(fake.stdout.readline().strip())
+    assert fake_port > 0, "fake server did not report its port"
 
     devices = {}
     try:
@@ -119,7 +107,7 @@ def main():
         members = [
             {"device_id": devices[i]["device_id"],
              "public_key": devices[i]["public_key"],
-             "url": "127.0.0.1:%d" % (18201 + i), "weight": 1.0}
+             "weight": 1.0}
             for i in (1, 2, 3)
         ]
         for index in (1, 2, 3):
@@ -139,13 +127,37 @@ def main():
             data = devices[index]["data"]
             nodes.append(subprocess.Popen(
                 [binary, "node", "run",
-                 "--data-dir", data, "--base-url", "http://127.0.0.1:18101",
+                 "--data-dir", data,
+                 "--base-url", "http://127.0.0.1:%d" % fake_port,
                  "--members", os.path.join(data, "members.json"),
-                 "--host", "127.0.0.1", "--sync-port", str(18201 + index),
-                 "--api-port", str(18110 + index)],
+                 "--host", "127.0.0.1", "--sync-port", "0",
+                 "--api-port", "0", "--swim-port", "0",
+                 "--port-file", os.path.join(root, f"port{index}.json")],
                 stdout=open(os.path.join(root, f"node{index}.log"), "w"),
                 stderr=subprocess.STDOUT,
                 env=dict(os.environ, ONION_SYNC_DEBUG="1")))
+
+        # Read each node's REAL bound ports (bind-0 + port files: no fixed
+        # ports anywhere, so parallel runs never collide), then fill the
+        # peer urls into members.json — the nodes reload it on mtime
+        # change and the sync rounds begin.
+        ports = {}
+        for index in (1, 2, 3):
+            port_file = os.path.join(root, f"port{index}.json")
+            end = time.time() + 30
+            while not os.path.exists(port_file) and time.time() < end:
+                time.sleep(0.2)
+            assert os.path.exists(port_file), \
+                "node %d never wrote its port file" % index
+            with open(port_file) as f:
+                ports[index] = json.load(f)
+            assert ports[index]["sync"] > 0 and ports[index]["api"] > 0
+        for i, index in enumerate((1, 2, 3), start=1):
+            members[i - 1]["url"] = "127.0.0.1:%d" % ports[index]["sync"]
+        for index in (1, 2, 3):
+            with open(os.path.join(devices[index]["data"], "members.json"),
+                      "w") as f:
+                json.dump(members, f)
 
         # 1. Wait for the campaign to finish on every device (decision
         #    0010: exhausted, i.e. its RESERVE fold reaches the budget, or
@@ -153,7 +165,7 @@ def main():
         def finished_everywhere():
             try:
                 for index in (1, 2, 3):
-                    state = node_state(18110 + index)
+                    state = node_state(ports[index]["api"])
                     campaigns = state.get("campaigns", [])
                     campaign_state = campaigns[0] if campaigns else None
                     if campaign_state is None:
@@ -174,11 +186,13 @@ def main():
             raise AssertionError("campaign never finished everywhere")
 
         # 2. Quiescence: no node may write a new record for three sync
-        #    rounds, so the last batch has reached every replica.
+        #    rounds, so the last batch has reached every replica. A
+        #    transient HTTP error on a loaded machine must not kill the
+        #    run: this round simply does not count.
         def vector_signature():
             signature = []
             for index in (1, 2, 3):
-                state = node_state(18110 + index)
+                state = node_state(ports[index]["api"])
                 signature.append(tuple(sorted(state.get("vector", {}).items())))
             return signature
 
@@ -188,7 +202,16 @@ def main():
             if time.time() > deadline:
                 raise DeadlineExceeded("quiescence")
             time.sleep(SYNC_ROUND_S)
-            current = vector_signature()
+            try:
+                current = vector_signature()
+            except (urllib.error.URLError, OSError,
+                    json.JSONDecodeError):
+                # A transient HTTP/parse error on a loaded machine: this
+                # round simply does not count. A persistently dead node
+                # keeps resetting until DeadlineExceeded fires.
+                quiescent_rounds = 0
+                previous = None
+                continue
             if current == previous and previous is not None:
                 quiescent_rounds += 1
             else:
@@ -196,7 +219,7 @@ def main():
             previous = current
 
         # 3. Convergence assertions.
-        states = [node_state(18110 + index) for index in (1, 2, 3)]
+        states = [node_state(ports[index]["api"]) for index in (1, 2, 3)]
         for index, state in enumerate(states, start=1):
             campaigns = state.get("campaigns", [])
             campaign_state = campaigns[0] if campaigns else {}
