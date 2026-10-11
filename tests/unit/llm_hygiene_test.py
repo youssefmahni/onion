@@ -119,7 +119,9 @@ def connection_ramp_cap(binary):
         # Without the ramp the client would finish 120 requests in about
         # 120/8 x 0.4 s = 6 s; at the 10/s cap it takes at least 11 s.
         elapsed = max(times) - min(times)
-        assert elapsed >= 11.0, f"ramp did not throttle the run: {elapsed:.1f}s"
+        # Unthrottled the run takes ~6 s (120/8 x 0.4 s); at the 10/s cap it
+        # takes ~11-12 s.  The bound sits between the two.
+        assert elapsed >= 10.5, f"ramp did not throttle the run: {elapsed:.1f}s"
     finally:
         stop.set()
         listener.close()

@@ -17,7 +17,7 @@
       "until_requests": 100
     },
     {
-      "tail_when_in_flight_above": 1,
+      "tail_when_in_flight_above": 0,
       "tail_probability": 0.9,
       "tail_extra_ms": 1000
     }
