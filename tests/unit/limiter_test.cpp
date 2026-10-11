@@ -132,6 +132,20 @@ TEST(Limiter, TailGuardNeedsTwiceTheBaselineP95) {
   EXPECT_EQ(limiter.limit(), 25);
 }
 
+TEST(Limiter, TailGuardHoldPassesBeforePlateauCountingResumes) {
+  onion::llm::Limiter limiter(16, 2000, 1.0);
+  limiter.on_window(ok(160, 1.0, 1.0));  // anchor + increase to 20
+  limiter.on_window(ok(200, 1.0, 2.2));  // guard: 18, hold 1, plateau
+  limiter.on_window(ok(200, 1.0, 1.0));  // recovered: the hold window passes,
+  EXPECT_EQ(limiter.limit(), 18);        // no plateau counting yet
+  limiter.on_window(ok(200, 1.0, 1.0));  // first plateau window
+  EXPECT_EQ(limiter.limit(), 18);
+  // The plateau counter restarts from the guard, so the next probe fires only
+  // after ten counted windows — not before.
+  for (int i = 0; i < 8; ++i) limiter.on_window(ok(200, 1.0, 1.0));
+  EXPECT_EQ(limiter.limit(), 18);  // nine counted windows: no probe yet
+}
+
 TEST(Limiter, HalvesOnRateLimitAndHoldsOneWindow) {
   onion::llm::Limiter limiter(16, 2000, 1.0);
   limiter.on_window(ok(160));  // anchor + increase to 20

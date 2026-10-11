@@ -12,7 +12,7 @@ constexpr double kGoodputRiseThreshold = 1.05;
 constexpr double kTailGuardP95Ratio = 2.0;
 constexpr double kEwmaAlpha = 0.5;
 constexpr int kPlateauProbeInterval = 10;
-constexpr int kBackoffHoldWindows = 1;
+constexpr int kOneWindowHold = 1;
 constexpr int kRevertHoldWindows = 2;
 
 bool pressure(const LimitWindow& window) {
@@ -58,7 +58,7 @@ void Limiter::on_window(const LimitWindow& window) {
     limit_ = press ? std::max(1, pre_probe_limit_ / 2) : pre_probe_limit_;
     probe_active_ = false;
     if (press) {
-      hold_windows_ = kBackoffHoldWindows;
+      hold_windows_ = kOneWindowHold;
       reset_ramp_state();
     }
     return;
@@ -76,7 +76,7 @@ void Limiter::on_window(const LimitWindow& window) {
   // limit and hold one window.
   if (press) {
     limit_ = std::max(1, limit_ / 2);
-    hold_windows_ = kBackoffHoldWindows;
+    hold_windows_ = kOneWindowHold;
     reset_ramp_state();
     return;
   }
@@ -101,7 +101,7 @@ void Limiter::on_window(const LimitWindow& window) {
   // the hold passes before the plateau counter starts.
   if (baseline_p95_s_ && window.p95_latency_s > kTailGuardP95Ratio * *baseline_p95_s_) {
     limit_ = std::max(1, static_cast<int>(limit_ * kTailGuardFactor));
-    hold_windows_ = kBackoffHoldWindows;
+    hold_windows_ = kOneWindowHold;
     reset_ramp_state();
     enter_plateau_now();
     return;
