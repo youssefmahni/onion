@@ -41,31 +41,42 @@ int limiter_trace(int argc, char** argv) {
     std::cerr << "limiter-trace requires --scenario healthy|rate_limited|slow_under_load\n";
     return 2;
   }
-  onion::llm::Limiter limiter(16, 2000);
+  onion::llm::Limiter limiter(16, 2000, 30.0);
   // Compressed trace: a handful of real 30-second windows, then the hourly
   // probe at t=3600 and its aftermath.  The limit is never reset between
   // samples, so every row is the exact limiter state for that window.
+  // The modeled provider is utilization-bound: goodput scales with the limit
+  // used, except that `slow_under_load` caps the goodput once the limit
+  // passes the provider's plateau (16 x 40 tokens per window).
   std::vector<std::uint64_t> starts{0, 30, 60, 90, 120, 150, 3600, 3630, 3660};
   if (csv)
-    std::cout << "window_start_s,window_end_s,limit_used,probe,rate_limited,median_latency_s,limit_after\n";
+    std::cout << "window_start_s,window_end_s,limit_used,probe,rate_limited,"
+                 "median_latency_s,p95_latency_s,out_tokens,limit_after\n";
   for (const auto started_at_s : starts) {
     const int before = limiter.limit();
     const int used = limiter.begin_window(started_at_s);
     onion::llm::LimitWindow window;
     window.ended_at_s = started_at_s + 30;
     window.calls = static_cast<std::size_t>(used);
+    std::uint64_t out = static_cast<std::uint64_t>(used) * 40;
+    if (scenario == "slow_under_load" && started_at_s >= 30 && started_at_s < 3600)
+      out = 16 * 40;
+    window.completed_out_tokens = out;
     window.median_latency_s = 0.1;
+    window.p95_latency_s = 1.0;
     if (scenario == "rate_limited" && started_at_s == 60) window.rate_limited = 1;
-    if (scenario == "slow_under_load" && started_at_s >= 30 && started_at_s < 3600) window.median_latency_s = 0.2;
     limiter.on_window(window);
     if (csv) {
       std::cout << started_at_s << "," << started_at_s + 30 << "," << used << ","
                 << (used != before ? "1" : "0") << "," << window.rate_limited << ","
-                << window.median_latency_s << "," << limiter.limit() << "\n";
+                << window.median_latency_s << "," << window.p95_latency_s << ","
+                << out << "," << limiter.limit() << "\n";
     } else {
       std::cout << "window_s=" << started_at_s << " used_limit=" << used
                 << " rate_limited=" << window.rate_limited
                 << " median_latency_s=" << window.median_latency_s
+                << " p95_latency_s=" << window.p95_latency_s
+                << " out_tokens=" << out
                 << " next_limit=" << limiter.limit() << "\n";
     }
   }
@@ -230,15 +241,24 @@ int adaptive_bench(int argc, char** argv) {
     onion::llm::LimitWindow stats;
     stats.ended_at_s = window_start + 30;
     stats.calls = results.size();
+    std::vector<double> latencies;
     for (const auto& result : results) {
       if (result.kind == onion::llm::Kind::RateLimited) ++stats.rate_limited;
       if (result.kind == onion::llm::Kind::ServerError) ++stats.server_errors;
       if (result.kind == onion::llm::Kind::Timeout) ++stats.timeouts;
+      if (result.kind == onion::llm::Kind::Transport) ++stats.connect_failures;
+      if (result.kind == onion::llm::Kind::Ok) {
+        stats.completed_out_tokens += result.out;
+        latencies.push_back(result.latency_s);
+      }
     }
-    std::vector<double> latencies;
-    for (const auto& result : results) latencies.push_back(result.latency_s);
     std::sort(latencies.begin(), latencies.end());
-    if (!latencies.empty()) stats.median_latency_s = latencies[latencies.size() / 2];
+    const auto percentile = [&](double fraction) {
+      return latencies.empty() ? 0.0
+          : latencies[static_cast<std::size_t>((latencies.size() - 1) * fraction)];
+    };
+    stats.median_latency_s = latencies.empty() ? 0.0 : percentile(.50);
+    stats.p95_latency_s = latencies.empty() ? 0.0 : percentile(.95);
     limiter.on_window(stats);
     report(window, used, std::move(results));
     window_start += 30;
