@@ -6,16 +6,12 @@ import argparse
 import json
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[2]
-SERVER = ROOT / "tools" / "fake_deepseek" / "fake_deepseek.py"
-SCENARIO = ROOT / "tools" / "fake_deepseek" / "scenarios" / "healthy.json"
+from fake_server_harness import fake_server
 
 
 def run_probe(binary, url, *extra):
@@ -36,42 +32,26 @@ def summary(output, key):
 def dns_one_lookup_per_host(binary):
     """The shared DNS cache plus the test resolver memo: one lookup for 100
     requests to the same host."""
-    with tempfile.TemporaryDirectory() as temporary:
-        record = Path(temporary) / "requests.jsonl"
-        server = subprocess.Popen(
-            [sys.executable, str(SERVER), "--scenario", str(SCENARIO), "--record", str(record), "--port", "0"],
-            stdout=subprocess.PIPE, text=True)
-        try:
-            port = int(server.stdout.readline().strip())
-            completed = run_probe(binary, f"http://localhost:{port}",
-                                  "--test-resolver", "--requests", "100")
-            assert completed.returncode == 0, completed.stderr
-            assert completion_ok(completed.stdout, 100), completed.stdout
-            assert summary(completed.stdout, "dns_lookups") == 1, completed.stdout
-        finally:
-            server.terminate()
-            server.wait(timeout=10)
+    with fake_server("healthy.json") as url:
+        port = int(url.rsplit(":", 1)[1])
+        completed = run_probe(binary, f"http://localhost:{port}",
+                              "--test-resolver", "--requests", "100")
+        assert completed.returncode == 0, completed.stderr
+        assert completion_ok(completed.stdout, 100), completed.stdout
+        assert summary(completed.stdout, "dns_lookups") == 1, completed.stdout
 
 
 def resolver_failures_are_transport(binary):
     """A failing resolution is a Transport outcome and does not hit the wire."""
-    with tempfile.TemporaryDirectory() as temporary:
-        record = Path(temporary) / "requests.jsonl"
-        server = subprocess.Popen(
-            [sys.executable, str(SERVER), "--scenario", str(SCENARIO), "--record", str(record), "--port", "0"],
-            stdout=subprocess.PIPE, text=True)
-        try:
-            port = int(server.stdout.readline().strip())
-            completed = run_probe(binary, f"http://localhost:{port}",
-                                  "--test-resolver", "--resolver-fail-first", "3", "--requests", "50")
-            assert completed.returncode == 0, completed.stderr
-            assert completed.stdout.count(" kind=1 ") == 3, completed.stdout
-            assert completion_ok(completed.stdout, 47), completed.stdout
-            # Three failed lookups plus the one successful resolution.
-            assert summary(completed.stdout, "dns_lookups") == 4, completed.stdout
-        finally:
-            server.terminate()
-            server.wait(timeout=10)
+    with fake_server("healthy.json") as url:
+        port = int(url.rsplit(":", 1)[1])
+        completed = run_probe(binary, f"http://localhost:{port}",
+                              "--test-resolver", "--resolver-fail-first", "3", "--requests", "50")
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.count(" kind=1 ") == 3, completed.stdout
+        assert completion_ok(completed.stdout, 47), completed.stdout
+        # Three failed lookups plus the one successful resolution.
+        assert summary(completed.stdout, "dns_lookups") == 4, completed.stdout
 
 
 def connection_ramp_cap(binary):
@@ -147,21 +127,13 @@ def connection_ramp_cap(binary):
 
 def connection_reuse(binary):
     """Keep-alive responses reuse connections: 100 requests open a handful."""
-    with tempfile.TemporaryDirectory() as temporary:
-        record = Path(temporary) / "requests.jsonl"
-        server = subprocess.Popen(
-            [sys.executable, str(SERVER), "--scenario", str(SCENARIO), "--record", str(record), "--port", "0"],
-            stdout=subprocess.PIPE, text=True)
-        try:
-            port = int(server.stdout.readline().strip())
-            completed = run_probe(binary, f"http://127.0.0.1:{port}", "--requests", "100")
-            assert completed.returncode == 0, completed.stderr
-            assert completion_ok(completed.stdout, 100), completed.stdout
-            opened = summary(completed.stdout, "connections_opened")
-            assert opened <= 10, f"expected reuse, opened {opened} connections"
-        finally:
-            server.terminate()
-            server.wait(timeout=10)
+    with fake_server("healthy.json") as url:
+        port = int(url.rsplit(":", 1)[1])
+        completed = run_probe(binary, f"http://127.0.0.1:{port}", "--requests", "100")
+        assert completed.returncode == 0, completed.stderr
+        assert completion_ok(completed.stdout, 100), completed.stdout
+        opened = summary(completed.stdout, "connections_opened")
+        assert opened <= 10, f"expected reuse, opened {opened} connections"
 
 
 def main():

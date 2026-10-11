@@ -67,8 +67,9 @@ unchanged.
    that does not change the limit (ceiling reached) ends ramping: hold at the
    ceiling, no revert.
 6. **Revert.** If the assessment fails, return to the pre-increase limit, hold
-   two windows, then start counting plateau windows (the plateau's entry
-   signal is G at the revert).
+   two windows, then start counting plateau windows (the plateau's reference
+   starts at the revert window's goodput and is refreshed on each plateau
+   window — see rule 4).
 
 **Holds.** A hold counts down one per non-idle window and blocks all
 proactive changes; backoff and the tail guard may still fire during a hold.

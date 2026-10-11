@@ -24,11 +24,15 @@ class FakeDeepSeek:
             with self.record_path.open("a", encoding="utf-8", newline="\n") as output:
                 output.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    def stage(self):
-        """The stage whose request range covers the current served count
-        (capacity_shift scenarios; defaults to the whole scenario)."""
+    def stage(self, served=None):
+        """The stage whose request range covers the given served count
+        (capacity_shift scenarios; defaults to the whole scenario).  The
+        count is read under the lock when not passed in."""
+        if served is None:
+            with self.lock:
+                served = self.served
         for item in self.scenario.get("stages", []):
-            if self.served < item.get("until_requests", float("inf")):
+            if served < item.get("until_requests", float("inf")):
                 return item
         return self.scenario
 
@@ -53,9 +57,9 @@ class FakeDeepSeek:
         if milliseconds > 0:
             time.sleep(milliseconds / 1000.0)
 
-    def in_reset_window(self):
-        window = self.stage().get("reset_window")
-        return window is not None and window[0] <= self.served < window[1]
+    def in_reset_window(self, served):
+        window = self.stage(served).get("reset_window")
+        return window is not None and window[0] <= served < window[1]
 
     def route(self, prompt):
         stage = self.stage()
@@ -94,7 +98,7 @@ def handler_for(fake):
                 return
             with fake.lock:
                 fake.served += 1
-                reset_window = fake.in_reset_window()
+                reset_window = fake.in_reset_window(fake.served)
             if reset_window:
                 # A connection failure burst: the connection is torn down with
                 # a reset before any bytes are read, which the client sees as

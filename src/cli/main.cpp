@@ -207,6 +207,7 @@ int adaptive_bench(int argc, char** argv) {
     else if (arg == "--timeout" && index + 1 < argc) timeout_s = std::atoi(argv[++index]);
   }
   if (url.empty() || requests <= 0) { std::cerr << "adaptive bench requires --url and --requests\n"; return 2; }
+  if (!(window_s > 0.0)) { std::cerr << "adaptive bench requires a positive --window-s\n"; return 2; }
   const char* key = std::getenv("DEEPSEEK_API_KEY");
   onion::llm::Client client({url, key ? std::string(key) : std::string(), timeout_s, 10, 1, static_cast<std::size_t>(ceiling)});
   onion::llm::Limiter limiter(start, ceiling, window_s);
