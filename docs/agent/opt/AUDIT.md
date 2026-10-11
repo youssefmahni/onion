@@ -93,3 +93,28 @@ the M2/M5 scope.
 `tests/fleet/`, `tools/chaos/`, `docs/agent/PROGRESS.md`, `docs/agent/WORKLOG.md`,
 `docs/agent/gates/M6*.md`, `.github/workflows/ci.yml`. The open M6 convergence
 flake (§4.4 of the goal) is read-only review material for W7.
+
+## 6. Timing-sensitive wiring tests (runner-speed dependent, moved to opt-nightly)
+
+The decision record 0011 control law is covered deterministically by
+`tests/unit/limiter_test.cpp` (simulated time: settle within ±10%, 90%-of-N
+in 3 minutes, one-window backoff, ceiling/floor, tail guard, plateau probe),
+which runs on every OS in ci.yml. The wiring tests below additionally run the
+real limiter against the fake server, but their assertions measure wall-clock
+windows, throughput shapes and latency distributions, which depend on the
+runner's speed, not on product behaviour. They therefore run only in
+`.github/workflows/opt-nightly.yml` (Linux), gated on `ONION_NIGHTLY=1`, and
+skip (exit 77) in the normal CI matrix.
+
+| Test | Why it is timing-sensitive |
+|---|---|
+| `llm.scenarios` (plateau wiring, tail-spike wiring, burst wiring) | 1 s windows, latency percentiles and convergence shapes depend on the client's per-request overhead and the Python fake server's throughput, which differ ~3× between the hosted runners |
+| `llm.capacity_shift` | the shift is only observable when the fake server's own throughput exceeds the shift's plateau (Linux runners only) |
+| `llm.threads` | polls `/proc/<pid>/status` while the bench runs; needs wall-clock sampling |
+| `llm.ramp` (connection-ramp cap) | asserts a new-connections-per-second rate and a throttled run duration in wall-clock time |
+
+The deterministic hygiene assertions remain in ci.yml: one DNS lookup per
+host, resolver-failure classification and connection reuse as `llm.hygiene`,
+and the resolver-memo TTL expiry as the `ClientHygiene.ResolverMemoExpiresPerTtl`
+gtest in `tests/unit/llm_test.cpp`.
+

@@ -1,0 +1,31 @@
+{
+  "models": [
+    {
+      "id": "deepseek-flash"
+    }
+  ],
+  "usage": {
+    "prompt_cache_hit_tokens": 4,
+    "prompt_cache_miss_tokens": 8,
+    "completion_tokens": 6
+  },
+  "stages": [
+    {
+      "until_requests": 300,
+      "latency": {
+        "fixed_ms": 50
+      },
+      "tail_when_in_flight_above": 18,
+      "tail_probability": 0.4,
+      "tail_extra_ms": 150
+    },
+    {
+      "latency": {
+        "fixed_ms": 50
+      },
+      "tail_when_in_flight_above": 36,
+      "tail_probability": 0.4,
+      "tail_extra_ms": 150
+    }
+  ]
+}

@@ -42,8 +42,7 @@ int Limiter::begin_window(std::uint64_t started_at_s) {
   return limit_;
 }
 
-void Limiter::on_window(const LimitWindow& window) {
-  // Idle windows never change state.
+void Limiter::on_window(const LimitWindow& window) {  // Idle windows never change state.
   if (window.calls == 0) return;
 
   const bool press = pressure(window);
@@ -103,13 +102,16 @@ void Limiter::on_window(const LimitWindow& window) {
     limit_ = std::max(1, static_cast<int>(limit_ * kTailGuardFactor));
     hold_windows_ = kOneWindowHold;
     reset_ramp_state();
-    enter_plateau_now();
+    enter_plateau_now(window_goodput);
     return;
   }
 
   // 4. Plateau probe: one window at ×1.1 after 10 plateau windows.
   if (plateau_probe_active_) {
-    if (goodput_ >= kGoodputRiseThreshold * plateau_signal_) {
+    // Compare the raw window goodput: a ×1.1 probe raises it 10% when
+    // utilization-bound, which the EWMA would halve to exactly the 5%
+    // threshold (a knife edge; observed failing on capacity_shift).
+    if (window_goodput >= kGoodputRiseThreshold * plateau_goodput_) {
       // Capacity moved: adopt the probed limit; the ramp resumes with the
       // next window's unassessed increase.
       plateau_ = false;
@@ -133,10 +135,14 @@ void Limiter::on_window(const LimitWindow& window) {
 
   if (plateau_) {
     if (limit_ >= ceiling_) return;  // nothing above the ceiling to probe
+    // The plateau reference follows the settled goodput.  Freezing it at the
+    // revert moment would keep the EWMA lag of the overshoot forever and
+    // make every capacity-growth probe fail (observed with capacity_shift).
+    plateau_goodput_ = window_goodput;
     ++plateau_windows_;
     if (plateau_windows_ >= kPlateauProbeInterval) {
       plateau_limit_ = limit_;
-      limit_ = std::min(ceiling_, static_cast<int>(limit_ * kPlateauProbeFactor));
+      limit_ = grow(limit_, kPlateauProbeFactor);
       plateau_probe_active_ = true;
       plateau_windows_ = 0;
     }
@@ -148,11 +154,11 @@ void Limiter::on_window(const LimitWindow& window) {
   if (assessing_) {
     if (goodput_ >= kGoodputRiseThreshold * goodput_at_increase_) {
       const int before = limit_;
-      limit_ = std::min(ceiling_, static_cast<int>(limit_ * kRampFactor));
+      limit_ = grow(limit_, kRampFactor);
       if (limit_ == before) {
         // Ceiling reached: hold there, no revert.
         assessing_ = false;
-        enter_plateau_now();
+        enter_plateau_now(window_goodput);
       } else {
         goodput_at_increase_ = goodput_;
         pre_increase_limit_ = before;
@@ -161,18 +167,24 @@ void Limiter::on_window(const LimitWindow& window) {
       limit_ = pre_increase_limit_;
       assessing_ = false;
       hold_windows_ = kRevertHoldWindows;
-      enter_plateau_now();
+      enter_plateau_now(window_goodput);
     }
   } else {
     goodput_at_increase_ = goodput_;
     pre_increase_limit_ = limit_;
-    limit_ = std::min(ceiling_, static_cast<int>(limit_ * kRampFactor));
+    limit_ = grow(limit_, kRampFactor);
     if (limit_ == pre_increase_limit_) {
-      enter_plateau_now();
+      enter_plateau_now(window_goodput);
     } else {
       assessing_ = true;
     }
   }
+}
+
+int Limiter::grow(int current, double factor) const {
+  // The multiplicative step always makes progress from small limits
+  // (floor(1 x 1.25) would otherwise lock the limit at 1 forever).
+  return std::min(ceiling_, std::max(current + 1, static_cast<int>(current * factor)));
 }
 
 void Limiter::reset_ramp_state() {
@@ -182,10 +194,10 @@ void Limiter::reset_ramp_state() {
   plateau_windows_ = 0;
 }
 
-void Limiter::enter_plateau_now() {
+void Limiter::enter_plateau_now(double window_goodput) {
   plateau_ = true;
   plateau_windows_ = 0;
-  plateau_signal_ = goodput_;
+  plateau_goodput_ = window_goodput;
 }
 
 int Limiter::limit() const { return limit_; }

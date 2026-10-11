@@ -238,6 +238,22 @@ TEST(Limiter, ReachesNinetyPercentOfThePlateauWithinThreeMinutes) {
   EXPECT_GE(limiter.limit(), 900);
 }
 
+TEST(Limiter, RecoversFromTheFloorAfterAHardBackoff) {
+  // A backoff storm can push the limit to 1; the multiplicative step must
+  // still grow it back (floor(1 x 1.25) would lock it there forever).
+  onion::llm::Limiter limiter(16, 2000, 1.0);
+  for (int i = 0; i < 5; ++i) limiter.on_window(pressured(1, 0, 0));
+  EXPECT_EQ(limiter.limit(), 1);
+  limiter.on_window(ok(10));  // hold window
+  EXPECT_EQ(limiter.limit(), 1);
+  limiter.on_window(ok(10));  // recovery: unassessed increase
+  EXPECT_EQ(limiter.limit(), 2);
+  limiter.on_window(ok(20));  // rising goodput: assessed increase passes
+  EXPECT_EQ(limiter.limit(), 3);
+  limiter.on_window(ok(30));
+  EXPECT_EQ(limiter.limit(), 4);
+}
+
 TEST(Limiter, BacksOffWithinOneWindowOnPressureAndDescendsOnCapacityLoss) {
   // Capacity drops from 1,000 to 400 mid-run: the p95 blows past 2x and the
   // tail guard descends while the ramp stays out of the way.

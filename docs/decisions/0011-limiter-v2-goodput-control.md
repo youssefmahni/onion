@@ -47,18 +47,29 @@ unchanged.
    stepping down, one ×0.9 per window; once the p95 recovers, the hold passes
    before the plateau counter starts.
 4. **Plateau probe.** After 10 consecutive plateau windows, one probe window
-   at min(ceiling, ⌊limit × 1.1⌋): if G rose at least 5% over the plateau's
-   entry signal, adopt the probed limit and the ramp resumes with the next
-   window's unassessed increase; otherwise return to the plateau limit and
-   restart the counter.
+   at min(ceiling, ⌊limit × 1.1⌋) — at least limit + 1, so the probe always
+   makes progress from small limits: if the probe window's goodput (the raw
+   per-window measurement, not the EWMA) is at least 5% above the plateau's
+   current window goodput, adopt the probed limit and the ramp resumes with
+   the next window's unassessed increase; otherwise return to the plateau
+   limit and restart the counter. The raw window is compared because a ×1.1
+   probe raises utilization-bound goodput 10%, which the EWMA would halve to
+   exactly the 5% threshold — a knife edge observed failing on
+   `capacity_shift`. The plateau reference starts at the entry window's
+   goodput and is refreshed on each plateau window, so it tracks the settled
+   goodput (a frozen revert-time value carries the overshoot's EWMA lag and
+   would make every capacity-growth probe fail).
 5. **Ramp.** The first successful window after the starting limit or a backoff
    performs an unassessed increase. After any increase, the next successful
    window assesses it: if G ≥ 1.05 × G at the moment of the increase, increase
-   again to min(ceiling, ⌊limit × 1.25⌋). An increase that does not change the
-   limit (ceiling reached) ends ramping: hold at the ceiling, no revert.
+   again to min(ceiling, ⌊limit × 1.25⌋) — at least limit + 1, so a limit of 1
+   recovers (⌊1 × 1.25⌋ would otherwise lock it there forever). An increase
+   that does not change the limit (ceiling reached) ends ramping: hold at the
+   ceiling, no revert.
 6. **Revert.** If the assessment fails, return to the pre-increase limit, hold
-   two windows, then start counting plateau windows (the plateau's entry
-   signal is G at the revert).
+   two windows, then start counting plateau windows (the plateau's reference
+   starts at the revert window's goodput and is refreshed on each plateau
+   window — see rule 4).
 
 **Holds.** A hold counts down one per non-idle window and blocks all
 proactive changes; backoff and the tail guard may still fire during a hold.
