@@ -16,3 +16,6 @@ Neither agent should block the other, and neither may edit the other's files
 - This file is committed on every `opt/*` branch and merged into `main`.
 
 ## Entries (newest last)
+
+- 2026-10-11 · OPT merged PR #13 (`opt/setup`): added `docs/agent/opt/OPTIMIZATION_GOAL.md` and this notice board, `docs/agent/opt/COORDINATION.md`. Docs only; **`m6-sync` does not need to merge `main`**.
+
