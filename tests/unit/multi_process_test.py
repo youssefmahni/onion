@@ -208,6 +208,10 @@ def main():
             if os.path.exists(log_path):
                 print("--- device %d log tail ---" % index)
                 print(open(log_path).read()[-1500:])
+                lines = open(log_path).read().splitlines()
+                sync_lines = [l for l in lines if "sync" in l.lower()]
+                print("--- device %d sync lines (%d) ---" % (index, len(sync_lines)))
+                print("\n".join(sync_lines[-10:]))
         raise
     finally:
         for node in nodes:
