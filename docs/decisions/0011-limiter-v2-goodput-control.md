@@ -77,15 +77,23 @@ the trace); the 1.5× median rule and the additive +4 rule are removed.
   reused across handles. `CURLOPT_DNS_CACHE_TIMEOUT` = `dns_cache_ttl_s`
   (default 600, at least the record TTL).
 - HTTP/2 preference with multiplexing is kept; `CURLMOPT_MAX_CONCURRENT_STREAMS`
-  (default 100), `CURLMOPT_MAX_HOST_CONNECTIONS` (default 6) and
-  `CURLMOPT_MAX_TOTAL_CONNECTIONS` (default 12) cap the connection topology.
+  (default 100) caps the streams per connection.
+  `CURLMOPT_MAX_HOST_CONNECTIONS` and `CURLMOPT_MAX_TOTAL_CONNECTIONS` default
+  to 0 (curl's unlimited): hard per-host caps would serialize the fleet on
+  HTTP/1.1-only hosts (Windows has no HTTP/2, so 1,000 in flight needs about
+  1,000 connections — a 6-connection cap would run them six at a time, and
+  the existing 1,000-timeout regression would take about 167 s instead of
+  20). The connection ramp below bounds growth everywhere; the caps remain
+  available as options.
 - **Connection ramp.** A token bucket with rate `new_connections_per_s`
-  (default 10, 0 = disabled) and burst equal to the rate. Each handle added to
+  (default 50, 0 = disabled) and burst equal to the rate. Each handle added to
   the multi handle consumes one token; when a handle finishes having opened
   `k` connections it refunds `1 − k` tokens (a reuse refunds one; a redirect
   pays for the extra). When the bucket is empty, new handles wait. The
   new-connection rate is therefore at most `new_connections_per_s` plus one
-  window of burst.
+  window of burst. A 10/s default was rejected by measurement: it would add
+  about 100 s of startup for 1,000 in flight on an HTTP/1.1 host, and the
+  owner's probe ramps use comparable-to-50/s rates (`--ramp`).
 - **Test-only DNS hook.** `Client::Options::dns_resolver` is an optional
   callback returning the resolved address for `(host, port)`; when set, the
   client memoizes resolutions per host for `dns_cache_ttl_s` and pins every

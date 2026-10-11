@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <iomanip>
 #include <mutex>
@@ -95,6 +96,29 @@ std::string json_string(std::string_view body, std::string_view key) {
   std::smatch match;
   const std::string copy(body);
   return std::regex_search(copy, match, expression) ? match[1].str() : std::string{};
+}
+
+// One mutex per curl lock datum: the share handle serializes DNS and TLS
+// session caches across every easy handle of this client (decision 0011).
+std::mutex share_locks[CURL_LOCK_DATA_LAST];
+void share_lock(CURL*, curl_lock_data data, curl_lock_access, void*) { share_locks[data].lock(); }
+void share_unlock(CURL*, curl_lock_data data, void*) { share_locks[data].unlock(); }
+
+struct UrlParts { std::string host; std::uint16_t port{}; };
+UrlParts split_url(std::string_view url) {
+  UrlParts parts;
+  const std::size_t scheme = url.find("://");
+  const std::size_t host_begin = scheme == std::string_view::npos ? 0 : scheme + 3;
+  const std::size_t host_end = url.find_first_of(":/", host_begin);
+  parts.host = std::string(url.substr(host_begin, host_end == std::string_view::npos
+                                                   ? std::string_view::npos
+                                                   : host_end - host_begin));
+  const bool https = scheme != std::string_view::npos && url.substr(0, scheme) == "https";
+  if (host_end != std::string_view::npos && url[host_end] == ':')
+    parts.port = static_cast<std::uint16_t>(std::atoi(std::string(url.substr(host_end + 1)).c_str()));
+  else
+    parts.port = https ? 443 : 80;
+  return parts;
 }
 
 size_t write_body(char* data, size_t size, size_t count, void* opaque) {
@@ -267,18 +291,33 @@ struct Client::Impl {
     long retry_after{};
     Clock::time_point started;
     curl_slist* headers{};
+    curl_slist* resolve_list{};
   };
   explicit Impl(Options opts)
       : options(std::move(opts)), multi(curl_multi_init()),
-        parser_pool(std::thread::hardware_concurrency()) {
+        parser_pool(std::thread::hardware_concurrency()),
+        bucket(options.new_connections_per_s),
+        url_parts(split_url(options.base_url)) {
     curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    if (options.max_concurrent_streams > 0)
+      curl_multi_setopt(multi, CURLMOPT_MAX_CONCURRENT_STREAMS, options.max_concurrent_streams);
+    if (options.max_host_connections > 0)
+      curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, options.max_host_connections);
+    if (options.max_total_connections > 0)
+      curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, options.max_total_connections);
+    share = curl_share_init();
+    curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock);
+    curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock);
+    curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
     worker = std::thread(&Impl::run, this);
   }
-  ~Impl() { { std::lock_guard<std::mutex> lock(mutex); stopping = true; } cv.notify_all(); worker.join(); curl_multi_cleanup(multi); }
+  ~Impl() { { std::lock_guard<std::mutex> lock(mutex); stopping = true; } cv.notify_all(); worker.join(); curl_share_cleanup(share); curl_multi_cleanup(multi); }
   // The worker must be declared after every member it reads: C++ initializes
   // members in declaration order, not initializer-list order.
   Options options;
   CURLM* multi{};
+  CURLSH* share{};
   std::mutex mutex;
   std::condition_variable cv;
   std::deque<Task> queued;
@@ -288,9 +327,62 @@ struct Client::Impl {
   std::atomic<std::size_t> peak{};
   std::atomic<std::size_t> active_peak{};
   std::atomic<std::size_t> connections{};
+  std::atomic<std::size_t> dns_lookups{};
   std::atomic<long> http_version{};
   CpuPool parser_pool;
+  // The connection ramp and the DNS memo are touched only by the worker
+  // thread, so they need no lock.
+  struct ConnectionBucket {
+    explicit ConnectionBucket(std::size_t rate) : rate(rate) {}
+    std::size_t rate;
+    double tokens = rate ? static_cast<double>(rate) : 0.0;
+    Clock::time_point last{Clock::now()};
+    bool try_consume() {
+      if (rate == 0) return true;
+      const auto now = Clock::now();
+      const double elapsed = std::chrono::duration<double>(now - last).count();
+      tokens = std::min(static_cast<double>(rate), tokens + elapsed * rate);
+      last = now;
+      if (tokens < 1.0) return false;
+      tokens -= 1.0;
+      return true;
+    }
+    void settle(long opened) {
+      if (rate == 0) return;
+      // A reuse (0 connections) refunds the token; extra connections pay.
+      tokens = std::max(0.0, std::min(static_cast<double>(rate), tokens + 1.0 - static_cast<double>(std::max(0L, opened))));
+    }
+  } bucket;
+  UrlParts url_parts;
+  std::unordered_map<std::string, std::pair<Clock::time_point, std::string>> dns_memo;
   std::thread worker;
+  std::string resolve(const std::string& host, std::uint16_t port) {
+    if (!options.dns_resolver) return {};
+    const auto now = Clock::now();
+    auto found = dns_memo.find(host);
+    if (found != dns_memo.end() && now - found->second.first < std::chrono::seconds(options.dns_cache_ttl_s))
+      return found->second.second;
+    dns_lookups.fetch_add(1);
+    const std::string address = options.dns_resolver(host, port);
+    if (address.empty()) return {};
+    dns_memo[host] = {now, address};
+    return address;
+  }
+  bool resolve_and_add(Task task) {
+    const std::string address = resolve(url_parts.host, url_parts.port);
+    if (options.dns_resolver && address.empty()) {
+      // Resolution failed: fail the request as a Transport error without
+      // handing it to libcurl (decision 0011, dns_fail_burst).
+      Result result;
+      result.kind = Kind::Transport;
+      result.latency_s = 0.0;
+      flight--;
+      task.done(std::move(result));
+      return false;
+    }
+    add(std::move(task), address);
+    return true;
+  }
   void submit(Request request, std::function<void(Result)> done) {
     std::lock_guard<std::mutex> lock(mutex);
     queued.push_back({std::move(request), std::move(done), 0, Clock::now()});
@@ -299,7 +391,7 @@ struct Client::Impl {
     while (observed < now && !peak.compare_exchange_weak(observed, now)) {}
     cv.notify_all();
   }
-  void add(Task task) {
+  void add(Task task, const std::string& resolved) {
     CURL* easy = curl_easy_init();
     auto item_ptr = std::make_unique<Active>();
     Active& item = *item_ptr;
@@ -321,6 +413,15 @@ struct Client::Impl {
       curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, options.connect_timeout_s);
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(easy, CURLOPT_SHARE, share);
+    curl_easy_setopt(easy, CURLOPT_DNS_CACHE_TIMEOUT, options.dns_cache_ttl_s);
+    if (!resolved.empty()) {
+      // A pinned resolution (the test hook): "host:port:address".  The list
+      // must outlive the transfer: curl reads it at connect time.
+      item.resolve_list = curl_slist_append(nullptr,
+          (url_parts.host + ":" + std::to_string(url_parts.port) + ":" + resolved).c_str());
+      curl_easy_setopt(easy, CURLOPT_RESOLVE, item.resolve_list);
+    }
     curl_easy_setopt(easy, CURLOPT_PRIVATE, easy); curl_multi_add_handle(multi, easy);
     const auto now = active.size();
     auto observed = active_peak.load();
@@ -333,8 +434,9 @@ struct Client::Impl {
     curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &opened);
     curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &version);
     connections.fetch_add(static_cast<std::size_t>(std::max(0L, opened)));
+    bucket.settle(opened);
     http_version.store(version);
-    curl_multi_remove_handle(multi, easy); curl_slist_free_all(item.headers); curl_easy_cleanup(easy);
+    curl_multi_remove_handle(multi, easy); curl_slist_free_all(item.headers); curl_slist_free_all(item.resolve_list); curl_easy_cleanup(easy);
     auto parsed = std::make_shared<std::promise<Result>>();
     auto future = parsed->get_future();
     parser_pool.submit([promise = std::move(parsed), code, status, retry_after = item.retry_after,
@@ -360,7 +462,16 @@ struct Client::Impl {
         }
         if (stopping && queued.empty() && active.empty()) break;
       }
-      for (auto& task : ready) add(std::move(task));
+      for (auto it = ready.begin(); it != ready.end(); ++it) {
+        if (!bucket.try_consume()) {
+          // The connection ramp is empty: put the rest back and wait for a
+          // refill (the bucket refills at new_connections_per_s).
+          std::lock_guard<std::mutex> lock(mutex);
+          for (auto back = ready.end(); back-- != it;) queued.push_front(std::move(*back));
+          break;
+        }
+        resolve_and_add(std::move(*it));
+      }
       int running = 0; curl_multi_perform(multi, &running); curl_multi_poll(multi, nullptr, 0, 10, nullptr);
       int messages = 0; while (CURLMsg* message = curl_multi_info_read(multi, &messages)) if (message->msg == CURLMSG_DONE) finish(message->easy_handle, message->data.result);
     }
@@ -380,6 +491,7 @@ std::size_t Client::in_flight() const { return impl_->flight.load(); }
 std::size_t Client::peak_in_flight() const { return impl_->peak.load(); }
 std::size_t Client::peak_active_requests() const { return impl_->active_peak.load(); }
 std::size_t Client::connections_opened() const { return impl_->connections.load(); }
+std::size_t Client::dns_lookups() const { return impl_->dns_lookups.load(); }
 long Client::negotiated_http_version() const { return impl_->http_version.load(); }
 std::string http_get(const std::string& url, const std::string& api_key,
                     long& http_status, long& http_version) {
