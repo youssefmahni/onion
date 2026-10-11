@@ -730,10 +730,11 @@ bool UdpSocket::join_group(const std::string& group, std::string* error) {
   membership.imr_address.s_addr = htonl(INADDR_ANY);
   membership.imr_ifindex = 0;
 #else
-  // macOS and other BSDs only define ip_mreq.
+  // macOS and other BSDs only define ip_mreq (whose interface field is
+  // imr_interface, not ip_mreqn's imr_address).
   ip_mreq membership{};
   membership.imr_multiaddr.s_addr = ::inet_addr(group.c_str());
-  membership.imr_address.s_addr = htonl(INADDR_ANY);
+  membership.imr_interface.s_addr = htonl(INADDR_ANY);
 #endif
   if (::setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership,
                    sizeof(membership)) != 0) {

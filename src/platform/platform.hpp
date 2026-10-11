@@ -2,6 +2,8 @@
 
 #include <filesystem>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -100,7 +102,9 @@ class UdpSocket {
 
  private:
 #ifdef _WIN32
-  std::uintptr_t socket_{INVALID_SOCKET};
+  // SOCKET is UINT_PTR; the invalid value is ~0 without including
+  // winsock2.h in this header.
+  std::uintptr_t socket_{std::numeric_limits<std::uintptr_t>::max()};
 #else
   int socket_{-1};
 #endif
