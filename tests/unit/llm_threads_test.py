@@ -50,7 +50,7 @@ def main():
     if not Path("/proc/self/status").exists():
         print("skipped: /proc not available on this platform")
         sys.exit(77)
-    with fake_server("healthy.json") as url:
+    with fake_server("healthy.json") as (url, _):
         port = int(url.rsplit(":", 1)[1])
         low, low_rc = run_at_limit(args.binary, port, 100)
         high, high_rc = run_at_limit(args.binary, port, 1000)

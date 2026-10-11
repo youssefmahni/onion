@@ -32,7 +32,7 @@ def summary(output, key):
 def dns_one_lookup_per_host(binary):
     """The shared DNS cache plus the test resolver memo: one lookup for 100
     requests to the same host."""
-    with fake_server("healthy.json") as url:
+    with fake_server("healthy.json") as (url, _):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://localhost:{port}",
                               "--test-resolver", "--requests", "100")
@@ -43,7 +43,7 @@ def dns_one_lookup_per_host(binary):
 
 def resolver_failures_are_transport(binary):
     """A failing resolution is a Transport outcome and does not hit the wire."""
-    with fake_server("healthy.json") as url:
+    with fake_server("healthy.json") as (url, _):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://localhost:{port}",
                               "--test-resolver", "--resolver-fail-first", "3", "--requests", "50")
@@ -127,7 +127,7 @@ def connection_ramp_cap(binary):
 
 def connection_reuse(binary):
     """Keep-alive responses reuse connections: 100 requests open a handful."""
-    with fake_server("healthy.json") as url:
+    with fake_server("healthy.json") as (url, _):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://127.0.0.1:{port}", "--requests", "100")
         assert completed.returncode == 0, completed.stderr
