@@ -40,17 +40,20 @@ unchanged.
    window, and reset the ramp state. Unchanged from v1 except that transport
    failures above 2% are now a pressure event.
 3. **Tail guard.** If a baseline p95 exists and the window's p95 exceeds twice
-   it, limit = max(1, ⌊limit × 0.9⌋), hold one window, reset the ramp state.
+   it, limit = max(1, ⌊limit × 0.9⌋), hold one window, and enter the plateau
+   state: the step-back plays the role of a revert, so the ramp cannot blindly
+   re-increase into the danger zone, and the plateau probe keeps tracking
+   capacity recovery. While the p95 stays above the threshold the guard keeps
+   stepping down, one ×0.9 per non-hold window.
 4. **Plateau probe.** After 10 consecutive plateau windows, one probe window
    at min(ceiling, ⌊limit × 1.1⌋): if G rose at least 5% over the plateau's
    entry signal, adopt the probed limit and resume ramping; otherwise return
    to the plateau limit and restart the counter.
-5. **Ramp.** The first successful window after the starting limit, a hold or a
-   backoff performs an unassessed increase. After any increase, the next
-   successful window assesses it: if G ≥ 1.05 × G at the moment of the
-   increase, increase again to min(ceiling, ⌊limit × 1.25⌋). An increase that
-   does not change the limit (ceiling reached) ends ramping: hold at the
-   ceiling, no revert.
+5. **Ramp.** The first successful window after the starting limit or a backoff
+   performs an unassessed increase. After any increase, the next successful
+   window assesses it: if G ≥ 1.05 × G at the moment of the increase, increase
+   again to min(ceiling, ⌊limit × 1.25⌋). An increase that does not change the
+   limit (ceiling reached) ends ramping: hold at the ceiling, no revert.
 6. **Revert.** If the assessment fails, return to the pre-increase limit, hold
    two windows, then start counting plateau windows (the plateau's entry
    signal is G at the revert).
