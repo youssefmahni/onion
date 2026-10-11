@@ -159,6 +159,13 @@ json state_json(onion::state::StateWriter& writer, int api_port,
     entry["id"] = campaign.id;
     entry["state"] = campaign.state;
     entry["reserved"] = writer.reserved_total(campaign.id);
+    // The uncapped fold for the budget-overshoot check (decision 0014):
+    // at most one chunk per device beyond the budget.
+    std::int64_t uncapped = 0;
+    for (const auto& [origin, total] :
+         writer.reserved_by_origin(campaign.id))
+      uncapped += total;
+    entry["reserved_uncapped"] = uncapped;
     json reserved_by_origin = json::object();
     for (const auto& [origin, total] :
          writer.reserved_by_origin(campaign.id))
@@ -869,6 +876,9 @@ int node_cmd(int argc, char** argv) {
           std::fprintf(stderr, "sync timer fired, members=%zu\n",
                        lane_members.size());
         last_sync = std::chrono::steady_clock::now();
+        // Decision 0014: one completed sync round re-opens reservations
+        // and feeds the measured-chunk window.
+        engine.note_sync_round();
         for (const auto& member : lane_members) {
           if (member.device_id == device_key->device_id) continue;
           const auto peer_entry = member_urls.find(member.device_id);

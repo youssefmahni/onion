@@ -75,7 +75,7 @@ def main():
     fake = subprocess.Popen(
         [sys.executable, FAKE_SERVER, "--scenario", HEALTHY_SCENARIO,
          "--record", os.path.join(root, "requests.jsonl"),
-         "--port", "0", "--funnel", "--funnel-max-depth", "3"],
+         "--port", "0", "--funnel", "--funnel-max-depth", "8"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     fake_port = int(fake.stdout.readline().strip())
     assert fake_port > 0, "fake server did not report its port"
@@ -87,8 +87,11 @@ def main():
             os.makedirs(os.path.join(data, "keys"))
             corpus = os.path.join(root, f"corpus{index}")
             os.makedirs(corpus)
-            with open(os.path.join(corpus, "Onion - level_00.csv"), "w") as f:
-                f.write(f"code,title\nP0{index},Phase {index}\n")
+            # Seeded at L4 (TDs) so the campaign's structure flag (off)
+            # never gates the work: L1..L3 expansion goes to review, L4+
+            # expands freely.
+            with open(os.path.join(corpus, "Onion - level_04.csv"), "w") as f:
+                f.write(f"code,path,title\nP0{index},P0{index},Phase {index}\n")
             # Fixed seed: the device identity (and so the lanes) are the
             # same on every run.
             run(binary, "node", "key", "set", "device-key",
@@ -159,9 +162,15 @@ def main():
                       "w") as f:
                 json.dump(members, f)
 
-        # 1. Wait for the campaign to finish on every device (decision
-        #    0010: exhausted, i.e. its RESERVE fold reaches the budget, or
-        #    stopped — never a raw timer).
+        # 1. Wait for the campaign to finish on every device, as decision
+        #    0010 defines "finished": exhausted (its capped RESERVE fold
+        #    reaches the budget) or stopped. The wait is progress-based
+        #    (never a raw timer): fail only when the fleet makes no
+        #    progress for N seconds, with a generous total cap. The
+        #    "no attempts in flight" half of the definition is proven by
+        #    the quiescence check in step 2: a funnel mid-flight commits
+        #    within milliseconds on the fake model, so three silent sync
+        #    rounds mean nothing is in flight anywhere.
         def finished_everywhere():
             try:
                 for index in (1, 2, 3):
@@ -179,11 +188,26 @@ def main():
                 return True
             except Exception:
                 return False
-        # Leave room for the three quiescence rounds after the work.
-        work_wait = max(60.0, HARD_DEADLINE_S - 90.0)
-        if not wait_for(finished_everywhere, work_wait, deadline,
-                        "campaign never finished"):
-            raise AssertionError("campaign never finished everywhere")
+        NO_PROGRESS_S = 90.0  # fail only when nothing moves for this long
+        last_progress = time.time()
+        last_vector = None
+        while not finished_everywhere():
+            if time.time() > deadline:
+                raise DeadlineExceeded(
+                    "campaign never finished everywhere (no-progress "
+                    "window exceeded)")
+            time.sleep(2.0)
+            try:
+                current = [node_state(ports[index]["api"]).get("vector", {})
+                           for index in (1, 2, 3)]
+            except Exception:
+                continue
+            if current != last_vector:
+                last_vector = current
+                last_progress = time.time()
+            elif time.time() - last_progress > NO_PROGRESS_S:
+                raise DeadlineExceeded(
+                    "no progress for %.0f s" % NO_PROGRESS_S)
 
         # 2. Quiescence: no node may write a new record for three sync
         #    rounds, so the last batch has reached every replica. A
@@ -232,6 +256,19 @@ def main():
         assert settled[0] == settled[1] == settled[2], settled
         merkle = [state["merkle_root"] for state in states]
         assert merkle[0] == merkle[1] == merkle[2], merkle
+
+        # Decision 0014: the fleet-wide budget overshoot is at most one
+        # chunk per device. The uncapped RESERVE sum on any replica is the
+        # same everywhere; it must stay within budget + one chunk per
+        # device (the chunk here is the 50-attempt floor: every device's
+        # measured window stays below it).
+        budget = 100
+        total_reserved = sum(
+            campaign.get("reserved_uncapped", 0)
+            for campaign in states[0].get("campaigns", []))
+        assert total_reserved <= budget + 3 * 50, \
+            "budget overshoot: %d reserved against a budget of %d" % (
+                total_reserved, budget)
         print("multi-process convergence: PASS settled=%s merkle=%s"
               % (settled, merkle[0][:16]))
     except (AssertionError, DeadlineExceeded) as error:

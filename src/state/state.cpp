@@ -469,11 +469,18 @@ void StateWriter::rebuild_index() {
     if (review.state == "open" || review.state.empty())
       review_paths_.insert(review.path);
   }
-  for (const store::Campaign& campaign : db_.campaigns(&error))
+  for (const store::Campaign& campaign : db_.campaigns(&error)) {
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
+    const auto spec = nlohmann::json::parse(campaign.spec, nullptr, false);
+    if (spec.is_object() && spec.contains("loop_budget") &&
+        spec["loop_budget"].is_number_integer())
+      campaign_budgets_[campaign.id] = spec["loop_budget"].get<std::int64_t>();
+  }
   reserved_by_campaign_.clear();
   reserved_by_origin_campaign_.clear();
   seen_reserve_keys_.clear();
+  reserve_entries_.clear();
+  campaign_budgets_.clear();
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -538,6 +545,8 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     if (seen_reserve_keys_.insert(key).second) {
       reserved_by_campaign_[campaign] += attempts;
       reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
+      reserve_entries_[campaign].push_back(
+          ReserveEntry{record.hlc, origin, attempts});
     }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
@@ -599,6 +608,11 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
                                     [&](const CampaignInfo& c) { return c.id == id; }),
                      campaigns_.end());
     campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state});
+    // Decision 0014: the capped fold uses the LATEST spec's loop budget.
+    const auto spec = payload.at("spec");
+    if (spec.is_object() && spec.contains("loop_budget") &&
+        spec["loop_budget"].is_number_integer())
+      campaign_budgets_[id] = spec["loop_budget"].get<std::int64_t>();
   }
 }
 
@@ -887,10 +901,50 @@ std::vector<CampaignInfo> StateWriter::campaigns() const {
   return campaigns_;
 }
 
-std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+std::int64_t StateWriter::campaign_budget(std::string_view campaign) const {
+  const auto found = campaign_budgets_.find(std::string(campaign));
+  return found == campaign_budgets_.end()
+             ? std::numeric_limits<std::int64_t>::max()
+             : found->second;
+}
+
+std::vector<StateWriter::ReserveEntry> StateWriter::reserve_entries_sorted(
+    std::string_view campaign) const {
   std::shared_lock lock(index_mutex_);
-  const auto found = reserved_by_campaign_.find(std::string(campaign));
-  return found == reserved_by_campaign_.end() ? 0 : found->second;
+  const auto found = reserve_entries_.find(std::string(campaign));
+  if (found == reserve_entries_.end()) return {};
+  std::vector<ReserveEntry> sorted = found->second;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const ReserveEntry& a, const ReserveEntry& b) {
+              if (a.hlc != b.hlc) return a.hlc < b.hlc;
+              return a.origin < b.origin;
+            });
+  return sorted;
+}
+
+std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+  // Decision 0014: count in (hlc, origin) order, capped at the loop
+  // budget; entries past the budget are void.
+  const std::int64_t budget = campaign_budget(campaign);
+  std::int64_t total = 0;
+  for (const ReserveEntry& entry : reserve_entries_sorted(campaign)) {
+    if (total + entry.attempts > budget) break;
+    total += entry.attempts;
+  }
+  return total;
+}
+
+bool StateWriter::reservation_void(std::string_view campaign,
+                                   std::string_view origin,
+                                   std::int64_t hlc) const {
+  const std::int64_t budget = campaign_budget(campaign);
+  std::int64_t total = 0;
+  for (const ReserveEntry& entry : reserve_entries_sorted(campaign)) {
+    if (total + entry.attempts > budget) return true;  // past the cap: void
+    total += entry.attempts;
+    if (entry.origin == origin && entry.hlc == hlc) return false;
+  }
+  return true;  // not among the counted entries: void or unknown
 }
 
 std::optional<std::string> StateWriter::origin_prev_hash(
