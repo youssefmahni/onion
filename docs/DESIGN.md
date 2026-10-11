@@ -561,10 +561,39 @@ Each device controls one number, the DeepSeek requests it has in flight, and adj
 
 **The request limit (adjusted every 30 s)**
 
-- Any HTTP 429 or 503, or timeouts above 5% of calls: halve the limit, then hold for one window.
-- Median latency within 1.5 times its low-load baseline: add 4. Baseline samples come only from initial windows at the starting limit and from an hourly probe. A probe caps one 30-second window at `max(starting limit, current limit / 4)`, stores that window's median as the new baseline, then restores the prior limit. Busy windows never update the baseline.
-- Latency rising without errors: hold, because more requests would only queue at DeepSeek.
-- It starts at the profile's starting value and never exceeds the profile's ceiling.
+The limit is one number, adjusted from DeepSeek's measured behaviour, within
+its profile's ceiling (decision 0011). The control signal is **goodput**
+(completed output tokens per second, an EWMA over two windows; failed
+requests do not count), not the median, because the real measurements show
+that past the provider's peak the median barely moves while throughput falls
+and p99 nearly triples.
+
+- **Ramp.** From the starting limit, or after a backoff or hold, the limit
+  multiplies by 1.25 per window while goodput keeps rising at least 5% per
+  increase, up to the ceiling.
+- **Plateau.** An increase that fails to raise goodput by 5% is undone: the
+  limit returns to its previous value and holds for two windows. Every 10
+  windows at a plateau, one probe window at ×1.1 tests whether capacity
+  changed; a 5% goodput rise adopts it, otherwise the plateau continues.
+- **Tail guard.** If a window's p95 exceeds twice the p95 of the low-load
+  baseline (the initial windows and the hourly probe), the limit steps back
+  ×0.9 and holds one window.
+- **Hard backoff.** Any HTTP 429 or 503, timeouts above 5% of calls, or
+  transport failures above 2% of calls: halve the limit and hold one window.
+- The limit starts at the profile's starting value and never exceeds the
+  profile's ceiling or falls below 1. The hourly low-load probe of decision
+  0005 is kept: it caps one window at `max(starting limit, current limit / 4)`
+  and records the median and p95 baselines.
+
+**Client hygiene**
+
+- One curl multi handle per process, with a shared DNS and TLS-session cache
+  (one hostname lookup per TTL), reused connections, and HTTP/2 multiplexing
+  with caps on concurrent streams and connections.
+- New connections open at most at a configured rate per second (a token
+  bucket, default 10/s), so a burst of tickets ramps instead of hammering
+  DNS and TCP.
+
 
 **Safety caps on top** (from the platform sampler)
 
