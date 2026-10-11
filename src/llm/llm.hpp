@@ -17,30 +17,50 @@ struct LimitWindow {
   std::size_t rate_limited{};
   std::size_t server_errors{};
   std::size_t timeouts{};
+  std::size_t connect_failures{};
+  std::uint64_t completed_out_tokens{};
   double median_latency_s{};
+  double p95_latency_s{};
 };
 
+// Limiter v2 (decision 0011): goodput-based control.  The limit is evaluated
+// once per window; window_length_s is injectable for tests (default 30).
 class Limiter {
  public:
-  Limiter(int starting_limit, int ceiling);
+  Limiter(int starting_limit, int ceiling, double window_length_s = 30.0);
 
-  // Returns the limit for this 30-second window. Once an hour it begins a
-  // probe window at a reduced limit; callers pass the result back in
-  // LimitWindow::limit_used.
+  // Returns the limit for this window. Once an hour it begins a probe window
+  // at a reduced limit (decision 0005, extended to record p95).
   int begin_window(std::uint64_t started_at_s);
   void on_window(const LimitWindow& window);
   int limit() const;
   std::optional<double> low_load_baseline_s() const;
+  std::optional<double> low_load_baseline_p95_s() const;
+  double goodput_signal() const;
 
  private:
+  void enter_plateau_now();
+  void reset_ramp_state();
   int starting_limit_;
   int limit_;
   int ceiling_;
-  bool hold_next_window_{false};
+  double window_length_s_;
+  int hold_windows_{0};
   bool probe_active_{false};
   int pre_probe_limit_{0};
   std::optional<std::uint64_t> last_probe_started_s_;
   std::optional<double> baseline_s_;
+  std::optional<double> baseline_p95_s_;
+  double goodput_{0};
+  bool goodput_valid_{false};
+  bool assessing_{false};
+  double goodput_at_increase_{0};
+  int pre_increase_limit_{0};
+  bool plateau_{false};
+  int plateau_windows_{0};
+  bool plateau_probe_active_{false};
+  int plateau_limit_{0};
+  double plateau_signal_{0};
 };
 
 struct Request {
