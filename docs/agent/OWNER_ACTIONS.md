@@ -140,3 +140,26 @@ Cost / duration: ≤ 50 real calls, ~30 minutes.
 Pass criteria: the profile shows laptop rules; the node restarts after kill -9; no 429 storm.
 
 If it fails: collect `node profile` output, the plist, and the node log tail.
+
+---
+
+### OA-13 · macOS sync 401 diagnosis (multi-process convergence) · M6 (revisited in M7) · status: open
+
+Why: On macOS arm64 CI, every sync round is rejected with 401 by the signed-request authenticate() — the same scheme passes on Linux, Windows and ASan CI. The multi-process convergence test therefore skips on macOS CI until this is fixed.
+
+Prerequisites: a Mac (or the Mac Pro) with the repo built.
+
+Steps:
+1. Run one node pair manually with diagnostics:
+   ```bash
+   ONION_SYNC_DEBUG=1 build/<preset>/data_depot node run --data-dir /tmp/d1 \
+     --members /tmp/d1/members.json --host 127.0.0.1 --sync-port 18202 --api-port 18111
+   # and a second node on 18203/18112
+   ```
+2. Read the "sync round to …" lines; the error is `vector request failed (status 401)`.
+3. Report which authenticate() check rejects: missing headers, unknown member, signature, or nonce. (Add a reason to the 401 body if needed.)
+4. Send the finding to the agent; it fixes src/sync and removes the skip from tests/unit/multi_process_test.py.
+
+Pass criteria: two Mac nodes converge; `ONION_MP_ALLOW_MACOS=1 python3 tests/unit/multi_process_test.py <binary>` prints PASS.
+
+Cost / duration: none (offline), ~20 minutes.

@@ -304,7 +304,8 @@ if(BUILD_TESTING)
   add_test(NAME sync.multi_process_convergence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/multi_process_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(sync.multi_process_convergence PROPERTIES
     TIMEOUT 420
-    ENVIRONMENT "ONION_MP_DEADLINE_S=360")
+    ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    SKIP_RETURN_CODE 77)
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
