@@ -44,11 +44,6 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
-        env:
-          ONION_MP_ALLOW_MACOS: "1"  # OA-13 diagnosis: force-run the
-                                     # multi-process test on macOS CI to
-                                     # capture the signed-request hex
-                                     # (temporary; removed with the fix)
 
   macos-x86_64-compat:
     name: macOS x86_64 / 12.0 compatibility build

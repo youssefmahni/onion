@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import platform
 import urllib.request
 from pathlib import Path
 
@@ -68,19 +67,7 @@ def dump_debug_state(binary, data, members_path):
 
 def main():
     binary = sys.argv[1]
-    # OA-13: on the hosted macOS arm64 CI runners every sync round is
-    # rejected with 401 by the signed-request authenticate() — diagnosed in
-    # WORKLOG.md, revisited in M7. The skip is scoped to those runners only
-    # (real Macs and other platforms keep running the test), is recorded as
-    # SKIPPED (exit 77, not a pass), and can be overridden to reproduce the
-    # failure with ONION_MP_ALLOW_MACOS=1.
-    if (sys.platform == "darwin" and platform.machine() == "arm64"
-            and os.environ.get("GITHUB_ACTIONS")
-            and not os.environ.get("ONION_MP_ALLOW_MACOS")):
-        print("SKIP (OA-13): macOS arm64 CI signed-request auth fails "
-              "(401 on every sync round); tracked in docs/agent/WORKLOG.md "
-              "and OWNER_ACTIONS.md, revisited in M7")
-        sys.exit(77)
+    started = time.time()
     started = time.time()
     deadline = started + HARD_DEADLINE_S
     root = tempfile.mkdtemp(prefix="onion_mp_")

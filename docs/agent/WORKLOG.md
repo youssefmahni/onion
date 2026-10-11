@@ -1,4 +1,14 @@
 # Worklog (append-only, newest at top)
+## 2026-10-11T19:4xZ · m7 · macOS sync 401 (OA-13) root cause and fix
+
+Result: FIXED and verified — `sync.multi_process_convergence` PASSES on macOS arm64 CI (126 s), all 8 CI jobs green (run 38167851946). OA-13 closed; the skip and the ONION_MP_ALLOW_MACOS override are removed; the keystore round trip no longer skips on macOS.
+
+Evidence:
+- Hex dumps of the exact string-to-sign on both sides (added for this diagnosis): client and server agreed byte-for-byte on macOS CI, so the canonical bytes, path normalization, header handling and key loading from members.json were all ruled out. The rejections came from the two layers below — in order.
+- Layer 1 (the 401): `replayed nonce`. The signed-request scheme had no per-request nonce — the timestamp was the only varying input, and it is shared across a whole sync round. A legitimate transport retry (common on the macOS runners) resent byte-identical requests; the anti-replay cache rejected the retry as a replay → every round ended 401. Fix: a fresh random nonce per request attempt, part of the signed bytes (device ‖ method ‖ path ‖ body-hash ‖ nonce ‖ ts), replay cache keyed on (device, nonce). A retry now signs a new nonce and passes; a true replay still fails.
+- Layer 2 (after layer 1, sync worked but pulled batches failed `verify 1` = BadSig): KeyStore::get on macOS read the shared login keychain FIRST. Three parallel nodes on one machine plus keychain state persisting across CI jobs made the key material nondeterministic — a node could sign batches with a key that did not match the public key in members.json. Fix: the 0600 file is the source of truth (keychain only as a migration fallback, and a present-but-invalid file fails closed instead of falling through to the keychain).
+- Guards added: `SyncGolden.FixedKeyAndRequestGiveFixedSignatureOnEveryOS` pins the exact signature bytes for a fixed key/request on every CI OS; the keystore round trip test runs on macOS without a skip; the node log now prints per-origin quarantine reasons.
+
 ## 2026-10-11T18:0xZ · m6 · convergence flake root cause (retrospective entry)
 
 Result: documented (was only in the commit message until now)
