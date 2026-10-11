@@ -239,9 +239,12 @@ int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
       Record{0, 0, "SETTLE",
              {{"path", "P01-IN01-T01"}, {"kept", 1}, {"end", "children"}}},
   }});
+  // The loop is only a timeout guard: the crash hook kills the child at the
+  // right step.  Polling `next_batch()` here would race the hook, because
+  // the counter increments before the durable write and the fold
+  // (append_batch), which produced spurious exit-5 failures under load.
   for (int i = 0; i < 3000; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    if (writer->next_batch() == 2) break;
   }
   _exit(5);  // the hook never fired: test failure
 }
