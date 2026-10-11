@@ -7,11 +7,13 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
 #include <memory>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -31,6 +33,7 @@
 #include "swim/beacon.hpp"
 #include "swim/swim.hpp"
 #include "swim/udp_transport.hpp"
+#include "log/invite.hpp"
 #include "state/state.hpp"
 #include "store/store.hpp"
 
@@ -247,6 +250,52 @@ int node_cmd(int argc, char** argv) {
     std::cout << "device_id=" << key->device_id << "\n"
               << "public_key=" << public_key_hex << "\n"
               << "slot=" << key->slot << "\n";
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "invite") {
+    // M7 joining: print a signed, single-use invitation token
+    // (DESIGN › Joining): the invited public key, the inviter, an expiry
+    // and a nonce that is recorded when the join completes.
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::platform::KeyStore store(dir / "keys");
+    std::string error;
+    const auto key = load_device_key(store, &error);
+    if (!key) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    const std::string pubkey_hex = flag(argc, argv, "--pubkey", "");
+    if (pubkey_hex.size() != 64) {
+      std::cerr << "usage: data_depot node invite --pubkey <64-hex> "
+                   "[--ttl 24h] [--nonce <hex>]\n";
+      return 2;
+    }
+    const auto ttl =
+        onion::log::parse_ttl(flag(argc, argv, "--ttl", "24h"), &error);
+    if (!ttl) {
+      std::cerr << "bad --ttl: " << error << "\n";
+      return 2;
+    }
+    std::string nonce = flag(argc, argv, "--nonce", "");
+    if (nonce.empty()) {
+      // 32 fixed hex chars: two zero-padded 64-bit draws.
+      std::random_device entropy;
+      std::mt19937_64 generator(entropy());
+      std::uniform_int_distribution<std::uint64_t> distribution;
+      std::ostringstream out;
+      out << std::hex << std::setfill('0') << std::setw(16)
+          << distribution(generator) << std::setw(16)
+          << distribution(generator);
+      nonce = out.str();
+    }
+    const std::int64_t now_s = static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    onion::log::Ed25519Signer signer(*key);
+    const auto token = onion::log::issue_invite(
+        pubkey_hex, key->device_id, *ttl, nonce, now_s, signer);
+    std::cout << onion::log::invite_to_string(token) << "\n";
     return 0;
   }
   if (argc >= 3 && std::string(argv[2]) == "debug-state") {

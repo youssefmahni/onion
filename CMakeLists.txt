@@ -129,7 +129,7 @@ set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
 
 # Data layer
-onion_add_compiled_module(log src/log/log.cpp)
+onion_add_compiled_module(log src/log/log.cpp src/log/invite.cpp)
 target_include_directories(log PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)

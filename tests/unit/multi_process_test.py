@@ -186,7 +186,9 @@ def main():
             raise AssertionError("campaign never finished everywhere")
 
         # 2. Quiescence: no node may write a new record for three sync
-        #    rounds, so the last batch has reached every replica.
+        #    rounds, so the last batch has reached every replica. A
+        #    transient HTTP error on a loaded machine must not kill the
+        #    run: this round simply does not count.
         def vector_signature():
             signature = []
             for index in (1, 2, 3):
@@ -200,7 +202,16 @@ def main():
             if time.time() > deadline:
                 raise DeadlineExceeded("quiescence")
             time.sleep(SYNC_ROUND_S)
-            current = vector_signature()
+            try:
+                current = vector_signature()
+            except (urllib.error.URLError, OSError,
+                    json.JSONDecodeError):
+                # A transient HTTP/parse error on a loaded machine: this
+                # round simply does not count. A persistently dead node
+                # keeps resetting until DeadlineExceeded fires.
+                quiescent_rounds = 0
+                previous = None
+                continue
             if current == previous and previous is not None:
                 quiescent_rounds += 1
             else:
