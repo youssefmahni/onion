@@ -529,6 +529,8 @@ int node_cmd(int argc, char** argv) {
     }
     std::cout << "sync listening on " << self_host << ":"
               << sync_server->bound_port() << "\n";
+    std::fprintf(stderr, "sync server started, members=%zu\n",
+                 lane_members.size());
   }
 
   const auto campaign_action = [&](std::string id,
@@ -647,8 +649,15 @@ int node_cmd(int argc, char** argv) {
     // Sync round every 15 s when the member list is present.
     if (sync_server && !lane_members.empty()) {
       static auto last_sync = std::chrono::steady_clock::now();
+      static std::uint64_t visits = 0;
+      if (std::getenv("ONION_SYNC_DEBUG") && ++visits % 200 == 0)
+        std::fprintf(stderr, "sync block heartbeat visits=%llu\n",
+                     static_cast<unsigned long long>(visits));
       if (std::chrono::steady_clock::now() - last_sync >=
           std::chrono::seconds(15)) {
+        if (std::getenv("ONION_SYNC_DEBUG"))
+          std::fprintf(stderr, "sync timer fired, members=%zu\n",
+                       lane_members.size());
         last_sync = std::chrono::steady_clock::now();
         for (const auto& member : lane_members) {
           if (member.device_id == device_key->device_id) continue;
