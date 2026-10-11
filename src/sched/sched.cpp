@@ -262,6 +262,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   std::deque<Ticket> waiting;
   std::unique_ptr<NodeIdAllocator> node_ids_;
   std::int64_t used_in_chunk = 0;
+  std::int64_t current_chunk_size_ = 0;
 
   const auto stop_requested = [&] {
     if (external_stop && external_stop->load()) return true;
@@ -326,9 +327,20 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       result.end_reason = "stop rule";
       break;
     }
-    if (writer.reserved_total(spec.id) >= spec.loop_budget) {
-      result.end_reason = "budget";
-      break;
+    // A spent chunk asks for the next one; when nothing fits the fleet
+    // budget anymore, the campaign is over.
+    if (used_in_chunk >= current_chunk_size_) {
+      const std::int64_t reserved = writer.reserved_total(spec.id);
+      const std::int64_t take =
+          std::min(spec.chunk, spec.loop_budget - reserved);
+      if (take <= 0) {
+        result.end_reason = "budget";
+        break;
+      }
+      current_chunk_size_ = take;
+      used_in_chunk = 0;
+      writer.submit(state::CommitTerminal{{make_record(
+          "RESERVE", {{"campaign", spec.id}, {"attempts", take}})}});
     }
 
     std::vector<Ticket> tickets = refresh_tickets();
@@ -350,19 +362,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       break;
     }
 
-    // Loop-budget chunking: one RESERVE chunk at a time, counted against
-    // the fleet-wide total (every device's RESERVE records count).
-    if (used_in_chunk == 0) {
-      const std::int64_t reserved = writer.reserved_total(spec.id);
-      const std::int64_t take =
-          std::min(spec.chunk, spec.loop_budget - reserved);
-      if (take <= 0) {
-        result.end_reason = "budget";
-        break;
-      }
-      writer.submit(state::CommitTerminal{{make_record(
-          "RESERVE", {{"campaign", spec.id}, {"attempts", take}})}});
-    }
+    (void)0;
 
     // A waiting ticket keeps its place in line (G9).
     Ticket ticket;
