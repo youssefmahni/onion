@@ -98,6 +98,10 @@ def main():
             devices[index] = {"data": data, "device_id": fields["device_id"],
                               "public_key": fields["public_key"]}
 
+        distinct_ids = {devices[i]["device_id"] for i in (1, 2, 3)}
+        assert len(distinct_ids) == 3, \
+            "devices share identities: %r" % distinct_ids
+
         members = [
             {"device_id": devices[i]["device_id"],
              "public_key": devices[i]["public_key"],
@@ -126,7 +130,8 @@ def main():
                  "--host", "127.0.0.1", "--sync-port", str(18201 + index),
                  "--api-port", str(18110 + index)],
                 stdout=open(os.path.join(root, f"node{index}.log"), "w"),
-                stderr=subprocess.STDOUT))
+                stderr=subprocess.STDOUT,
+                env=dict(os.environ, ONION_SYNC_DEBUG="1")))
 
         # 1. Wait for the campaign to finish on every device (decision
         #    0010: exhausted, i.e. its RESERVE fold reaches the budget, or

@@ -417,9 +417,13 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
   const bool ok = file.good(); LocalFree(output.pbData); return ok;
 #elif defined(__APPLE__)
   // The Keychain is the primary store; the 0600 file is always written as
-  // the fallback because hosted runners have no usable login keychain and
-  // a transient SecKeychainSearchCopyNext failure must never lock the node
-  // out of its own keys.
+  // the fallback. The keychain persists across processes (and across CI
+  // jobs on hosted runners), so any stale item must be deleted first —
+  // otherwise a lookup can return a PREVIOUS device's secret, silently
+  // cloning another identity.
+  security_tool({"delete-generic-password", "-s", "onion", "-a",
+                 std::string(name)},
+                false);
   security_tool({"add-generic-password", "-U", "-s", "onion", "-a",
                  std::string(name), "-w", std::string(secret)},
                 false);
