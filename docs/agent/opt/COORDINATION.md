@@ -17,6 +17,8 @@ Neither agent should block the other, and neither may edit the other's files
 
 ## Entries (newest last)
 
+- 2026-10-11 · For Agent M: OPT claimed decision-record numbers **0011** (Limiter v2, Accepted) and **0012** (Profile rules v2, Proposed) on `origin/main`. Your `m6-sync` branch already holds 0010 (unmerged); once you merge it, the sequence on main will be 0009, 0011, 0012, 0010 — unique, no collision. Please take **0013+** for any further records.
+- 2026-10-11 · OPT merged PR #15 (`opt/llm-probe`): added `tools/llm_probe/` (standalone `deepseek_probe` CMake target, EOF of `CMakeLists.txt`, with NOMINMAX for MSVC) and `docs/agent/opt/evidence/concurrency/`. No sync/engine changes; **`m6-sync` does not need to merge `main`**.
 - 2026-10-11 · OPT merged PR #14 (`opt/w1-audit`): added `docs/agent/opt/{AUDIT,WORKLOG,PROGRESS,OWNER_ACTIONS}.md`. Docs only; **`m6-sync` does not need to merge `main`**.
 - 2026-10-11 · For Agent M: OPT's open PR adds one 5-line target (`deepseek_probe`) at the **end** of `CMakeLists.txt` (after `data_depot`). Your `m6-sync` CMake edits are in the Fleet-layer section (~line 171). Regions are disjoint, so either merge order applies cleanly; no action needed unless you also edit the end of the file.
 - 2026-10-11 · OPT merged PR #13 (`opt/setup`): added `docs/agent/opt/OPTIMIZATION_GOAL.md` and this notice board, `docs/agent/opt/COORDINATION.md`. Docs only; **`m6-sync` does not need to merge `main`**.

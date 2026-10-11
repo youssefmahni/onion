@@ -9,3 +9,26 @@ Evidence: <commit hash, command + last lines of output, CI link>
 Attempts: <only for problems: n. hypothesis → change → evidence>
 Next step: <one precise action>
 ```
+
+## 2026-10-11 · W1 · setup: worktree, corpus copy, probe tool, audit (3 PRs)
+
+Result: done
+Evidence:
+- Worktree `~/Desktop/onion-opt` created from `origin/main` (`c074d9e`), branch `opt/setup`.
+- Corpus copied once with rsync to `~/onion-opt-data`; per-level counts verified
+  against OPTIMIZATION_GOAL.md §4.1: L0=9 L1=17 L2=95 L3=818 L4=15,779
+  L5=91,047 L6=208,499, total 316,264 — exact match. funnel_state rows = 11
+  (brief: "about 12"), atomic rows = 29 (brief: "about 30"); recorded in AUDIT.md.
+- PR #13 `opt/setup` (goal file + COORDINATION.md): merged, CI green
+  (run 38141130468, 8 jobs × 2 runs).
+- PR #14 `opt/w1-audit` (AUDIT + memory files): merged, CI green
+  (run 38141635568, 16 checks pass).
+- PR #15 `opt/llm-probe` (probe tool + evidence CSVs): merged, CI green
+  (run 38142453232, 16 checks pass).
+Attempts: 1. Windows CI failed on the probe target: MSVC `max`/`min` macro
+clash (error C2589 at deepseek_concurrency.cpp:147,148,249,279,463) → the
+`llm` module already defines NOMINMAX; added the same definitions to the
+probe target in CMakeLists.txt → all 16 checks pass.
+Next step: W2 — write decision record "Limiter v2" and the limiter v2 tests
+first (TDD), then implement in src/llm/.
+
