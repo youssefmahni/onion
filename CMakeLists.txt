@@ -78,7 +78,7 @@ endif()
 onion_add_compiled_module(platform src/platform/platform.cpp)
 if(WIN32)
   # platform is static, so consumers must receive the Windows API import libs.
-  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi)
+  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi ws2_32)
   target_compile_definitions(platform PRIVATE
     _WIN32_WINNT=0x0A00
     NOMINMAX
@@ -183,7 +183,7 @@ target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion:
 if(WIN32)
   target_link_libraries(sync PUBLIC ws2_32)
 endif()
-onion_add_compiled_module(swim src/swim/membership.cpp src/swim/swim.cpp)
+onion_add_compiled_module(swim src/swim/membership.cpp src/swim/swim.cpp src/swim/udp_transport.cpp)
 target_link_libraries(swim PUBLIC nlohmann_json::nlohmann_json onion::core onion::platform)
 onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
 target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)

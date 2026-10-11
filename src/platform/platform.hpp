@@ -64,4 +64,45 @@ class KeyStore {
  private:
   std::filesystem::path directory_;
 };
+
+// A UDP datagram socket (SWIM gossip and the LAN beacon, DESIGN ›
+// Transport: UDP 7946). Binds INADDR_ANY on the given port and optionally
+// joins a multicast group on the default interface. The socket is
+// non-blocking: recv() returns nullopt when nothing is pending.
+class UdpSocket {
+ public:
+  UdpSocket();
+  ~UdpSocket();
+  UdpSocket(const UdpSocket&) = delete;
+  UdpSocket& operator=(const UdpSocket&) = delete;
+  UdpSocket(UdpSocket&& other) noexcept;
+  UdpSocket& operator=(UdpSocket&& other) noexcept;
+
+  bool bind(std::uint16_t port, std::string* error);
+  // Joins the group for the LAN beacon; binding must have succeeded.
+  // Missing on routers that block multicast — callers fall back to seed
+  // addresses (DESIGN › Discovery).
+  bool join_group(const std::string& group, std::string* error);
+  bool send(const std::string& address, std::uint16_t port,
+            std::string_view bytes);
+
+  // The locally bound port (the one assigned when bind() got port 0).
+  std::optional<std::uint16_t> port() const;
+
+  struct Datagram {
+    std::string from_address;
+    std::string bytes;
+  };
+  std::optional<Datagram> recv();
+
+  // Closes the underlying socket (destructor, moves, and re-binds).
+  void close();
+
+ private:
+#ifdef _WIN32
+  std::uintptr_t socket_{INVALID_SOCKET};
+#else
+  int socket_{-1};
+#endif
+};
 }

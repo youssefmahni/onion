@@ -150,7 +150,8 @@ class Swim {
   };
 
   struct IndirectForward {
-    std::string originator;
+    std::string originator_id;       // the device id from the message
+    std::string originator_address;  // the datagram's source address
     std::string target;
     std::int64_t originator_seq;  // echoed so stale acks never match
     std::int64_t deadline_ms;

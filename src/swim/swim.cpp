@@ -150,7 +150,11 @@ void Swim::expire_forwardings() {
         {std::string(kTarget), forward.target},
         {std::string(kOk), false},
     };
-    transport_->send(forward.originator, report.dump());
+    const Member* originator = membership_.get(forward.originator_id);
+    transport_->send(originator && !originator->address.empty()
+                         ? originator->address
+                         : forward.originator_address,
+                     report.dump());
   }
 }
 
@@ -241,7 +245,11 @@ void Swim::handle_datagram(const std::string& from_address,
 
   if (type == kPing) {
     // Dissemination: updates piggyback on pings as well as acks, so merge
-    // them before replying.
+    // them before replying. Replies go to the sender's registered
+    // host:port address (the datagram's source address has no port).
+    // Accepted risk (decision 0013): pings/acks are unauthenticated, so a
+    // spoofed "from" only redirects our reply — membership state changes
+    // still require signed updates.
     merge_updates();
     nlohmann::json reply = {
         {std::string(kMsgType), std::string(kAck)},
@@ -249,7 +257,12 @@ void Swim::handle_datagram(const std::string& from_address,
         {std::string(kSeq), seq},
     };
     flush_gossip(reply);
-    if (transport_) transport_->send(from_address, reply.dump());
+    if (transport_) {
+      const Member* sender = membership_.get(from);
+      transport_->send(sender && !sender->address.empty() ? sender->address
+                                                          : from_address,
+                       reply.dump());
+    }
     return;
   }
 
@@ -269,7 +282,7 @@ void Swim::handle_datagram(const std::string& from_address,
     flush_gossip(forward);
     if (transport_) {
       indirect_forwards_[local_seq] = IndirectForward{
-          from_address, target, seq,
+          from, from_address, target, seq,
           clock_->now_ms() + options_.ack_timeout_ms,
       };
       const Member* target_member = membership_.get(target);
@@ -295,7 +308,11 @@ void Swim::handle_datagram(const std::string& from_address,
             {std::string(kTarget), forward.target},
             {std::string(kOk), true},
         };
-        transport_->send(forward.originator, report.dump());
+        const Member* originator = membership_.get(forward.originator_id);
+        transport_->send(originator && !originator->address.empty()
+                             ? originator->address
+                             : forward.originator_address,
+                         report.dump());
       }
       merge_updates();
       return;

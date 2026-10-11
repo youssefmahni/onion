@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <string>
+#include <thread>
 
 #include "swim/swim.hpp"
+#include "swim/udp_transport.hpp"
 
 namespace onion::swim {
 namespace {
@@ -538,6 +541,67 @@ TEST(SwimProtocol, IdleWithNoPeersDoesNothing) {
   }
   EXPECT_TRUE(transport.sent_.empty());
   EXPECT_EQ(solo.membership().self().state, MemberState::ACTIVE);
+}
+
+TEST(SwimUdpTest, PingAckOverRealLoopbackSockets) {
+  // The same failure-detection happy path, but through real UDP sockets
+  // on 127.0.0.1: the transport splits host:port addresses, the engine
+  // ticks against a fake clock, and datagrams are drained by poll().
+  FakeClock clock(0);
+  UdpTransport transport_a;
+  UdpTransport transport_b;
+  std::string error;
+  ASSERT_TRUE(transport_a.open(0, "", &error)) << error;
+  ASSERT_TRUE(transport_b.open(0, "", &error)) << error;
+  const auto port_a = transport_a.port();
+  const auto port_b = transport_b.port();
+  ASSERT_TRUE(port_a.has_value());
+  ASSERT_TRUE(port_b.has_value());
+
+  Options options_a = node_options(
+      "dev-a", "127.0.0.1:" + std::to_string(*port_a));
+  Options options_b = node_options(
+      "dev-b", "127.0.0.1:" + std::to_string(*port_b));
+  Swim a(options_a);
+  Swim b(options_b);
+  a.set_clock(&clock);
+  b.set_clock(&clock);
+  a.set_transport(&transport_a);
+  b.set_transport(&transport_b);
+  transport_a.set_receiver(
+      [&](const std::string& from, std::string bytes) {
+        a.handle_datagram(from, std::move(bytes));
+      });
+  transport_b.set_receiver(
+      [&](const std::string& from, std::string bytes) {
+        b.handle_datagram(from, std::move(bytes));
+      });
+  set_active(a, "dev-a", "127.0.0.1:" + std::to_string(*port_a));
+  set_active(b, "dev-b", "127.0.0.1:" + std::to_string(*port_b));
+  know(a, "dev-b", "127.0.0.1:" + std::to_string(*port_b),
+       MemberState::ACTIVE);
+  know(b, "dev-a", "127.0.0.1:" + std::to_string(*port_a),
+       MemberState::ACTIVE);
+
+  // a pings b over UDP; b's ack returns through the sockets. The kernel
+  // may deliver asynchronously, so drain with a bounded wait.
+  a.probe_now("dev-b");
+  for (int attempt = 0; attempt < 200 && a.pending_ping_target().has_value();
+       attempt++) {
+    transport_b.poll();  // b receives the ping, sends the ack
+    transport_a.poll();  // a receives the ack
+    if (!a.pending_ping_target().has_value()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_FALSE(a.pending_ping_target().has_value());
+  EXPECT_EQ(a.membership().get("dev-b")->state, MemberState::ACTIVE);
+
+  // A missed ping still suspects, now through the real socket path.
+  transport_b.set_receiver([](const std::string&, std::string) {});
+  a.probe_now("dev-b");
+  clock.advance(1000);
+  a.advance_timers();
+  EXPECT_EQ(a.membership().get("dev-b")->state, MemberState::SUSPECT);
 }
 
 }  // namespace
