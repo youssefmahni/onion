@@ -88,14 +88,9 @@ TEST(DataDirTest, EnvironmentPrecedence) {
 }
 TEST_F(PlatformTest, KeyStoreRoundTripsAndRejectsTraversal) {
   onion::platform::KeyStore store(root_ / "keys");
-#ifdef __APPLE__
-  // The Keychain backend needs an unlocked login keychain; hosted runners
-  // have none, so the round trip is validated on real Macs (OA-12).
-  if (!store.put("device.key", "secret"))
-    GTEST_SKIP() << "no usable Keychain on this runner";
-  EXPECT_EQ(store.get("device.key"), std::optional<std::string>("secret"));
-  EXPECT_FALSE(store.put("../outside", "bad"));
-#else
+  // The 0600 file is the source of truth on every OS (macOS included:
+  // the keychain is only a migration fallback, so no unlocked login
+  // keychain is needed — this test runs everywhere, no skip).
   ASSERT_TRUE(store.put("device.key", "secret"));
   EXPECT_EQ(store.get("device.key"), std::optional<std::string>("secret"));
   EXPECT_FALSE(store.put("../outside", "bad"));
@@ -107,7 +102,6 @@ TEST_F(PlatformTest, KeyStoreRoundTripsAndRejectsTraversal) {
   EXPECT_EQ(key.st_mode & 0777, 0600);
   ASSERT_EQ(::chmod((root_ / "keys" / "device.key").c_str(), 0644), 0);
   EXPECT_FALSE(store.get("device.key"));
-#endif
 #endif
 }
 TEST(PlatformSampleTest, OSValuesArePresent) {

@@ -451,20 +451,23 @@ std::optional<std::string> KeyStore::get(std::string_view name) const {
   if (!valid_name(name)) return std::nullopt;
 #if defined(__APPLE__)
   {
-    auto keychain = security_tool({"find-generic-password", "-s", "onion", "-a",
-                                   std::string(name), "-w"},
-                                  true);
-    if (keychain) return keychain;
-  }
-  {
+    // The 0600 file is the source of truth (deterministic, permission
+    // checked): the shared login keychain on CI runners survives across
+    // jobs and machines, and parallel nodes on one machine collide on the
+    // same service/account item — reading it first silently returned
+    // another device's key (the macOS BadSig root cause). The keychain is
+    // only a migration fallback for installs that predate the file.
     struct stat status{};
     const auto path = directory_ / std::string(name);
-    if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0)
-      return std::nullopt;
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return std::nullopt;
-    return std::string((std::istreambuf_iterator<char>(file)), {});
+    if (::stat(path.c_str(), &status) == 0 && (status.st_mode & 0077) == 0) {
+      std::ifstream file(path, std::ios::binary);
+      if (file)
+        return std::string((std::istreambuf_iterator<char>(file)), {});
+    }
   }
+  return security_tool({"find-generic-password", "-s", "onion", "-a",
+                        std::string(name), "-w"},
+                       true);
 #elif defined(_WIN32)
   std::ifstream file(directory_ / std::string(name), std::ios::binary);
   if (!file) return std::nullopt;
