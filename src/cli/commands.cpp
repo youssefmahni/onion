@@ -834,10 +834,16 @@ int node_cmd(int argc, char** argv) {
               {*writer, device_key, std::move(client_members)});
           const int applied =
               client.run_round(peer, &quarantined, &sync_error);
-          if (std::getenv("ONION_SYNC_DEBUG"))
-            std::fprintf(stderr, "sync round to %s: applied=%d error=%s\n",
+          if (std::getenv("ONION_SYNC_DEBUG")) {
+            std::string quarantine_note;
+            for (const auto& [origin, reason] : quarantined)
+              quarantine_note += " " + origin + "->" + reason;
+            std::fprintf(stderr,
+                         "sync round to %s: applied=%d error=%s%s\n",
                          peer.c_str(), applied,
-                         sync_error.empty() ? "none" : sync_error.c_str());
+                         sync_error.empty() ? "none" : sync_error.c_str(),
+                         quarantine_note.c_str());
+          }
         }
       }
     }
