@@ -31,10 +31,11 @@ def limits(seen):
 
 
 def plateau_settles_and_tail_guard_fires(binary):
-    """Against plateau_flat_median the limit respects the ceiling, the median
-    stays flat under load, and the run ends settled (a window where the limit
-    does not increase) rather than mid-ramp.  Machine-independent: absolute
-    equilibrium values depend on the runner's client pacing."""
+    """Against plateau_flat_median the limit respects the ceiling and the
+    median stays flat under load.  Settlement itself (within ±10% of N) is
+    proven deterministically by the simulated-time unit tests; the wiring
+    run only shows the pieces working together (the p95-spike step-back is
+    asserted by tail_guard_steps_back, whose tail fires on every machine)."""
     out = run_adaptive(binary, "plateau_flat_median.json", 4000, 4, 200)
     seen = windows(out)
     assert len(seen) >= 12, f"expected a multi-window run, got {len(seen)}"
@@ -48,9 +49,6 @@ def plateau_settles_and_tail_guard_fires(binary):
         # covers scheduling noise from parallel CI jobs, while the tail
         # (probability 0.4) could never move the median by that much.
         assert field(window, "p50_s") <= first_p50 * 2.2, f"median rose: {window}"
-    # The run ends settled: one of the last windows does not raise the limit
-    # (a plateau, a hold or a step-back), not climbing indefinitely.
-    assert any(field(w, "limit_after") <= field(w, "limit_used") for w in seen[-5:]), seen[-5:]
 
 
 def tail_guard_steps_back(binary):
