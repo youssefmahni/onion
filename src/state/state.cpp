@@ -471,6 +471,14 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       statement->bind(1, payload.at("path").get<std::string>(), &bind_error);
       statement->step(&bind_error);
     }
+  } else if (type == "RESERVE") {
+    const auto& payload = record.payload;
+    const std::string campaign = payload.value("campaign", std::string{});
+    const std::int64_t attempts = payload.value("attempts", std::int64_t{0});
+    const std::string key = origin + ":" + std::to_string(record.hlc);
+    std::unique_lock lock(index_mutex_);
+    if (seen_reserve_keys_.insert(key).second)
+      reserved_by_campaign_[campaign] += attempts;
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
     auto statement = db_.prepare(
