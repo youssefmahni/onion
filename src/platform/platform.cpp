@@ -455,14 +455,18 @@ std::optional<std::string> KeyStore::get(std::string_view name) const {
     // checked): the shared login keychain on CI runners survives across
     // jobs and machines, and parallel nodes on one machine collide on the
     // same service/account item — reading it first silently returned
-    // another device's key (the macOS BadSig root cause). The keychain is
-    // only a migration fallback for installs that predate the file.
+    // another device's key (the macOS BadSig root cause). When the file
+    // exists it is authoritative: bad permissions or an unreadable file
+    // fail CLOSED (the keychain must never bypass the permission gate).
+    // The keychain is consulted only when the file is absent — a
+    // migration fallback for installs that predate the file.
     struct stat status{};
     const auto path = directory_ / std::string(name);
-    if (::stat(path.c_str(), &status) == 0 && (status.st_mode & 0077) == 0) {
+    if (::stat(path.c_str(), &status) == 0) {
+      if ((status.st_mode & 0077) != 0) return std::nullopt;
       std::ifstream file(path, std::ios::binary);
-      if (file)
-        return std::string((std::istreambuf_iterator<char>(file)), {});
+      if (!file) return std::nullopt;
+      return std::string((std::istreambuf_iterator<char>(file)), {});
     }
   }
   return security_tool({"find-generic-password", "-s", "onion", "-a",
