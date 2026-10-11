@@ -470,17 +470,18 @@ void StateWriter::rebuild_index() {
       review_paths_.insert(review.path);
   }
   for (const store::Campaign& campaign : db_.campaigns(&error)) {
-    campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
+    campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec,
+                                      campaign.state, campaign.hlc,
+                                      campaign.origin});
     const auto spec = nlohmann::json::parse(campaign.spec, nullptr, false);
     if (spec.is_object() && spec.contains("loop_budget") &&
         spec["loop_budget"].is_number_integer())
       campaign_budgets_[campaign.id] = spec["loop_budget"].get<std::int64_t>();
   }
-  reserved_by_campaign_.clear();
-  reserved_by_origin_campaign_.clear();
-  seen_reserve_keys_.clear();
-  reserve_entries_.clear();
-  campaign_budgets_.clear();
+  // The RESERVE fold is replayed from the log before this point (replay()
+  // folds every record); RESERVE has no store table, so these maps must
+  // survive the rebuild — clearing them here erased the fleet budget
+  // accounting on every restart (decision 0014).
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -600,14 +601,22 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     const auto& payload = record.payload;
     const std::string id = payload.at("id").get<std::string>();
     std::string state = payload.at("state").get<std::string>();
-    // stop is final, in the index as in the store.
     auto it = std::find_if(campaigns_.begin(), campaigns_.end(),
                            [&](const CampaignInfo& c) { return c.id == id; });
+    // Latest (hlc, origin) wins, in the index exactly as in the store
+    // (upsert_campaign's WHERE): a stale record delivered late must not
+    // move the campaign back (decision 0014's capped fold reads this).
+    const bool newer =
+        it == campaigns_.end() || record.hlc > it->hlc ||
+        (record.hlc == it->hlc && origin > it->origin);
+    if (!newer) return;
+    // stop is final, in the index as in the store.
     if (it != campaigns_.end() && it->state == "stopped") state = "stopped";
     campaigns_.erase(std::remove_if(campaigns_.begin(), campaigns_.end(),
                                     [&](const CampaignInfo& c) { return c.id == id; }),
                      campaigns_.end());
-    campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state});
+    campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state,
+                                      record.hlc, origin});
     // Decision 0014: the capped fold uses the LATEST spec's loop budget.
     const auto spec = payload.at("spec");
     if (spec.is_object() && spec.contains("loop_budget") &&

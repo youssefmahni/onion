@@ -194,15 +194,15 @@ def main():
         while not finished_everywhere():
             if time.time() > deadline:
                 raise DeadlineExceeded(
-                    "campaign never finished everywhere (no-progress "
-                    "window exceeded)")
+                    "campaign never finished everywhere")
             time.sleep(2.0)
+            current = None
             try:
                 current = [node_state(ports[index]["api"]).get("vector", {})
                            for index in (1, 2, 3)]
             except Exception:
-                continue
-            if current != last_vector:
+                current = None  # a dead node shows as no progress
+            if current is not None and current != last_vector:
                 last_vector = current
                 last_progress = time.time()
             elif time.time() - last_progress > NO_PROGRESS_S:
@@ -258,10 +258,12 @@ def main():
         assert merkle[0] == merkle[1] == merkle[2], merkle
 
         # Decision 0014: the fleet-wide budget overshoot is at most one
-        # chunk per device. The uncapped RESERVE sum on any replica is the
-        # same everywhere; it must stay within budget + one chunk per
-        # device (the chunk here is the 50-attempt floor: every device's
-        # measured window stays below it).
+        # chunk per device. The uncapped RESERVE sum is identical on every
+        # replica (the merkle roots match, and the fold is order-
+        # independent), so reading it from device 1's state suffices. It
+        # must stay within budget + one chunk per device (the chunk here
+        # is the 50-attempt floor: every device's measured window stays
+        # below it).
         budget = 100
         total_reserved = sum(
             campaign.get("reserved_uncapped", 0)

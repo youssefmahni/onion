@@ -364,3 +364,25 @@ TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
   EXPECT_EQ(second.end_reason, "drained");  // the resumed tickets finished
   EXPECT_GT(second.settled, 0);
 }
+
+TEST_F(EngineTest, StructureReviewDoesNotReprocessTheTicket) {
+  seed_root();
+  Budget budget("10");
+  Engine engine = make_engine(budget);
+  CampaignSpec campaign = spec();
+  campaign.structure = false;  // the root is L1: expansion goes to review
+  const Engine::RunResult first = engine.run(campaign, nullptr);
+  EXPECT_EQ(first.reviews, 1);
+  EXPECT_EQ(first.settled, 0);
+
+  // Running again must not re-attempt the reviewed ticket: still exactly
+  // one review, no new children, no spend.
+  const Engine::RunResult second = engine.run(campaign, nullptr);
+  EXPECT_EQ(second.reviews, 0);
+  EXPECT_EQ(second.attempts, 0);
+  std::string error;
+  EXPECT_EQ(writer_->db().open_reviews(&error).size(), 1u);
+  // The root plus the review-stored children (decision 0008) — and the
+  // second run added nothing.
+  EXPECT_EQ(writer_->db().all_nodes(&error).size(), 4u);
+}

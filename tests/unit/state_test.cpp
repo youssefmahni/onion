@@ -538,10 +538,12 @@ onion::log::Batch reserve_batch(
     const std::string& origin, std::uint64_t number,
     std::vector<std::pair<std::int64_t, std::int64_t>> reserves) {
   std::vector<Record> records;
+  std::int64_t seq = 1;  // the replay's contiguity check expects 1..n
   for (const auto& [hlc, attempts] : reserves) {
     Record record = make_record(
         "RESERVE", {{"campaign", "mp1"}, {"attempts", attempts}});
     record.hlc = hlc;
+    record.seq = seq++;
     records.push_back(std::move(record));
   }
   onion::log::NullSigner signer;
@@ -639,4 +641,56 @@ TEST_F(StateWriterTest, ReservationThatExactlyFitsIsNotVoid) {
   writer_->sync();
   EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
   EXPECT_TRUE(writer_->reservation_void("mp1", origin_b, 300));
+}
+
+TEST_F(StateWriterTest, ReserveFoldSurvivesRestart) {
+  // Decision 0014: the RESERVE fold is log-only (no store table) — after
+  // a restart the replay must restore the capped total and the void set,
+  // or a rebooted device forgets the fleet's budget accounting.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  writer_->submit(onion::state::AppendForeign{reserve_batch(
+      "dev00000000000000aa", 1, {{100, 500}, {200, 500}})});
+  writer_->sync();
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+
+  // Restart on the same directory.
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 100));
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
+}
+
+TEST_F(StateWriterTest, StaleCampaignRecordDoesNotMoveTheBudget) {
+  // Latest (hlc, origin) wins for the budget too: a stale CAMPAIGN record
+  // delivered late must not shrink the cap on any replica.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);  // budget 1000, folded with a real hlc
+
+  // A stale record with a LOWER hlc claims budget 10.
+  onion::log::Record stale;
+  stale.type = "CAMPAIGN";
+  stale.payload = {{"id", "mp1"},
+                   {"spec", {{"loop_budget", 10}, {"chunk", 50}}},
+                   {"state", "running"}};
+  stale.hlc = 1;  // far below the first record's hlc
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000bb", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{stale}, signer)});
+  writer_->sync();
+
+  writer_->submit(onion::state::AppendForeign{reserve_batch(
+      "dev00000000000000aa", 1, {{100, 500}, {200, 500}})});
+  writer_->sync();
+  // The cap stayed 1000: both entries count.
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
 }

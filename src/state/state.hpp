@@ -59,6 +59,8 @@ struct CampaignInfo {
   std::string id;
   std::string spec;    // JSON
   std::string state;   // running | paused | stopped
+  std::int64_t hlc{};        // latest (hlc, origin) wins
+  std::string origin;
 };
 
 class StateWriter {

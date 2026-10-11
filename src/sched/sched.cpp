@@ -163,10 +163,15 @@ std::int64_t NodeIdAllocator::counter_from_code(std::string_view code) {
 struct Engine::Impl {
   Options options;
   std::atomic<bool> internal_stop{false};
-  // Decision 0014: sync-round pacing for fleet reservations.
-  bool sync_round_complete{true};  // the first reservation is free
-  std::int64_t attempts_in_window{0};
-  std::int64_t last_window_attempts{0};
+  // Decision 0014: sync-round pacing for fleet reservations, per campaign
+  // (one Engine runs every campaign, so the round state must not leak
+  // between them).
+  struct RoundState {
+    bool sync_round_complete{true};  // the first reservation is free
+    std::int64_t attempts_in_window{0};
+    std::int64_t last_window_attempts{0};
+  };
+  std::map<std::string, RoundState> round_states;
   std::map<std::string, std::vector<std::int64_t>> own_reserve_hlcs;
   log::HlcClock hlc;
 };
@@ -176,9 +181,11 @@ Engine::Engine(Options options)
 Engine::~Engine() = default;
 
 void Engine::note_sync_round() {
-  impl_->last_window_attempts = impl_->attempts_in_window;
-  impl_->attempts_in_window = 0;
-  impl_->sync_round_complete = true;
+  for (auto& [campaign, state] : impl_->round_states) {
+    state.last_window_attempts = state.attempts_in_window;
+    state.attempts_in_window = 0;
+    state.sync_round_complete = true;
+  }
 }
 
 namespace {
@@ -258,6 +265,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                              {"gate", std::to_string(spec.gate)},
                              {"floor", std::to_string(spec.floor)},
                              {"chunk", spec.chunk},
+                             {"structure", spec.structure},
                              {"model", spec.model}}},
                    {"state", "running"}})}});
   }
@@ -382,7 +390,8 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     if (used_in_chunk >= current_chunk_size_) {
       const std::int64_t reserved = writer.reserved_total(spec.id);
       const bool fleet = !impl_->options.members.empty();
-      if (fleet && !impl_->sync_round_complete) {
+      auto& round_state = impl_->round_states[spec.id];
+      if (fleet && !round_state.sync_round_complete) {
         // Decision 0014: at most one reservation per sync round. The node
         // loop re-enters run() after the next completed round.
         result.end_reason = "drained";
@@ -393,7 +402,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         // The measured chunk: max(50, attempts in the previous sync-round
         // window × 1.2, ceiling) — fast devices are not throttled.
         const std::int64_t measured = std::max<std::int64_t>(
-            50, (impl_->last_window_attempts * 6 + 4) / 5);
+            50, (round_state.last_window_attempts * 6 + 4) / 5);
         take = std::min(measured, spec.loop_budget - reserved);
       } else {
         take = std::min(spec.chunk, spec.loop_budget - reserved);
@@ -404,7 +413,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       }
       current_chunk_size_ = take;
       used_in_chunk = 0;
-      impl_->sync_round_complete = false;
+      round_state.sync_round_complete = false;
       log::Record reserve = make_record(
           "RESERVE", {{"campaign", spec.id}, {"attempts", take}});
       // The engine stamps the hlc so it can recognise its own entries for
@@ -474,17 +483,21 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                       {"campaign", spec.id},
                       {"issues", attempt.issues}})});
       result.attempts++;
-      impl_->attempts_in_window++;
+      impl_->round_states[spec.id].attempts_in_window++;
     }
 
     used_in_chunk++;
     // Children are stored with the review so accept can settle without
-    // spending more (decision 0008).
+    // spending more (decision 0008). The caches must update too: an open
+    // review filters the path out of the ticket stream, and the children
+    // join node_cache so an accept can expand them without a re-fetch.
     const auto emit_needs_review = [&](const gate::Attempt& chosen,
                                        std::string reason) {
       std::vector<log::Record> records;
+      std::vector<std::string> new_ids;
       for (const gate::Child& child : chosen.children) {
         const std::string id = node_ids_->allocate();
+        new_ids.push_back(id);
         records.push_back(make_record(
             "ADD_NODE", {{"path", ticket.path + "-" + id},
                          {"layer", ticket.layer + 1},
@@ -500,6 +513,16 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                            {"attempts", funnel_result.attempts.size()},
                            {"score", std::to_string(chosen.score)}}));
       writer.submit(state::CommitTerminal{std::move(records)});
+      if (cache_valid) {
+        review_cache.push_back(ticket.path);
+        for (std::size_t i = 0; i < chosen.children.size(); ++i) {
+          store::Node child_node;
+          child_node.path = ticket.path + "-" + new_ids[i];
+          child_node.layer = ticket.layer + 1;
+          child_node.title = chosen.children[i].title;
+          node_cache.push_back(std::move(child_node));
+        }
+      }
       result.reviews++;
     };
     switch (funnel_result.decision) {
