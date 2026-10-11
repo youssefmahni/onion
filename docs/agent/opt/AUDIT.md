@@ -87,8 +87,19 @@ the M2/M5 scope.
   0004 (request shape, usage fields, truncation, 401). The OPT-track C5 re-run
   is cheap (≤ 10 calls) and is planned for W3.
 
-## 5. Agent M areas not touched (read-only)
+## 4b. macOS runner slowness — verdict: harness-side (measured 2026-10-11)
 
+The macOS CI runner showed ~3× the per-request latency of Linux in the wiring
+runs. A diagnostic (temporary workflow on the macOS runner, `llm probe`
+against the fake server, comparing the client's `latency_s` with the server's
+recorded `elapsed_ms` per request) measured: client p50 13.8 ms, server p50
+11.5 ms → a 2.3 ms client overhead. The macOS client is not slower per
+request; the wiring-test slowness came from the test harness (window pacing
+and the connection-ramp queue), not from the engine. No Mac Pro fleet item is
+needed. (The timing-sensitive wiring tests moved to `opt-nightly.yml`
+anyway, so the harness effect no longer matters to CI.)
+
+## 5. Agent M areas not touched (read-only)
 `src/sync/`, `src/swim/`, the lane/stealing parts of `src/sched/`,
 `tests/fleet/`, `tools/chaos/`, `docs/agent/PROGRESS.md`, `docs/agent/WORKLOG.md`,
 `docs/agent/gates/M6*.md`, `.github/workflows/ci.yml`. The open M6 convergence
