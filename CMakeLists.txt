@@ -320,3 +320,11 @@ add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
 target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
+
+# Standalone real-DeepSeek concurrency probe (dev tool, OPT track W1).
+# Links only libcurl; not part of the engine.
+add_executable(deepseek_probe tools/llm_probe/deepseek_concurrency.cpp)
+target_link_libraries(deepseek_probe PRIVATE ${ONION_CURL_TARGET} Threads::Threads)
+if(WIN32)
+  target_compile_definitions(deepseek_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
