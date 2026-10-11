@@ -39,6 +39,24 @@ std::int64_t now_s() {
           .count());
 }
 
+// The exact signed bytes, hex-encoded, for the OA-13-style diagnosis of a
+// rejected request: compare Linux vs macOS byte for byte.
+std::string signed_bytes_hex(std::string_view device_id,
+                             std::string_view method, std::string_view path,
+                             std::string_view body,
+                             std::int64_t timestamp_s) {
+  const std::string bytes = signed_bytes(device_id, method, path, body,
+                                         timestamp_s);
+  static const char* digits = "0123456789abcdef";
+  std::string hex;
+  hex.reserve(bytes.size() * 2);
+  for (const unsigned char byte : bytes) {
+    hex.push_back(digits[byte >> 4]);
+    hex.push_back(digits[byte & 0xf]);
+  }
+  return hex;
+}
+
 }  // namespace
 
 std::string sign_request(std::string_view device_id, std::string_view method,
@@ -133,27 +151,38 @@ bool SyncServer::start(std::string* error) {
     const std::string device_id = request.get_header_value("X-Onion-Device");
     const std::string timestamp = request.get_header_value("X-Onion-Time");
     const std::string signature = request.get_header_value("X-Onion-Sig");
-    if (device_id.empty() || timestamp.empty() || signature.empty()) {
+    const auto reject = [&](const char* reason) -> const MemberKey* {
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr,
+                     "[sync-auth] REJECT %s: device=%s ts-header=%s "
+                     "sig-header=%s target=%s body-hash=%s now=%lld "
+                     "signed-bytes-hex=%s\n",
+                     reason, device_id.c_str(), timestamp.c_str(),
+                     signature.c_str(), request.target.c_str(),
+                     onion::log::blake2b_hex(request.body).c_str(),
+                     static_cast<long long>(now_s()),
+                     signed_bytes_hex(device_id, "GET", request.target,
+                                      request.body,
+                                      std::atoll(timestamp.c_str()))
+                         .c_str());
       response.status = 401;
+      response.set_content(std::string("{\"error\":\"") + reason +
+                               "\"}",
+                           "application/json");
       return nullptr;
-    }
+    };
+    if (device_id.empty() || timestamp.empty() || signature.empty())
+      return reject("missing auth header");
     const MemberKey* member = find_member(impl_->options.members, device_id);
-    if (!member) {
-      response.status = 401;
-      return nullptr;
-    }
+    if (!member) return reject("unknown device");
     const std::int64_t ts = std::atoll(timestamp.c_str());
     // The signature covers the full target (path + query); httplib keeps
     // the query only in request.target.
     if (!request_signature_valid(device_id, "GET", request.target, request.body,
-                                 signature, member->public_key, ts, now_s())) {
-      response.status = 401;
-      return nullptr;
-    }
-    if (impl_->nonces.seen_and_add(device_id, signature, now_s())) {
-      response.status = 401;
-      return nullptr;
-    }
+                                 signature, member->public_key, ts, now_s()))
+      return reject("bad signature");
+    if (impl_->nonces.seen_and_add(device_id, signature, now_s()))
+      return reject("replayed nonce");
     return member;
   };
 
@@ -338,6 +367,14 @@ int SyncClient::run_round(std::string_view peer_base_url,
   log::Ed25519Signer signer(*impl_->options.key);
   auto request_headers = [&](std::string_view path) {
     const std::string signature = sign_request(self, "GET", path, "", ts, signer);
+    if (std::getenv("ONION_SYNC_DEBUG"))
+      std::fprintf(stderr,
+                   "[sync-client] device=%s path=%s ts=%lld body-hash=%s "
+                   "sig=%s signed-bytes-hex=%s\n",
+                   self.c_str(), std::string(path).c_str(),
+                   static_cast<long long>(ts),
+                   onion::log::blake2b_hex("").c_str(), signature.c_str(),
+                   signed_bytes_hex(self, "GET", path, "", ts).c_str());
     return httplib::Headers{{"X-Onion-Device", self},
                             {"X-Onion-Time", std::to_string(ts)},
                             {"X-Onion-Sig", signature}};

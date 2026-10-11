@@ -319,3 +319,25 @@ TEST_F(SyncTest, MidChainPullContinuesTheLocalChainHead) {
   EXPECT_EQ(applied, 1);  // the second batch
   EXPECT_TRUE(writer_b_->settled("P01-IN01-T02"));
 }
+
+TEST(SyncGolden, FixedKeyAndRequestGiveFixedSignatureOnEveryOS) {
+  // Cross-OS golden (OA-13 work): a fixed key, method, path, body and
+  // timestamp must produce byte-identical signatures on Linux, macOS and
+  // Windows — any drift in the canonical string-to-sign fails here on the
+  // platform that drifts. The expected value was produced once by this
+  // implementation and is pinned.
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  onion::log::Ed25519Signer signer(key);
+  const std::string signature = onion::sync::sign_request(
+      key.device_id, "GET", "/sync/v1/vector", "", 1700000000, signer);
+  EXPECT_EQ(key.device_id, "9d24e2eeaf27c2a0");
+  EXPECT_EQ(signature.size(), 128u);
+  EXPECT_TRUE(onion::sync::request_signature_valid(
+      key.device_id, "GET", "/sync/v1/vector", "", signature,
+      key.public_key, 1700000000, 1700000000));
+  // The exact pinned bytes:
+  EXPECT_EQ(signature,
+            "a95f84b38c90acfcf19ec1b37e39cbed2b5b4dbc1f41c5bf8667a92c81da63d2a9309209a557abe17d5dac3ca63c410ebaa35f5c47ea0d46ec5b793b40822908");
+}
