@@ -2,12 +2,15 @@
 """Wiring tests: the adaptive limiter against the fake-server scenarios of
 decision 0011 (plateau_flat_median, capacity_shift, connect_fail_burst).
 
-The absolute bands are tuned to the hosted Linux runner; on other machines
-the fake server's own throughput shifts the equilibrium slightly, so the
-assertions combine generous absolute bands with relative properties (the p95
-spike, the step-back, the halving) that hold everywhere."""
+NIGHTLY ONLY: the assertions measure wall-clock windows, throughput shapes
+and latency distributions, which depend on the runner's speed, not on
+product behaviour (AUDIT.md).  The deterministic control-law coverage lives
+in tests/unit/limiter_test.cpp and runs on every OS in ci.yml.  In the
+normal CI matrix this test skips (exit 77)."""
 import argparse
+import os
 import re
+import sys
 from pathlib import Path
 
 from fake_server_harness import run_adaptive
@@ -94,6 +97,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
+    if os.environ.get("ONION_NIGHTLY") != "1":
+        print("skipped: timing-sensitive wiring tests; run in opt-nightly.yml")
+        sys.exit(77)
     plateau_settles_and_tail_guard_fires(args.binary)
     tail_guard_steps_back(args.binary)
     connect_fail_burst_halves(args.binary)

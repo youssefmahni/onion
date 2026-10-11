@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """O2: the client's thread count is independent of the in-flight count
-(100 vs 1,000 in flight).  Linux only: thread counts come from
-/proc/<pid>/status; elsewhere the test skips (exit 77)."""
+(100 vs 1,000 in flight).
+
+NIGHTLY ONLY: the assertion polls /proc/<pid>/status while the bench runs,
+a wall-clock measurement that depends on the runner's speed, not on product
+behaviour (AUDIT.md).  In the normal CI matrix this test skips (exit 77)."""
+import os
 import subprocess
 import sys
 import time
@@ -47,6 +51,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
+    if os.environ.get("ONION_NIGHTLY") != "1":
+        print("skipped: timing-sensitive wiring test; runs in opt-nightly.yml")
+        sys.exit(77)
     if not Path("/proc/self/status").exists():
         print("skipped: /proc not available on this platform")
         sys.exit(77)

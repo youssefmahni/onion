@@ -1,0 +1,40 @@
+# OPT track nightly jobs: timing-sensitive wiring tests that measure
+# wall-clock rates, windows and latency shapes.  Their assertions depend on
+# the runner's speed, not on product behaviour, so they run here on Linux
+# instead of the normal CI matrix (docs/agent/opt/AUDIT.md).  Deterministic
+# coverage of the same control laws runs on every OS in ci.yml
+# (tests/unit/limiter_test.cpp).
+#
+# Future tenants (OPT workstreams): W3 libFuzzer targets (10 min each),
+# W5 funnel experiment replays.
+name: OPT nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wiring:
+    name: Timing-sensitive wiring tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --yes pocl-opencl-icd ocl-icd-opencl-dev
+          libcurl4-openssl-dev
+      - name: Configure
+        run: cmake --preset linux-debug
+      - name: Build
+        run: cmake --build --preset linux-debug
+      - name: Timing-sensitive wiring tests
+        run: >-
+          ctest --preset linux-debug --output-on-failure
+          -R '^llm\.(scenarios|capacity_shift|threads|ramp)$'
+        env:
+          ONION_NIGHTLY: '1'

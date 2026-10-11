@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Wiring test: the limiter follows a mid-run capacity shift (decision 0011,
-plateau probe adoption).  The Python fake server's own throughput caps below
-the shift's target on the hosted macOS and Windows runners, so the shift is
-only observable on Linux; elsewhere the test skips (exit 77)."""
+plateau probe adoption).
+
+NIGHTLY ONLY: the assertion depends on the fake server's throughput, which
+depends on the runner's speed, not on product behaviour (AUDIT.md).  The
+deterministic plateau-probe adoption coverage lives in
+tests/unit/limiter_test.cpp and runs on every OS in ci.yml.  In the normal
+CI matrix this test skips (exit 77)."""
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -32,6 +37,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
+    if os.environ.get("ONION_NIGHTLY") != "1":
+        print("skipped: timing-sensitive wiring test; runs in opt-nightly.yml")
+        sys.exit(77)
     # The Python fake server's own throughput caps well below the shift's
     # target on the hosted macOS and Windows runners (about 28-30 concurrent
     # requests there), so the shift is only observable on Linux.
