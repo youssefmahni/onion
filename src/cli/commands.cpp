@@ -625,6 +625,10 @@ int node_cmd(int argc, char** argv) {
       {*writer, ask, budget, 1, device_key->device_id, "0.02", prices,
        device_key->slot, lane_members, device_key->device_id});
   while (!stop_flag.load()) {
+    static std::uint64_t loop_visits = 0;
+    if (std::getenv("ONION_SYNC_DEBUG") && ++loop_visits % 50 == 0)
+      std::fprintf(stderr, "node loop heartbeat visits=%llu\n",
+                   static_cast<unsigned long long>(loop_visits));
     bool worked = false;
     for (const auto& campaign : writer->campaigns()) {
       if (campaign.state != "running") continue;
@@ -632,8 +636,13 @@ int node_cmd(int argc, char** argv) {
       json spec_json = json::parse(campaign.spec, nullptr, false);
       auto spec = onion::sched::parse_campaign(spec_json, &parse_error);
       if (!spec) continue;
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr, "entering engine.run for %s\n", spec->id.c_str());
       const onion::sched::Engine::RunResult result =
           engine.run(*spec, &stop_flag);
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr, "engine.run returned %s\n",
+                     result.end_reason.c_str());
       worked = true;
       std::cout << "campaign " << spec->id << " ended: " << result.end_reason
                 << " settled=" << result.settled
