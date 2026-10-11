@@ -3,6 +3,8 @@
 ## Current
 
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
+- Landed so far: signed LAN beacon + `node run` swim wiring (decision 0013 canonical signing over the updates payload, signer/verifier hooks, tolerant UDP bind so co-located nodes survive; ASAN smoke of two real nodes exchanging over UDP clean) — CI green 8/8 (run 38160064783, includes the multi-process test); three review rounds, all findings fixed (stack-use-after-scope signer capture, malformed-datagram sig/ts crash, vacuous signing test, doc drift)
+- Next: invite/join (token, slot collision, clone + Merkle, ACTIVE at lag<100), majority & eviction, stealing, chaos tools, multi-process join/kill scenarios
 - Landed so far: `src/swim` membership core (22 tests, run 38152532336 green) + the real UDP transport (`platform::UdpSocket` POSIX/Windows + `swim::UdpTransport`, replies to registered host:port addresses, bounded poll drain, decision 0013) — 260/260 local, CI green 8/8 (run 38155206858); one CI build-break cycle fixed (macOS `ip_mreq.imr_interface`, winsock-free header sentinel)
 - Earlier: `src/swim` membership core (ping/ack, 2 indirect probes, SUSPECT, refutation via incarnation+1, DEAD after the suspicion timeout, piggybacked gossip, 5 s beacon timer, 8 states, injectable transport+clock) — 22 deterministic tests, CI green 8/8 (run 38152532336); reviewed twice (2 CRITICAL/HIGH-class findings fixed: synchronous-transport iterator invalidation, malformed-datagram exceptions, suspicion-deadline reset, seq collisions, self-suspect refutation, positive-ack race)
 - Next units: UDP 7946 transport + signed multicast beacon (decision 0013), invite/join, majority & eviction, stealing, chaos tools, multi-process join/kill scenarios
@@ -11,6 +13,7 @@
 
 ## Log (newest first)
 
+- 2026-10-11: M7 beacon signing + node wiring committed (`526f8b8`), CI green 8/8
 - 2026-10-11: M7 SWIM core committed (`2e87391`), CI green 8/8, decision 0013 (SWIM wire defaults + beacon group 239.255.77.31:7946) drafted
 - 2026-10-11: M6 merged as PR #12 (`1f5176a`), all 8 CI jobs green on the final head (three consecutive green runs before the final test additions), tagged `m6-rc` · gate report docs/agent/gates/M6.md · root causes fixed: mid-chain sync pulls started with an empty expected_prev (liveness), devices reserved chunks without work, dev-import nodes never synced, macOS keychain identity cloning; the macOS arm64 CI 401 in the signed-request authenticate() remains — the multi-process test skips there (recorded SKIPPED via exit 77), tracked as OA-13 for M7 · decision 0010 (exhausted vs finished) added to DESIGN.md · no real calls
 - 2026-10-10: M5 merged as PR #11 (`c074d9e`), all 8 CI jobs green, tagged `m5-rc` · gate report docs/agent/gates/M5.md · the legacy pool-resize flake was fixed for real: the manager runs work() inline so the old handshake deadlocked (PR #9), and the announce print is torn by concurrent workers (PR #10) — the test now counts atomic announce prefixes · no real calls
