@@ -2,12 +2,13 @@
 
 ## Current
 
-- Milestone: M6 · branch m6-sync · started 2026-10-10
-- M5 merged (`c074d9e`, PR #11), tagged `m5-rc`; M4 merged (`5b03cb4`), tagged `m4-rc`
-- Tests: 206/206 new-tree on Linux · legacy 98/98 · CI green on the M5 merge
+- Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
+- M6 merged (`1f5176a`, PR #12), tagged `m6-rc`; M5 merged (`c074d9e`), tagged `m5-rc`
+- Tests: 224/224 new-tree on Linux · legacy 98/98 · CI green on the M6 merge
 
 ## Log (newest first)
 
+- 2026-10-11: M6 merged as PR #12 (`1f5176a`), all 8 CI jobs green on the final head (three consecutive green runs before the final test additions), tagged `m6-rc` · gate report docs/agent/gates/M6.md · root causes fixed: mid-chain sync pulls started with an empty expected_prev (liveness), devices reserved chunks without work, dev-import nodes never synced, macOS keychain identity cloning; the macOS arm64 CI 401 in the signed-request authenticate() remains — the multi-process test skips there (recorded SKIPPED via exit 77), tracked as OA-13 for M7 · decision 0010 (exhausted vs finished) added to DESIGN.md · no real calls
 - 2026-10-10: M5 merged as PR #11 (`c074d9e`), all 8 CI jobs green, tagged `m5-rc` · gate report docs/agent/gates/M5.md · the legacy pool-resize flake was fixed for real: the manager runs work() inline so the old handshake deadlocked (PR #9), and the announce print is torn by concurrent workers (PR #10) — the test now counts atomic announce prefixes · no real calls
 - 2026-10-10: M4 merged as PR #8 (`5b03cb4`), all 8 CI jobs green, tagged `m4-rc` · gate report docs/agent/gates/M4.md (signed log, torn-tail at every byte offset, checkpoints, genesis import verifier; corpus-copy import scripted as OA-10) · one legacy flake observed on Linux CI, passed on re-run, no product change · no real calls
 - 2026-10-10: M4 in place: device keys and Ed25519 (golden cross-check), full batch verification, zstd-sealed segments, verified torn-tail repair (tested at every byte offset), slot-scoped 64-bit TK ids, checkpoints with signed manifests and Merkle roots (decision 0009), the eviction-signature rule, admin keygen, the genesis import with duplicate proposal/resolution and a CSV verifier, CUTOVER.md and the weekly dry-run script · corpus-copy import is an owner action (OA-2 pending) · no real calls
