@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <map>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
@@ -33,6 +34,12 @@ struct AppendAttempt {
 // and SETTLE last — or a single NEEDS_REVIEW record.
 struct CommitTerminal {
   std::vector<log::Record> records;
+};
+
+// A verified batch pulled from a peer (M6): appended to the local copy of
+// that origin's log, durably, then folded with the batch's own origin.
+struct AppendForeign {
+  log::Batch batch;
 };
 
 // Unsigned development import (M3 only; M4 replaces it with the genesis
@@ -82,6 +89,7 @@ class StateWriter {
   void submit(AppendAttempt command);
   void submit(CommitTerminal command);
   void submit(DevImport command);
+  void submit(AppendForeign command);
   // Blocks until every queued command is durable and folded.
   void sync();
   // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
@@ -89,6 +97,11 @@ class StateWriter {
   // Drains and joins the writer thread.
   void stop();
 
+  // The applied vector (origin -> last record seq).
+  std::map<std::string, std::int64_t> vector() const;
+  // The head hash of an origin's local chain (empty when nothing is known;
+  // batch 1 then chains from the genesis public-key hash).
+  std::optional<std::string> origin_prev_hash(std::string_view origin) const;
   // Read side (any thread; WAL reads plus a shared index).
   const store::Db& db() const;
   log::Segments& segments();
@@ -96,22 +109,36 @@ class StateWriter {
   bool leaf(std::string_view path) const;         // settled, cannot split
   bool needs_review(std::string_view path) const;
   std::optional<CampaignInfo> campaign(std::string_view id) const;
+  // Fleet-wide RESERVE totals per campaign (folded from every synced log,
+  // replay-safe and deduplicated by origin + hlc).
+  std::int64_t reserved_total(std::string_view campaign) const;
+  // Per-origin RESERVE totals for one campaign, for diagnostics.
+  std::map<std::string, std::int64_t> reserved_by_origin(
+      std::string_view campaign) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
 
  private:
   struct Command {
-    enum class Kind { Attempt, Terminal, Import, Sync, Shutdown } kind;
+    enum class Kind { Attempt, Terminal, Import, Foreign, Sync, Shutdown } kind;
     log::Record attempt;
     std::vector<log::Record> records;
     std::vector<DevImportedNode> nodes;
+    log::Batch foreign;
   };
 
   void run();
   bool flush_pending_attempts(std::string* error);
   bool append_batch(std::vector<log::Record> records, std::string* error);
-  void fold(const log::Record& record, std::string* error);
+  void update_applied(std::string_view origin,
+                      const std::vector<log::Record>& records);
+  std::map<std::string, std::unique_ptr<log::Segments>> foreign_segments_;
+  // Per-origin chain heads (own origin included) for sync continuation.
+  mutable std::shared_mutex chain_mutex_;
+  std::map<std::string, std::string> origin_prev_hashes_;
+  void fold(const log::Record& record, std::string_view batch_origin,
+            std::string* error);
   void rebuild_index();
   void replay(std::string* error);
 
@@ -146,6 +173,9 @@ class StateWriter {
   std::unordered_set<std::string> leaf_paths_;    // settled with end != children
   std::unordered_set<std::string> review_paths_;  // needs_review, state open
   std::vector<CampaignInfo> campaigns_;
+  std::map<std::string, std::int64_t> reserved_by_campaign_;
+  std::map<std::string, std::int64_t> reserved_by_origin_campaign_;  // origin|campaign
+  std::unordered_set<std::string> seen_reserve_keys_;  // origin:hlc
 };
 
 }  // namespace onion::state

@@ -1,6 +1,7 @@
 #include "sched.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <deque>
 #include <limits>
@@ -232,8 +233,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     return result;
   }
 
-  // Emit the CAMPAIGN record (start).
-  writer.submit(state::CommitTerminal{{make_record(
+  // Emit the CAMPAIGN record only when the campaign is new (the run loop
+  // re-enters run() after every drain; re-emission would spam the log).
+  if (!existing) {
+    writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", {{"scope", spec.scope},
                              {"loop_budget", spec.loop_budget},
@@ -245,6 +248,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                              {"chunk", spec.chunk},
                              {"model", spec.model}}},
                    {"state", "running"}})}});
+  }
 
   gate::FunnelOptions funnel_options;
   funnel_options.params.pass_score = spec.gate;
@@ -257,8 +261,8 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   std::vector<SettledSample> settled_samples;
   std::deque<Ticket> waiting;
   std::unique_ptr<NodeIdAllocator> node_ids_;
-  std::int64_t reserved_attempts = 0;
   std::int64_t used_in_chunk = 0;
+  std::int64_t current_chunk_size_ = 0;
 
   const auto stop_requested = [&] {
     if (external_stop && external_stop->load()) return true;
@@ -323,26 +327,49 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       result.end_reason = "stop rule";
       break;
     }
-    if (reserved_attempts >= spec.loop_budget) {
-      result.end_reason = "budget";
-      break;
-    }
-
     std::vector<Ticket> tickets = refresh_tickets();
+    // M6: only the tickets whose home lane is this device are worked; the
+    // rest stay for their owners.
+    if (!impl_->options.self.empty() && !impl_->options.members.empty()) {
+      tickets.erase(
+          std::remove_if(tickets.begin(), tickets.end(),
+                         [&](const Ticket& ticket) {
+                           const auto owner = lane_owner(
+                               ticket.path, impl_->options.members);
+                           return !owner || *owner != impl_->options.self;
+                         }),
+          tickets.end());
+    }
     if (tickets.empty() && waiting.empty()) cache_valid = false;
     if (tickets.empty() && waiting.empty()) {
-      result.end_reason = "drained";
+      // No work here. In fleet mode the campaign is over once the fleet
+      // budget is exhausted (the synced RESERVE records say so); otherwise
+      // the device waits for the next sync round to bring lane work.
+      if (!impl_->options.members.empty() &&
+          writer.reserved_total(spec.id) >= spec.loop_budget) {
+        result.end_reason = "budget";
+      } else {
+        result.end_reason = "drained";
+      }
       break;
     }
 
-    // Loop-budget chunking: one RESERVE chunk at a time.
-    if (used_in_chunk == 0) {
-      const std::int64_t take = std::min(spec.chunk,
-                                         spec.loop_budget - reserved_attempts);
-      reserved_attempts += take;
+    // A spent chunk asks for the next one, only now that work exists.
+    if (used_in_chunk >= current_chunk_size_) {
+      const std::int64_t reserved = writer.reserved_total(spec.id);
+      const std::int64_t take =
+          std::min(spec.chunk, spec.loop_budget - reserved);
+      if (take <= 0) {
+        result.end_reason = "budget";
+        break;
+      }
+      current_chunk_size_ = take;
+      used_in_chunk = 0;
       writer.submit(state::CommitTerminal{{make_record(
           "RESERVE", {{"campaign", spec.id}, {"attempts", take}})}});
     }
+
+    (void)0;
 
     // A waiting ticket keeps its place in line (G9).
     Ticket ticket;
@@ -507,10 +534,13 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     impl_->options.budget.settle(*reservation, "0");
   }
 
-  // A campaign that finished by itself (stop rule, drained, budget) is
-  // closed: stop is final for the campaign record too.
-  if (result.end_reason == "stop rule" || result.end_reason == "drained" ||
-      result.end_reason == "budget") {
+  // Only a real finish closes the campaign record (decision 0010): the
+  // stop rule, or a drain in single-device mode. Exhaustion ("budget")
+  // never closes it — open tickets resume if the budget is raised, and a
+  // drained fleet lane waits for sync.
+  const bool fleet = !impl_->options.members.empty();
+  if (result.end_reason == "stop rule" ||
+      (result.end_reason == "drained" && !fleet)) {
     writer.submit(state::CommitTerminal{{make_record(
         "CAMPAIGN", {{"id", spec.id},
                      {"spec", {{"scope", spec.scope},
@@ -572,6 +602,41 @@ void Engine::review_reject(std::string_view path, const CampaignSpec& spec) {
       "REVIEW", {{"path", std::string(path)}, {"decision", "reject"}, {"note", ""}}));
   impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
   impl_->options.writer.sync();
+}
+
+
+// ------------------------------------------------------------------ lanes
+
+double hrw_score(std::string_view path, std::string_view device_id,
+                 double weight) {
+  const std::string combined = std::string(path) + std::string(device_id);
+  const std::string digest = onion::log::blake2b_hex(combined);
+  // First 64 bits big-endian from the first 16 hex characters.
+  std::uint64_t x = 0;
+  for (int i = 0; i < 16; ++i) {
+    const char c = digest[static_cast<std::size_t>(i)];
+    const int nibble = c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10;
+    x = (x << 4) | static_cast<std::uint64_t>(nibble);
+  }
+  const double h = (static_cast<double>(x) + 0.5) / 18446744073709551616.0;
+  // h is strictly in (0, 1), so ln(h) is finite and negative.
+  return -weight / std::log(h);
+}
+
+std::optional<std::string> lane_owner(std::string_view path,
+                                      const std::vector<LaneMember>& members) {
+  if (members.empty()) return std::nullopt;
+  double best_score = -std::numeric_limits<double>::infinity();
+  std::string best_id;
+  for (const LaneMember& member : members) {
+    const double score = hrw_score(path, member.device_id, member.weight);
+    if (score > best_score ||
+        (score == best_score && member.device_id < best_id)) {
+      best_score = score;
+      best_id = member.device_id;
+    }
+  }
+  return best_id;
 }
 
 }  // namespace onion::sched

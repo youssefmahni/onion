@@ -171,12 +171,23 @@ target_link_libraries(store INTERFACE onion::core onion::platform)
 target_link_libraries(llm INTERFACE onion::core onion::platform)
 
 # Fleet layer
-onion_add_module(sync)
+FetchContent_Declare(
+  httplib
+  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
+  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(httplib)
+onion_add_compiled_module(sync src/sync/sync.cpp)
+target_include_directories(sync PUBLIC "${httplib_SOURCE_DIR}")
+target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion::state)
+if(WIN32)
+  target_link_libraries(sync PUBLIC ws2_32)
+endif()
 onion_add_module(swim)
 onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
 target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onion::log onion::llm)
-target_link_libraries(sync INTERFACE onion::log onion::store onion::platform)
+
 target_link_libraries(swim INTERFACE onion::core onion::platform)
 
 # Engine layer
@@ -191,12 +202,6 @@ target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
 
 # Interface layer
-FetchContent_Declare(
-  httplib
-  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
-  URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(httplib)
 onion_add_compiled_module(api src/api/api.cpp)
 # The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
 # httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
@@ -270,6 +275,10 @@ if(BUILD_TESTING)
   target_link_libraries(onion_profile_test PRIVATE onion::profile GTest::gtest_main)
   gtest_discover_tests(onion_profile_test)
 
+  add_executable(onion_sync_test tests/unit/sync_test.cpp)
+  target_link_libraries(onion_sync_test PRIVATE onion::sync GTest::gtest_main)
+  gtest_discover_tests(onion_sync_test)
+
   add_executable(onion_limiter_test tests/unit/limiter_test.cpp)
   target_link_libraries(onion_limiter_test PRIVATE onion::llm GTest::gtest_main)
   gtest_discover_tests(onion_limiter_test)
@@ -294,6 +303,11 @@ if(BUILD_TESTING)
   add_test(NAME llm.client_error_400 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/llm_client_failure_test.py" "--mode" "client-error" "$<TARGET_FILE:data_depot>")
   add_test(NAME genesis_import.verify COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/genesis_import_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(genesis_import.verify PROPERTIES TIMEOUT 90)
+  add_test(NAME sync.multi_process_convergence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/multi_process_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(sync.multi_process_convergence PROPERTIES
+    TIMEOUT 420
+    ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    SKIP_RETURN_CODE 77)
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
@@ -319,7 +333,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 

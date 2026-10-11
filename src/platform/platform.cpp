@@ -416,10 +416,25 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
   if (file) file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
   const bool ok = file.good(); LocalFree(output.pbData); return ok;
 #elif defined(__APPLE__)
-  return security_tool({"add-generic-password", "-U", "-s", "onion", "-a",
-                        std::string(name), "-w", std::string(secret)},
-                       false)
-      .has_value();
+  // The Keychain is the primary store; the 0600 file is always written as
+  // the fallback. The keychain persists across processes (and across CI
+  // jobs on hosted runners), so any stale item must be deleted first —
+  // otherwise a lookup can return a PREVIOUS device's secret, silently
+  // cloning another identity.
+  security_tool({"delete-generic-password", "-s", "onion", "-a",
+                 std::string(name)},
+                false);
+  security_tool({"add-generic-password", "-U", "-s", "onion", "-a",
+                 std::string(name), "-w", std::string(secret)},
+                false);
+  {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          S_IRUSR | S_IWUSR);
+    if (fd < 0) return false;
+    const bool ok = write_all(fd, secret) && ::fsync(fd) == 0;
+    ::close(fd);
+    return ok && ::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0;
+  }
 #else
   const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
   if (fd < 0) return false;
@@ -430,9 +445,21 @@ bool KeyStore::put(std::string_view name, std::string_view secret) {
 std::optional<std::string> KeyStore::get(std::string_view name) const {
   if (!valid_name(name)) return std::nullopt;
 #if defined(__APPLE__)
-  return security_tool({"find-generic-password", "-s", "onion", "-a",
-                        std::string(name), "-w"},
-                       true);
+  {
+    auto keychain = security_tool({"find-generic-password", "-s", "onion", "-a",
+                                   std::string(name), "-w"},
+                                  true);
+    if (keychain) return keychain;
+  }
+  {
+    struct stat status{};
+    const auto path = directory_ / std::string(name);
+    if (::stat(path.c_str(), &status) != 0 || (status.st_mode & 0077) != 0)
+      return std::nullopt;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return std::nullopt;
+    return std::string((std::istreambuf_iterator<char>(file)), {});
+  }
 #elif defined(_WIN32)
   std::ifstream file(directory_ / std::string(name), std::ios::binary);
   if (!file) return std::nullopt;

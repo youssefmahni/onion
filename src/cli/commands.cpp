@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #endif
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -21,6 +22,8 @@
 #include "core/depot_core.hpp"
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
+#include "sync/sync.hpp"
+#include "store/checkpoint.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
 #include "platform/platform.hpp"
@@ -129,11 +132,23 @@ json state_json(onion::state::StateWriter& writer, int api_port,
   result["node"]["running"] = *running;
   result["node"]["api_port"] = api_port;
   result["spend_usd"] = writer.db().spend_usd(&error);
+  // Convergence observables: the applied vector and the Merkle root.
+  json vector = json::object();
+  for (const auto& [origin, seq] : writer.vector()) vector[origin] = seq;
+  result["vector"] = std::move(vector);
+  const auto all_nodes = writer.db().all_nodes(&error);
+  result["merkle_root"] = onion::store::merkle_root(all_nodes);
   json campaigns = json::array();
   for (const auto& campaign : writer.campaigns()) {
     json entry;
     entry["id"] = campaign.id;
     entry["state"] = campaign.state;
+    entry["reserved"] = writer.reserved_total(campaign.id);
+    json reserved_by_origin = json::object();
+    for (const auto& [origin, total] :
+         writer.reserved_by_origin(campaign.id))
+      reserved_by_origin[origin] = total;
+    entry["reserved_by_origin"] = std::move(reserved_by_origin);
     try {
       entry["spec"] = json::parse(campaign.spec);
     } catch (const std::exception&) {
@@ -201,6 +216,154 @@ int node_cmd(int argc, char** argv) {
                     << "] rules_v" << stmt->integer(3) << "\n";
       }
     }
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "identity") {
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::platform::KeyStore store(dir / "keys");
+    std::string error;
+    auto key = load_device_key(store, &error);
+    if (!key) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    std::string public_key_hex;
+    for (const std::uint8_t byte : key->public_key) {
+      public_key_hex += "0123456789abcdef"[byte >> 4];
+      public_key_hex += "0123456789abcdef"[byte & 0x0f];
+    }
+    std::cout << "device_id=" << key->device_id << "\n"
+              << "public_key=" << public_key_hex << "\n"
+              << "slot=" << key->slot << "\n";
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "debug-state") {
+    // Read-only diagnostic dump: campaigns, open tickets with their lane
+    // owners, per-origin reserves, the applied vector and recent attempts.
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    const std::string members_path = flag(argc, argv, "--members", "");
+    std::vector<onion::sched::LaneMember> lane_members;
+    if (!members_path.empty()) {
+      std::ifstream members_file(members_path);
+      auto members_json = json::parse(members_file, nullptr, false);
+      if (members_json.is_array())
+        for (const auto& member : members_json)
+          if (member.contains("device_id"))
+            lane_members.push_back(
+                {member["device_id"].get<std::string>(),
+                 member.value("weight", 1.0)});
+    }
+    onion::store::Db db(dir / "onion.db");
+    std::string error;
+    if (!db.open(&error)) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    json out;
+    json campaigns = json::array();
+    for (const auto& campaign : db.campaigns(&error)) {
+      json entry;
+      entry["id"] = campaign.id;
+      entry["state"] = campaign.state;
+      try {
+        entry["spec"] = json::parse(campaign.spec);
+      } catch (const std::exception&) {
+        entry["spec"] = json::object();
+      }
+      // Open tickets for this campaign with their lane owners.
+      auto spec = onion::sched::parse_campaign(entry["spec"], &error);
+      if (spec) {
+        const auto nodes = db.all_nodes(&error);
+        std::vector<std::string> reviews;
+        for (const auto& review : db.open_reviews(&error))
+          if (review.state == "open" || review.state.empty())
+            reviews.push_back(review.path);
+        json tickets = json::array();
+        std::string t_error;
+        auto statement = db.prepare(
+            "SELECT path FROM settles;", &t_error);
+        std::set<std::string> settled;
+        if (statement) {
+          std::string step_error;
+          while (statement->step_row(&step_error))
+            settled.insert(statement->text(0));
+        }
+        for (const auto& ticket : onion::sched::order_tickets(
+                 nodes,
+                 [&](std::string_view path) { return settled.count(std::string(path)) > 0; },
+                 [](std::string_view) { return false; }, reviews, *spec)) {
+          json t;
+          t["path"] = ticket.path;
+          t["layer"] = ticket.layer;
+          const auto owner = onion::sched::lane_owner(ticket.path, lane_members);
+          t["owner"] = owner ? *owner : "none";
+          tickets.push_back(std::move(t));
+        }
+        entry["open_tickets"] = std::move(tickets);
+      }
+      campaigns.push_back(std::move(entry));
+    }
+    out["campaigns"] = std::move(campaigns);
+    // Per-origin RESERVE records, scanned from every oplog (read-only).
+    {
+      json reserves = json::object();
+      std::error_code ec;
+      const auto oplog = dir / "oplog";
+      if (std::filesystem::exists(oplog))
+        for (const auto& origin_dir :
+             std::filesystem::directory_iterator(oplog, ec)) {
+          if (!origin_dir.is_directory()) continue;
+          const std::string origin = origin_dir.path().filename().string();
+          json per_campaign = json::object();
+          for (const auto& file :
+               std::filesystem::directory_iterator(origin_dir.path(), ec)) {
+            if (!file.is_regular_file()) continue;
+            std::ifstream in(file.path(), std::ios::binary);
+            std::string line;
+            while (std::getline(in, line)) {
+              if (line.empty()) continue;
+              auto batch = json::parse(line, nullptr, false);
+              if (batch.is_discarded() || !batch.contains("recs")) continue;
+              for (const auto& record : batch["recs"]) {
+                if (record.value("t", std::string{}) != "RESERVE") continue;
+                const auto& p = record["p"];
+                const std::string campaign =
+                    p.value("campaign", std::string{});
+                per_campaign[campaign] =
+                    per_campaign.value(campaign, 0) +
+                    p.value("attempts", 0);
+              }
+            }
+          }
+          reserves[origin] = std::move(per_campaign);
+        }
+      out["reserves_by_origin"] = std::move(reserves);
+    }
+    {
+      json vector = json::object();
+      auto statement = db.prepare(
+          "SELECT origin, seq FROM applied ORDER BY origin;", &error);
+      if (statement) {
+        std::string step_error;
+        while (statement->step_row(&step_error))
+          vector[statement->text(0)] = statement->integer(1);
+      }
+      out["vector"] = std::move(vector);
+    }
+    {
+      auto statement = db.prepare(
+          "SELECT COUNT(*) FROM attempts WHERE hlc > "
+          "(CAST(strftime('%s','now') AS INTEGER) - 60) * 65536;",
+          &error);
+      if (statement) {
+        std::string step_error;
+        if (statement->step_row(&step_error))
+          out["attempts_last_60s"] = statement->integer(0);
+      }
+    }
+    out["settled_nodes"] = db.settles(&error).size();
+    out["merkle_root"] = onion::store::merkle_root(db.all_nodes(&error));
+    std::cout << out.dump() << "\n";
     return 0;
   }
   if (argc >= 3 && std::string(argv[2]) == "key") {
@@ -320,6 +483,56 @@ int node_cmd(int argc, char** argv) {
 
   std::atomic<bool> stop_flag{false};
 
+  // M6: the static member list and the sync server (members.json).
+  std::vector<onion::sched::LaneMember> lane_members;
+  std::vector<onion::sync::MemberKey> sync_members;
+  std::map<std::string, std::string> member_urls;
+  std::unique_ptr<onion::sync::SyncServer> sync_server;
+  const std::string members_path = flag(argc, argv, "--members", "");
+  const std::string self_host = flag(argc, argv, "--host", "127.0.0.1");
+  const int self_sync_port = std::atoi(flag(argc, argv, "--sync-port", "7947").c_str());
+  if (!members_path.empty()) {
+    std::ifstream members_file(members_path);
+    auto members_json = json::parse(members_file, nullptr, false);
+    if (members_json.is_discarded() || !members_json.is_array()) {
+      std::cerr << "--members must point at a JSON array\n";
+      return 2;
+    }
+    for (const auto& member : members_json) {
+      if (!member.contains("device_id") || !member.contains("public_key")) {
+        std::cerr << "members.json entries need device_id and public_key\n";
+        return 2;
+      }
+      const std::string member_id = member["device_id"].get<std::string>();
+      const std::string public_key_hex = member["public_key"].get<std::string>();
+      std::vector<std::uint8_t> public_key;
+      for (std::size_t i = 0; i + 1 < public_key_hex.size(); i += 2)
+        public_key.push_back(static_cast<std::uint8_t>(
+            std::stoul(public_key_hex.substr(i, 2), nullptr, 16)));
+      lane_members.push_back(
+          {member_id, member.value("weight", 1.0)});
+      sync_members.push_back({member_id, public_key});
+      if (member.contains("url"))
+        member_urls[member_id] = member["url"].get<std::string>();
+    }
+    onion::sync::SyncServer::Options sync_options;
+    sync_options.port = self_sync_port;
+    sync_options.bind_address = self_host;
+    sync_options.writer = writer.get();
+    sync_options.key = device_key;
+    sync_options.members = sync_members;
+    sync_server = std::make_unique<onion::sync::SyncServer>(std::move(sync_options));
+    std::string sync_error;
+    if (!sync_server->start(&sync_error)) {
+      std::cerr << sync_error << "\n";
+      return 1;
+    }
+    std::cout << "sync listening on " << self_host << ":"
+              << sync_server->bound_port() << "\n";
+    std::fprintf(stderr, "sync server started, members=%zu\n",
+                 lane_members.size());
+  }
+
   const auto campaign_action = [&](std::string id,
                                    std::string state) -> bool {
     const auto existing = writer->campaign(id);
@@ -406,10 +619,16 @@ int node_cmd(int argc, char** argv) {
   std::cout << "node listening on 127.0.0.1:" << server.bound_port()
             << " data=" << dir << "\n";
 
-  // Engine loop: run every running campaign until stopped.
+  // Engine loop: run every running campaign until stopped. With a member
+  // list, the engine works only its own home-lane tickets.
   onion::sched::Engine engine(
-      {*writer, ask, budget, 1, device_key->device_id, "0.02", prices});
+      {*writer, ask, budget, 1, device_key->device_id, "0.02", prices,
+       device_key->slot, lane_members, device_key->device_id});
   while (!stop_flag.load()) {
+    static std::uint64_t loop_visits = 0;
+    if (std::getenv("ONION_SYNC_DEBUG") && ++loop_visits % 50 == 0)
+      std::fprintf(stderr, "node loop heartbeat visits=%llu\n",
+                   static_cast<unsigned long long>(loop_visits));
     bool worked = false;
     for (const auto& campaign : writer->campaigns()) {
       if (campaign.state != "running") continue;
@@ -417,17 +636,62 @@ int node_cmd(int argc, char** argv) {
       json spec_json = json::parse(campaign.spec, nullptr, false);
       auto spec = onion::sched::parse_campaign(spec_json, &parse_error);
       if (!spec) continue;
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr, "entering engine.run for %s\n", spec->id.c_str());
       const onion::sched::Engine::RunResult result =
           engine.run(*spec, &stop_flag);
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr, "engine.run returned %s\n",
+                     result.end_reason.c_str());
       worked = true;
       std::cout << "campaign " << spec->id << " ended: " << result.end_reason
                 << " settled=" << result.settled
                 << " attempts=" << result.attempts
                 << " calls=" << result.calls << "\n";
+      // Exhausted and drained lanes are not finished (decision 0010): the
+      // loop sleeps instead of spinning until sync brings work or the
+      // fleet-wide close arrives.
+      if (result.end_reason == "budget" || result.end_reason == "drained")
+        worked = false;
       if (stop_flag.load()) break;
+    }
+    // Sync round every 15 s when the member list is present.
+    if (sync_server && !lane_members.empty()) {
+      static auto last_sync = std::chrono::steady_clock::now();
+      static std::uint64_t visits = 0;
+      if (std::getenv("ONION_SYNC_DEBUG") && ++visits % 200 == 0)
+        std::fprintf(stderr, "sync block heartbeat visits=%llu\n",
+                     static_cast<unsigned long long>(visits));
+      if (std::chrono::steady_clock::now() - last_sync >=
+          std::chrono::seconds(15)) {
+        if (std::getenv("ONION_SYNC_DEBUG"))
+          std::fprintf(stderr, "sync timer fired, members=%zu\n",
+                       lane_members.size());
+        last_sync = std::chrono::steady_clock::now();
+        for (const auto& member : lane_members) {
+          if (member.device_id == device_key->device_id) continue;
+          const auto peer_entry = member_urls.find(member.device_id);
+          if (peer_entry == member_urls.end()) continue;
+          const std::string peer = peer_entry->second;
+          std::map<std::string, std::string> quarantined;
+          std::string sync_error;
+          std::map<std::string, onion::sync::MemberKey> client_members;
+          for (const auto& entry : sync_members)
+            client_members[entry.device_id] = entry;
+          onion::sync::SyncClient client(
+              {*writer, device_key, std::move(client_members)});
+          const int applied =
+              client.run_round(peer, &quarantined, &sync_error);
+          if (std::getenv("ONION_SYNC_DEBUG"))
+            std::fprintf(stderr, "sync round to %s: applied=%d error=%s\n",
+                         peer.c_str(), applied,
+                         sync_error.empty() ? "none" : sync_error.c_str());
+        }
+      }
     }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
+  if (sync_server) sync_server->stop();
   server.stop();
   writer->stop();
   return 0;

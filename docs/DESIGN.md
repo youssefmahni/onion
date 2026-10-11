@@ -416,6 +416,8 @@ You tell the whole fleet what to build with a signed `CAMPAIGN` record, created 
 - **Loop budget in reserved chunks.** Devices take the budget in chunks through `RESERVE` records (default 50 attempts, or about one minute of that device's throughput). Reservations count in `(hlc, origin)` order; one that would pass the budget is void, and its device stops starting attempts for that campaign. Overshoot is at most one chunk per device.
 - **Several campaigns** can run at once; a node belongs to the campaign whose scope prefix matches it most specifically.
 
+**Liveness (decision 0010).** A campaign is *exhausted* on a device when its fold of `RESERVE` records, counted in `(hlc, origin)` order and capped at the loop budget (overshoot is void), reaches the loop budget; that device starts no new attempts for it. A campaign is *finished* when it is exhausted or stopped and no device has an attempt in flight. Exhaustion never closes the campaign record: open tickets stay open and resume if the loop budget is raised.
+
 ## Work scheduling
 
 Work is split into tickets: every open node in a running campaign is a ticket. Each ticket has a home lane, the device with the highest weighted rendezvous score for its path. A device works its own lane first and, when the lane runs dry, steals tickets from busy lanes with a short claim.

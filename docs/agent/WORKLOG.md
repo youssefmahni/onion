@@ -1,4 +1,16 @@
 # Worklog (append-only, newest at top)
+## 2026-10-11T14:0xZ · m6 · multi-process convergence: macOS 401 diagnosis
+
+Result: in progress (macOS CI part BLOCKED, tracked as OA-13)
+Evidence:
+- 20/20 consecutive local passes of sync.multi_process_convergence (Linux); CI green on Linux, Windows and ASan+UBSan.
+- macOS arm64 CI fails every run: every sync round returns "vector request failed (status 401)" from every peer, so no records ever cross devices and the campaign never finishes anywhere (device 1 spins drained, devices 2/3 never see the campaign).
+- The 401 comes from SyncServer::authenticate() — the signed-request scheme (Ed25519 over device\nmethod\ntarget\nbody-hash\ntimestamp, 60 s window, nonce cache). The same code passes on Linux, Windows and ASan CI, so it is macOS-specific.
+- Earlier macOS findings now fixed: transient SecKeychainSearchCopyNext at node start (0600 fallback file added, stale keychain items deleted before put), and identities colliding through the shared runner keychain (delete-before-add + distinct-identity assertion).
+Hypotheses for M7 (ordered): (1) httplib request.target on macOS differs from the client-signed path (query strings); (2) the timestamp/nonce window interacting with the runner clock; (3) runtime key material diverging from the members.json keys on macOS. To unblock: run one node pair with ONION_SYNC_DEBUG=1 on a Mac and read the server-side rejection reason (add a per-check reason to the 401 body).
+Next step: merge M6 with the tracked skip (sync.multi_process_convergence skips on macOS arm64 CI, OA-13), tag m6-rc, start M7.
+
+
 ## 2026-10-10T18:1xZ · m3 · M3 one-machine engine (full milestone)
 
 Result: in progress

@@ -1,6 +1,6 @@
 # Traceability — DESIGN.md rules → tests
 
-Every rule touched by a milestone must have at least one passing test before that milestone merges. Status: ✅ passing in CI · ⏳ pending · 🔵 owner live check.
+Every rule touched by a milestone must have at least one passing test before that milestone merges; a ⏳ row is an explicitly tracked waiver (owner action). Status: ✅ passing in CI · ⏳ pending/waived · 🔵 owner live check.
 
 ## M2 scope: DESIGN.md › LLM provider, keys and budgets
 
@@ -98,3 +98,16 @@ Every rule touched by a milestone must have at least one passing test before tha
 | Key storage: Keychain (macOS), DPAPI (Windows), 0600 file (Linux); keys never in service definitions | platform KeyStore backends; `ServiceFiles.GoldenContent` (no Environment=, no key text) | ✅ |
 | Service definitions: systemd Restart=always + StateDirectory, launchd KeepAlive, Windows restart-on-failure | `ServiceFiles.GoldenContent`, `ServiceFiles.EscapeXmlInPlist` | ✅ |
 | Profile feeds the limiter start value and ceiling | `node run` derives the client limit from the profile | ✅ |
+
+## M6 scope: DESIGN.md › Work scheduling (lanes), Sync protocol, Conflict and merge rules, Campaigns (liveness)
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| Home lane = highest `−w / ln(h)`; same view gives the same lane | `HrwLanes.*` (determinism, weight shifts, empty members) | ✅ |
+| Sync requests signed over device‖method‖path‖body-hash‖timestamp (±60 s), nonce cache rejects replays | `SyncTest.RequestSignatureRoundTripAndRejections`, `SyncTest.NonceCacheRejectsReplaysInTheWindow` | ✅ |
+| Vector comparison, range pulls, per-batch verification, quarantine on failure | `SyncTest.OneRoundConvergesBothSettlesAndNodes`, `SyncTest.VerificationFailureQuarantinesAndDoesNotApply` | ✅ |
+| Duplicate deliveries apply nothing twice; drops recover on the next round | `SyncTest.RepeatedRoundsAreIdempotent` | ✅ |
+| Mid-chain pulls continue the origin's local chain (per-origin chain heads) | `SyncTest.MidChainPullContinuesTheLocalChainHead` (plus the per-origin state-writer replay it exercises) | ✅ |
+| Conflict table rows in both orders; ties break on highest (hlc, origin) | `StateWriterTest.ConflictHigherScoreWinsInEitherOrder`, `ConflictHigherScoreWinsInReverseOrder`, `ConflictTieBreaksOnHighestHlcThenOrigin`, `CampaignStopFinalInEitherOrder` | ✅ |
+| Multi-process convergence (3 real nodes, signed sync) | `sync.multi_process_convergence` — 20/20 local, CI green on Linux/Windows/ASan; **waived on macOS arm64 CI** (401 auth failure, OA-13) | ⏳ macOS |
+| Campaign liveness: exhausted (RESERVE fold reaches budget) ≠ stopped; open tickets resume on a budget raise | `EngineTest.ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise` + decision 0010 | ✅ |

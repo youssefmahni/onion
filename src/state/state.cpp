@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #include <zstd.h>
@@ -34,7 +35,8 @@ void upsert_node(store::Db& db, const log::Record& record,
       "hlc) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, ?1, ?2, "
       "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
-      "layer=excluded.layer WHERE excluded.hlc > nodes.hlc;",
+      "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
+      "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -62,7 +64,8 @@ void upsert_settle(store::Db& db, const log::Record& record,
       "ON CONFLICT(path) DO UPDATE SET kept=excluded.kept, "
       "atomic=excluded.atomic, attempts=excluded.attempts, "
       "score=excluded.score, campaign=excluded.campaign, hlc=excluded.hlc, "
-      "origin=excluded.origin WHERE excluded.hlc > settles.hlc;",
+      "origin=excluded.origin WHERE excluded.hlc > settles.hlc OR "
+      "(excluded.hlc = settles.hlc AND excluded.origin > settles.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -147,7 +150,8 @@ void upsert_review(store::Db& db, const log::Record& record,
       "VALUES (?1, ?2, 'open', '', ?3, ?4) "
       "ON CONFLICT(path) DO UPDATE SET state='open', reason=excluded.reason, "
       "hlc=excluded.hlc, origin=excluded.origin "
-      "WHERE excluded.hlc > reviews.hlc;",
+      "WHERE excluded.hlc > reviews.hlc OR "
+      "(excluded.hlc = reviews.hlc AND excluded.origin > reviews.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -172,7 +176,8 @@ void upsert_campaign(store::Db& db, const log::Record& record,
       "ON CONFLICT(id) DO UPDATE SET spec=excluded.spec, "
       "state=CASE WHEN campaigns.state = 'stopped' THEN 'stopped' "
       "ELSE excluded.state END, hlc=excluded.hlc, origin=excluded.origin "
-      "WHERE excluded.hlc > campaigns.hlc;",
+      "WHERE excluded.hlc > campaigns.hlc OR "
+      "(excluded.hlc = campaigns.hlc AND excluded.origin > campaigns.origin);",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -263,31 +268,44 @@ void StateWriter::replay(std::string* error) {
   // write and the store update recovers exactly. With a device key, each
   // batch is verified against the chain; the first failing line is a torn
   // tail and is cut from the active segment.
-  std::vector<std::filesystem::path> sealed_files;
-  std::filesystem::path active_file;
+  // Walk every origin directory under oplog/ (the own origin and the
+  // synced copies), maintaining per-origin chains.
+  std::map<std::string, std::vector<std::filesystem::path>> sealed_by_origin;
+  std::map<std::string, std::filesystem::path> active_by_origin;
   std::error_code ec;
-  const std::filesystem::path dir = segments_->active_path().parent_path();
-  if (std::filesystem::exists(dir))
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-      if (!entry.is_regular_file()) continue;
-      if (entry.path().extension() == ".zst") sealed_files.push_back(entry.path());
-      else if (active_file.empty() || entry.path() > active_file)
-        active_file = entry.path();  // the newest raw segment wins
+  const std::filesystem::path oplog = segments_->active_path().parent_path().parent_path();
+  if (std::filesystem::exists(oplog))
+    for (const auto& origin_dir :
+         std::filesystem::directory_iterator(oplog, ec)) {
+      if (!origin_dir.is_directory()) continue;
+      const std::string origin = origin_dir.path().filename().string();
+      for (const auto& entry :
+           std::filesystem::directory_iterator(origin_dir.path(), ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == ".zst")
+          sealed_by_origin[origin].push_back(entry.path());
+        else if (active_by_origin[origin].empty() ||
+                 entry.path() > active_by_origin[origin])
+          active_by_origin[origin] = entry.path();
+      }
+      std::sort(sealed_by_origin[origin].begin(),
+                sealed_by_origin[origin].end());
     }
-  std::sort(sealed_files.begin(), sealed_files.end());
   if (std::getenv("ONION_REPLAY_DEBUG")) {
-    std::fprintf(stderr, "replay: sealed=%zu active=%s\n",
-                 sealed_files.size(), active_file.string().c_str());
+    std::fprintf(stderr, "replay: %zu origins\n", active_by_origin.size());
   }
 
-  std::int64_t expected_first = 1;
-  std::string expected_prev =
-      options_.device_key ? log::genesis_prev(*options_.device_key)
-                          : std::string{};
   std::vector<std::string> members{options_.origin};
-  std::uint64_t expected_batch = 1;
 
-  const auto process_line = [&](const std::string& line, std::string* line_error) {
+  // process_line verifies one batch against the per-origin chain. For the
+  // own origin the full Ed25519 check applies; foreign origins are
+  // chain-checked only (their keys arrive with M7 gossip — the batches
+  // were signature-verified when they were received).
+  const auto process_line = [&](const std::string& line,
+                                const std::string& origin,
+                                std::string& expected_prev,
+                                std::int64_t& expected_first,
+                                std::string* line_error) {
     auto batch_json = nlohmann::json::parse(line, nullptr, false);
     if (batch_json.is_discarded() || !batch_json.contains("recs")) {
       if (line_error) *line_error = "unparseable batch line";
@@ -308,7 +326,7 @@ void StateWriter::replay(std::string* error) {
       }
       batch.records.push_back(log::Record::from_json(record_json));
     }
-    if (options_.device_key) {
+    if (origin == options_.origin && options_.device_key) {
       log::VerifyContext context;
       context.version = 1;
       context.expected_prev = expected_prev;
@@ -322,73 +340,117 @@ void StateWriter::replay(std::string* error) {
                         std::to_string(static_cast<int>(verified)) + ")";
         return false;
       }
-    }
-    if (batch.number != expected_batch && options_.device_key) {
-      if (line_error) *line_error = "batch number gap";
-      return false;
+    } else {
+      // Chain-only checks: hash, contiguity, and the prev link (skipped
+      // for the unknown batch 1 of a foreign origin).
+      if (batch.hash != log::hash_records_hex(batch.records)) {
+        if (line_error) *line_error = "bad hash";
+        return false;
+      }
+      if (!batch.records.empty() &&
+          batch.records.front().seq != expected_first) {
+        if (line_error) *line_error = "gap";
+        return false;
+      }
+      if (batch.number > 1 && batch.prev != expected_prev) {
+        if (line_error) *line_error = "bad prev";
+        return false;
+      }
     }
     for (const log::Record& record : batch.records) {
       if (record.seq >= static_cast<std::int64_t>(next_seq_))
         next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
-      fold(record, error);
+      fold(record, batch.origin, error);
     }
+    update_applied(batch.origin, batch.records);
     applied_since_checkpoint_ += batch.records.size();
-    next_batch_ = batch.number + 1;
-    expected_batch = batch.number + 1;
+    if (origin == options_.origin) {
+      next_batch_ = batch.number + 1;
+      prev_hash_ = batch.hash;
+    }
     expected_prev = batch.hash;
-    expected_first = static_cast<std::int64_t>(next_seq_.load());
-    prev_hash_ = batch.hash;
+    expected_first =
+        batch.records.empty()
+            ? expected_first
+            : static_cast<std::int64_t>(batch.records.back().seq) + 1;
+    {
+      std::unique_lock chain_lock(chain_mutex_);
+      origin_prev_hashes_[origin] = batch.hash;
+    }
     return true;
   };
 
-  for (const auto& file : sealed_files) {
-    const std::string content = decompress_segment(file);
-    if (content.empty()) {
-      if (error) *error = "cannot decompress sealed segment " + file.string();
-      return;
-    }
-    std::istringstream in(content);
-    std::string line;
-    while (std::getline(in, line)) {
-      if (line.empty()) continue;
-      std::string line_error;
-      if (!process_line(line, &line_error)) {
-        if (error)
-          *error = "sealed segment " + file.string() +
-                   " failed verification: " + line_error +
-                   " (corruption, not a torn tail)";
-        return;
-      }
-    }
-  }
+  const auto origins = [&]() {
+    std::set<std::string> all;
+    for (const auto& [origin, files] : sealed_by_origin) all.insert(origin);
+    for (const auto& [origin, file] : active_by_origin) all.insert(origin);
+    return all;
+  }();
 
-  if (!active_file.empty()) {
-    std::ifstream in(active_file, std::ios::binary);
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(in, line)) lines.push_back(line);
-    in.close();
-    std::size_t good = 0;
-    for (; good < lines.size(); ++good) {
-      if (lines[good].empty()) {
-        good++;
-        continue;
+  for (const std::string& origin : origins) {
+    // One chain per origin: sealed segments first, then the active one,
+    // sharing the same expected_prev / expected_first.
+    std::string expected_prev =
+        origin == options_.origin && options_.device_key
+            ? log::genesis_prev(*options_.device_key)
+            : std::string{};
+    std::int64_t expected_first = 1;
+
+    auto sealed = sealed_by_origin.find(origin);
+    if (sealed != sealed_by_origin.end()) {
+      for (const auto& file : sealed->second) {
+        const std::string content = decompress_segment(file);
+        if (content.empty()) {
+          if (error)
+            *error = "cannot decompress sealed segment " + file.string();
+          return;
+        }
+        std::istringstream in(content);
+        std::string line;
+        while (std::getline(in, line)) {
+          if (line.empty()) continue;
+          std::string line_error;
+          if (!process_line(line, origin, expected_prev, expected_first,
+                            &line_error)) {
+            if (error)
+              *error = "sealed segment " + file.string() +
+                       " failed verification: " + line_error +
+                       " (corruption, not a torn tail)";
+            return;
+          }
+        }
       }
-      std::string line_error;
-      if (!process_line(lines[good], &line_error)) break;
     }
-    // A failing tail line is a torn tail: cut it (and anything after).
-    if (good < lines.size()) {
-      std::uint64_t keep = 0;
-      for (std::size_t i = 0; i < good; ++i) keep += lines[i].size() + 1;
-      std::filesystem::resize_file(active_file, keep, ec);
-      if (ec) {
-        if (error) *error = "cannot cut torn tail: " + ec.message();
-        return;
+
+    auto active = active_by_origin.find(origin);
+    if (active != active_by_origin.end()) {
+      const std::filesystem::path& active_file = active->second;
+      std::ifstream in(active_file, std::ios::binary);
+      std::vector<std::string> lines;
+      std::string line;
+      while (std::getline(in, line)) lines.push_back(line);
+      in.close();
+      std::size_t good = 0;
+      for (; good < lines.size(); ++good) {
+        if (lines[good].empty()) continue;
+        std::string line_error;
+        if (!process_line(lines[good], origin, expected_prev, expected_first,
+                          &line_error))
+          break;
       }
-      std::fprintf(stderr,
-                   "state writer: cut a torn tail of %zu batch(es) from %s\n",
-                   lines.size() - good, active_file.string().c_str());
+      // A failing tail line is a torn tail: cut it (and anything after).
+      if (good < lines.size()) {
+        std::uint64_t keep = 0;
+        for (std::size_t i = 0; i < good; ++i) keep += lines[i].size() + 1;
+        std::filesystem::resize_file(active_file, keep, ec);
+        if (ec) {
+          if (error) *error = "cannot cut torn tail: " + ec.message();
+          return;
+        }
+        std::fprintf(stderr,
+                     "state writer: cut a torn tail of %zu batch(es) from %s\n",
+                     lines.size() - good, active_file.string().c_str());
+      }
     }
   }
   rebuild_index();
@@ -409,6 +471,9 @@ void StateWriter::rebuild_index() {
   }
   for (const store::Campaign& campaign : db_.campaigns(&error))
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
+  reserved_by_campaign_.clear();
+  reserved_by_origin_campaign_.clear();
+  seen_reserve_keys_.clear();
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -434,14 +499,16 @@ void StateWriter::rebuild_index() {
   }
 }
 
-void StateWriter::fold(const log::Record& record, std::string* error) {
+void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
+                       std::string* error) {
   const std::string& type = record.type;
-  if (type == "ADD_NODE") upsert_node(db_, record, options_.origin, error);
-  else if (type == "SETTLE") upsert_settle(db_, record, options_.origin, error);
-  else if (type == "ATTEMPT") upsert_attempt(db_, record, options_.origin, error);
-  else if (type == "CRITIQUE") upsert_critique(db_, record, options_.origin, error);
-  else if (type == "NEEDS_REVIEW") upsert_review(db_, record, options_.origin, error);
-  else if (type == "CAMPAIGN") upsert_campaign(db_, record, options_.origin, error);
+  const std::string origin(batch_origin);
+  if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
+  else if (type == "SETTLE") upsert_settle(db_, record, origin, error);
+  else if (type == "ATTEMPT") upsert_attempt(db_, record, origin, error);
+  else if (type == "CRITIQUE") upsert_critique(db_, record, origin, error);
+  else if (type == "NEEDS_REVIEW") upsert_review(db_, record, origin, error);
+  else if (type == "CAMPAIGN") upsert_campaign(db_, record, origin, error);
   // REVIEW decisions update the reviews row:
   else if (type == "REVIEW") {
     const auto& payload = record.payload;
@@ -461,6 +528,16 @@ void StateWriter::fold(const log::Record& record, std::string* error) {
       std::string bind_error;
       statement->bind(1, payload.at("path").get<std::string>(), &bind_error);
       statement->step(&bind_error);
+    }
+  } else if (type == "RESERVE") {
+    const auto& payload = record.payload;
+    const std::string campaign = payload.value("campaign", std::string{});
+    const std::int64_t attempts = payload.value("attempts", std::int64_t{0});
+    const std::string key = origin + ":" + std::to_string(record.hlc);
+    std::unique_lock lock(index_mutex_);
+    if (seen_reserve_keys_.insert(key).second) {
+      reserved_by_campaign_[campaign] += attempts;
+      reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
     }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
@@ -543,10 +620,41 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;
   if (options_.crash_hook) options_.crash_hook(1);  // batch durable, store stale
-  for (const log::Record& record : records) fold(record, error);
+  for (const log::Record& record : records) fold(record, options_.origin, error);
+  update_applied(options_.origin, records);
   if (error && !error->empty()) return false;
   if (options_.crash_hook) options_.crash_hook(2);  // fold done
   return true;
+}
+
+void StateWriter::update_applied(std::string_view origin,
+                                 const std::vector<log::Record>& records) {
+  if (records.empty()) return;
+  std::string error;
+  auto statement = db_.prepare(
+      "INSERT INTO applied(origin, seq) VALUES (?1, ?2) "
+      "ON CONFLICT(origin) DO UPDATE SET seq = excluded.seq "
+      "WHERE excluded.seq > applied.seq;",
+      &error);
+  if (!statement) return;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(origin), &bind_error) ||
+      !statement->bind(2, records.back().seq, &bind_error)) {
+    return;
+  }
+  statement->step(&bind_error);
+}
+
+std::map<std::string, std::int64_t> StateWriter::vector() const {
+  std::map<std::string, std::int64_t> result;
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT origin, seq FROM applied ORDER BY origin;", &error);
+  if (!statement) return result;
+  std::string step_error;
+  while (statement->step_row(&step_error))
+    result[statement->text(0)] = statement->integer(1);
+  return result;
 }
 
 bool StateWriter::flush_pending_attempts(std::string* error) {
@@ -595,6 +703,38 @@ void StateWriter::run() {
         flush_pending_attempts(&error);
         if (error.empty()) append_batch(std::move(command.records), &error);
         break;
+      case Command::Kind::Foreign: {
+        // Append the verified foreign batch to the origin's local log and
+        // fold it. The batch was verified by the sync client.
+        flush_pending_attempts(&error);
+        if (!error.empty()) break;
+        // Append to the foreign origin's segments (a separate Segments).
+        auto& foreign_segments = foreign_segments_[command.foreign.origin];
+        if (!foreign_segments) {
+          log::Segments::Options segment_options;
+          segment_options.dir =
+              options_.data_dir / "oplog" / command.foreign.origin;
+          segment_options.origin = command.foreign.origin;
+          segment_options.seal_bytes = options_.seal_bytes;
+          foreign_segments =
+              std::make_unique<log::Segments>(segment_options);
+          std::string open_error;
+          foreign_segments->open(&open_error);
+        }
+        std::string append_error;
+        if (!foreign_segments->append(command.foreign, &append_error)) {
+          error = "foreign append failed: " + append_error;
+          break;
+        }
+        for (const log::Record& record : command.foreign.records)
+          fold(record, command.foreign.origin, &error);
+        update_applied(command.foreign.origin, command.foreign.records);
+        {
+          std::unique_lock chain_lock(chain_mutex_);
+          origin_prev_hashes_[command.foreign.origin] = command.foreign.hash;
+        }
+        break;
+      }
       case Command::Kind::Import: {
         auto statement = db_.prepare(
             "INSERT INTO nodes(code, path, parent_id, layer, title, origin, "
@@ -670,6 +810,15 @@ void StateWriter::submit(DevImport command) {
   queue_cv_.notify_one();
 }
 
+void StateWriter::submit(AppendForeign command) {
+  std::lock_guard lock(queue_mutex_);
+  Command queued;
+  queued.kind = Command::Kind::Foreign;
+  queued.foreign = std::move(command.batch);
+  queue_.push_back(std::move(queued));
+  queue_cv_.notify_one();
+}
+
 void StateWriter::sync() {
   synced_flag_.store(false);
   {
@@ -699,9 +848,12 @@ void StateWriter::stop() {
   }
   if (thread_.joinable()) thread_.join();
   started_ = false;
-  // Release the database and the segment handle so the data directory can
-  // be removed (Windows keeps open files locked).
+  // Release the database and every segment handle so the data directory
+  // can be removed (Windows keeps open files locked).
   if (segments_) segments_->close();
+  for (auto& [origin, foreign] : foreign_segments_)
+    if (foreign) foreign->close();
+  foreign_segments_.clear();
   db_.close();
 }
 
@@ -733,6 +885,33 @@ std::optional<CampaignInfo> StateWriter::campaign(std::string_view id) const {
 std::vector<CampaignInfo> StateWriter::campaigns() const {
   std::shared_lock lock(index_mutex_);
   return campaigns_;
+}
+
+std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = reserved_by_campaign_.find(std::string(campaign));
+  return found == reserved_by_campaign_.end() ? 0 : found->second;
+}
+
+std::optional<std::string> StateWriter::origin_prev_hash(
+    std::string_view origin) const {
+  std::shared_lock chain_lock(chain_mutex_);
+  const auto found = origin_prev_hashes_.find(std::string(origin));
+  if (found == origin_prev_hashes_.end()) return std::nullopt;
+  return found->second;
+}
+
+std::map<std::string, std::int64_t> StateWriter::reserved_by_origin(
+    std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  std::map<std::string, std::int64_t> result;
+  const std::string suffix = "|" + std::string(campaign);
+  for (const auto& [key, total] : reserved_by_origin_campaign_) {
+    if (key.size() >= suffix.size() &&
+        key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
+      result[key.substr(0, key.size() - suffix.size())] = total;
+  }
+  return result;
 }
 
 std::uint64_t StateWriter::next_seq() const { return next_seq_.load(); }
