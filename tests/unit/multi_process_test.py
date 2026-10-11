@@ -148,7 +148,9 @@ def main():
                 return True
             except Exception:
                 return False
-        if not wait_for(finished_everywhere, 90, deadline,
+        # Leave room for the three quiescence rounds after the work.
+        work_wait = max(60.0, HARD_DEADLINE_S - 90.0)
+        if not wait_for(finished_everywhere, work_wait, deadline,
                         "campaign never finished"):
             raise AssertionError("campaign never finished everywhere")
 
