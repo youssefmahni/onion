@@ -25,3 +25,26 @@ Pass criteria: the M6 agent acknowledges the four numbered points.
 If it fails: record the M6 agent's response in `docs/agent/opt/COORDINATION.md`.
 
 Cost / duration: no API calls; under 5 minutes.
+
+### OA-2 · Fix GitHub Actions billing (CI blocked) · all workstreams · status: open
+
+Why: Every CI job now fails before starting: "The job was not started because
+recent account payments have failed or your spending limit needs to be
+increased." (first seen 2026-10-11 ~19:45 UTC, run 38169437593). No PR can
+merge (merge rules require CI green), and both agents' verification depends
+on CI.
+
+Prerequisites: access to the repo owner's GitHub Billing & plans settings.
+
+Steps:
+1. Open https://github.com/settings/billing (organization or personal, as
+   applicable for youssefmahni/onion).
+2. Fix the failed payment or raise the spending limit.
+3. Re-run one failed job (`gh run rerun 38169437593 --failed`).
+
+Pass criteria: the re-run jobs start and complete (pass or fail on their own
+merits, not on billing).
+
+If it fails: capture the billing page state and send it to the agents.
+
+Cost / duration: none; minutes of clicking.
