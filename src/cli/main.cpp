@@ -295,7 +295,7 @@ int adaptive_bench(int argc, char** argv) {
     stats.p95_latency_s = latencies.empty() ? 0.0 : percentile(.95);
     limiter.on_window(stats);
     report(window, used, std::move(results));
-    window_start += static_cast<std::uint64_t>(window_s);
+    window_start = static_cast<std::uint64_t>((window + 1) * window_s);
   }
   std::cout << "tokens_in_hit=" << tokens_hit.load() << " tokens_in_miss=" << tokens_miss.load()
             << " tokens_out=" << tokens_out.load() << " total_requests=" << submitted.load() << "\n";

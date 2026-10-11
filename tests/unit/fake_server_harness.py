@@ -25,9 +25,12 @@ def fake_server(scenario_name, scenario_dir=None):
              "--record", str(record), "--port", "0"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stderr_lines = []
-        drainer = threading.Thread(
-            target=lambda: [stderr_lines.append(line) for line in server.stderr],
-            daemon=True)
+
+        def drain():
+            for line in server.stderr:
+                stderr_lines.append(line)
+
+        drainer = threading.Thread(target=drain, daemon=True)
         drainer.start()
         try:
             port = int(server.stdout.readline().strip())
