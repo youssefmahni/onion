@@ -195,6 +195,7 @@ struct WindowSink {
 int adaptive_bench(int argc, char** argv) {
   std::string url, model = "deepseek-flash";
   int requests = 0, start = 4, ceiling = 50, timeout_s = 120;
+  double window_s = 30.0;
   for (int index = 3; index < argc; ++index) {
     const std::string arg(argv[index]);
     if (arg == "--url" && index + 1 < argc) url = argv[++index];
@@ -202,13 +203,13 @@ int adaptive_bench(int argc, char** argv) {
     else if (arg == "--requests" && index + 1 < argc) requests = std::atoi(argv[++index]);
     else if (arg == "--start" && index + 1 < argc) start = std::atoi(argv[++index]);
     else if (arg == "--ceiling" && index + 1 < argc) ceiling = std::atoi(argv[++index]);
+    else if (arg == "--window-s" && index + 1 < argc) window_s = std::atof(argv[++index]);
     else if (arg == "--timeout" && index + 1 < argc) timeout_s = std::atoi(argv[++index]);
   }
   if (url.empty() || requests <= 0) { std::cerr << "adaptive bench requires --url and --requests\n"; return 2; }
   const char* key = std::getenv("DEEPSEEK_API_KEY");
-  if (!key || !*key) { std::cout << "key=missing\n"; return 2; }
-  onion::llm::Client client({url, std::string(key), timeout_s, 10, 1, static_cast<std::size_t>(ceiling)});
-  onion::llm::Limiter limiter(start, ceiling);
+  onion::llm::Client client({url, key ? std::string(key) : std::string(), timeout_s, 10, 1, static_cast<std::size_t>(ceiling)});
+  onion::llm::Limiter limiter(start, ceiling, window_s);
   onion::llm::CircuitBreaker breaker;
   WindowSink sink;
   std::atomic<int> submitted{0};
@@ -247,25 +248,27 @@ int adaptive_bench(int argc, char** argv) {
               << " http_version=" << client.negotiated_http_version()
               << " breaker_open=" << (breaker.open() ? "true" : "false") << "\n";
   };
-  (void)report;
+
   for (int window = 0; submitted.load() < requests; ++window) {
     const int used = limiter.begin_window(window_start);
-    while (submitted.load() < requests && client.in_flight() < static_cast<std::size_t>(used)) {
-      client.submit({model, "You answer in at most five words.", "Say ok", 16, 0.0},
-        [&](onion::llm::Result result) {
-          breaker.on_result(result.kind);
-          tokens_hit += result.in_hit;
-          tokens_miss += result.in_miss;
-          tokens_out += result.out;
-          sink.add(std::move(result));
-          ++finished;
-        });
-      ++submitted;
-    }
     const auto window_begin = std::chrono::steady_clock::now();
-    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - window_begin).count() < 30.0 &&
+    // Fill the window continuously: the limit can be small after a backoff,
+    // and a single submit pass per window would crawl at low limits.
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - window_begin).count() < window_s &&
            finished.load() < requests) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      while (submitted.load() < requests && client.in_flight() < static_cast<std::size_t>(used)) {
+        client.submit({model, "You answer in at most five words.", "Say ok", 16, 0.0},
+          [&](onion::llm::Result result) {
+            breaker.on_result(result.kind);
+            tokens_hit += result.in_hit;
+            tokens_miss += result.in_miss;
+            tokens_out += result.out;
+            sink.add(std::move(result));
+            ++finished;
+          });
+        ++submitted;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     auto results = sink.drain();
     onion::llm::LimitWindow stats;
@@ -291,7 +294,7 @@ int adaptive_bench(int argc, char** argv) {
     stats.p95_latency_s = latencies.empty() ? 0.0 : percentile(.95);
     limiter.on_window(stats);
     report(window, used, std::move(results));
-    window_start += 30;
+    window_start += static_cast<std::uint64_t>(window_s);
   }
   std::cout << "tokens_in_hit=" << tokens_hit.load() << " tokens_in_miss=" << tokens_miss.load()
             << " tokens_out=" << tokens_out.load() << " total_requests=" << submitted.load() << "\n";

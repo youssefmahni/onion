@@ -39,8 +39,9 @@ class Limiter {
   double goodput_signal() const;
 
  private:
-  void enter_plateau_now();
+  void enter_plateau_now(double window_goodput);
   void reset_ramp_state();
+  int grow(int current, double factor) const;
   int starting_limit_;
   int limit_;
   int ceiling_;
@@ -60,7 +61,7 @@ class Limiter {
   int plateau_windows_{0};
   bool plateau_probe_active_{false};
   int plateau_limit_{0};
-  double plateau_signal_{0};
+  double plateau_goodput_{0};
 };
 
 struct Request {

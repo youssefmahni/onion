@@ -17,30 +17,52 @@ class FakeDeepSeek:
         self.record_path = record_path
         self.lock = threading.Lock()
         self.in_flight = 0
+        self.served = 0
 
     def write_record(self, item):
         with self.lock:
             with self.record_path.open("a", encoding="utf-8", newline="\n") as output:
                 output.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
 
+    def stage(self):
+        """The stage whose request range covers the current served count
+        (capacity_shift scenarios; defaults to the whole scenario)."""
+        for item in self.scenario.get("stages", []):
+            if self.served < item.get("until_requests", float("inf")):
+                return item
+        return self.scenario
+
     def delay(self):
-        latency = self.scenario.get("latency", {})
+        stage = self.stage()
+        latency = stage.get("latency", {})
         fixed = latency.get("fixed_ms")
         if fixed is not None:
             milliseconds = fixed
         else:
             milliseconds = random.gauss(latency.get("mean_ms", 0), latency.get("stddev_ms", 0))
-        threshold = self.scenario.get("slow_when_in_flight_above")
+        threshold = stage.get("slow_when_in_flight_above")
         if threshold is not None and self.in_flight > threshold:
-            milliseconds += self.scenario.get("slow_extra_ms", 0)
+            milliseconds += stage.get("slow_extra_ms", 0)
+        # A probabilistic tail delay: only a fraction of the overloaded
+        # requests slow down, so the median stays flat while the tail (p95,
+        # p99) rises past the plateau -- the F2 saturation signature.
+        tail_threshold = stage.get("tail_when_in_flight_above")
+        if tail_threshold is not None and self.in_flight > tail_threshold:
+            if random.random() < stage.get("tail_probability", 0.5):
+                milliseconds += stage.get("tail_extra_ms", 0)
         if milliseconds > 0:
             time.sleep(milliseconds / 1000.0)
 
+    def in_reset_window(self):
+        window = self.stage().get("reset_window")
+        return window is not None and window[0] <= self.served < window[1]
+
     def route(self, prompt):
-        for item in self.scenario.get("routes", []):
+        stage = self.stage()
+        for item in stage.get("routes", []):
             if item.get("contains", "") in prompt:
                 return item
-        return self.scenario.get("default", {})
+        return stage.get("default", {})
 
 
 def handler_for(fake):
@@ -69,6 +91,29 @@ def handler_for(fake):
         def do_POST(self):
             if self.path != "/chat/completions":
                 self.send_error(404)
+                return
+            with fake.lock:
+                fake.served += 1
+                reset_window = fake.in_reset_window()
+            if reset_window:
+                # A connection failure burst: the connection is torn down with
+                # a reset before any bytes are read, which the client sees as
+                # a transport failure (connect_fail_burst).  The rfile/wfile
+                # hold duplicated fds of the socket, and the server keeps the
+                # dead handler thread (and thus those fds) referenced, so all
+                # three must be closed for the reset to reach the client.
+                self.close_connection = True
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                           struct.pack("ii", 1, 0))
+                try:
+                    self.rfile.close()
+                except OSError:
+                    pass
+                try:
+                    self.wfile.close()
+                except OSError:
+                    pass
+                self.connection.close()
                 return
             size = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(size)

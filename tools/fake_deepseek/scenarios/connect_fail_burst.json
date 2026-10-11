@@ -1,0 +1,6 @@
+{
+  "models": [{"id": "deepseek-flash"}],
+  "latency": {"fixed_ms": 50},
+  "usage": {"prompt_cache_hit_tokens": 4, "prompt_cache_miss_tokens": 8, "completion_tokens": 6},
+  "reset_window": [150, 230]
+}
