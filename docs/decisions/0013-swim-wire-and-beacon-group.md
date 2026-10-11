@@ -15,5 +15,5 @@ M7 adds the SWIM membership protocol (DESIGN › Membership) over UDP 7946 and t
 ## Consequences
 
 - `src/swim`'s transport is injectable; the platform layer provides the UDP 7946 socket and joins the beacon group on the active interface.
-- The beacon is signed at the platform layer through the existing `log::Signer`; the SWIM engine hands over the unsigned payload via its `beacon_hook`.
+- The SWIM engine signs the piggybacked updates itself (the signer is injected through `set_updates_signer`, built on the existing `log::Signer`), then hands the signed payload to the transport layer via its `beacon_hook`; the platform layer only performs the UDP multicast send.
 - Any device that cannot join the group (router isolation) still discovers peers through invitation seed addresses, per DESIGN › Discovery.

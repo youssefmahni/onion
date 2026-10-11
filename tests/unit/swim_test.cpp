@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 
+#include "log/log.hpp"
+#include "swim/beacon.hpp"
 #include "swim/swim.hpp"
 #include "swim/udp_transport.hpp"
 
@@ -541,6 +543,132 @@ TEST(SwimProtocol, IdleWithNoPeersDoesNothing) {
   }
   EXPECT_TRUE(transport.sent_.empty());
   EXPECT_EQ(solo.membership().self().state, MemberState::ACTIVE);
+}
+
+
+TEST(SwimBeacon, SignedBeaconRoundTrips) {
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  onion::log::Ed25519Signer signer(key);
+  // The exact bytes the engine signs: the dump of a real member record.
+  Member member;
+  member.device_id = "dev-x";
+  member.state = MemberState::ACTIVE;
+  member.incarnation = 1;
+  const std::string updates =
+      nlohmann::json::array({member.to_json()}).dump();
+  const std::int64_t ts = 1'700'000'000;
+  const std::string signature =
+      onion::swim::sign_beacon(key.device_id, updates, ts, signer);
+  EXPECT_FALSE(signature.empty());
+  EXPECT_TRUE(onion::swim::beacon_signature_valid(
+      key.device_id, updates, signature, key.public_key, ts, ts));
+  // Tampered updates fail.
+  EXPECT_FALSE(onion::swim::beacon_signature_valid(
+      key.device_id, R"([{"device_id":"dev-x","state":"DEAD","incarnation":1}])",
+      signature, key.public_key, ts, ts));
+  // Wrong device id fails.
+  EXPECT_FALSE(onion::swim::beacon_signature_valid(
+      "dev-y", updates, signature, key.public_key, ts, ts));
+  // Outside the ±60 s window fails.
+  EXPECT_FALSE(onion::swim::beacon_signature_valid(
+      key.device_id, updates, signature, key.public_key, ts, ts + 120));
+}
+
+TEST(SwimBeacon, EngineDropsUnsignedUpdatesWhenVerifierSet) {
+  FourNodes nodes;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  nodes.clock.set(0);
+  nodes.b.set_updates_verifier(
+      [&](std::string_view device_id, std::string_view updates_json,
+          std::string_view signature_hex, std::int64_t timestamp_s,
+          std::int64_t now_s) {
+        if (device_id != key.device_id) return false;
+        return onion::swim::beacon_signature_valid(
+            device_id, updates_json, signature_hex, key.public_key,
+            timestamp_s, now_s);
+      });
+  // Unsigned gossip is dropped: the member keeps its old state.
+  nodes.b.handle_datagram(
+      "a:1",
+      R"({"t":"gossip","from":"dev-a","updates":[{"device_id":"dev-b","state":"SUSPECT","incarnation":2}]})");
+  EXPECT_EQ(nodes.b.membership().get("dev-b")->state, MemberState::ACTIVE);
+}
+
+TEST(SwimBeacon, EngineMergesSignedUpdates) {
+  FourNodes nodes;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  onion::log::Ed25519Signer signer(key);
+  // b only accepts updates signed by dev-a's key.
+  nodes.b.set_updates_verifier(
+      [&](std::string_view device_id, std::string_view updates_json,
+          std::string_view signature_hex, std::int64_t timestamp_s,
+          std::int64_t now_s) {
+        if (device_id != key.device_id) return false;
+        return onion::swim::beacon_signature_valid(
+            device_id, updates_json, signature_hex, key.public_key,
+            timestamp_s, now_s);
+      });
+
+  // The signature covers the CANONICAL dump of the updates array (the
+  // wire contract of decision 0013), so sign exactly that form.
+  const nlohmann::json updates_json = nlohmann::json::parse(
+      R"([{"device_id":"dev-c","state":"SUSPECT","incarnation":2}])");
+  const std::string updates = updates_json.dump();
+  const std::int64_t ts = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  const std::string signature =
+      onion::swim::sign_beacon(key.device_id, updates, ts, signer);
+  nlohmann::json message = {
+      {"t", "gossip"},
+      {"from", key.device_id},
+      {"updates", updates_json},
+      {"sig", signature},
+      {"ts", ts},
+  };
+  nodes.b.handle_datagram("a:1", message.dump());
+  EXPECT_EQ(nodes.b.membership().get("dev-c")->state, MemberState::SUSPECT);
+}
+
+TEST(SwimBeacon, EngineSignsOutboundUpdates) {
+  FourNodes nodes;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "000102030405060708090a0b0c0d0e0f"
+      "101112131415161718191a1b1c1d1e1f");
+  onion::log::Ed25519Signer signer(key);
+  nodes.clock.set(0);
+  // a signs; b verifies a's updates with the key's public key. The
+  // engine signs under its OWN device id (self_id), so the verifier
+  // accepts the engine id and checks against the known public key.
+  nodes.a.set_updates_signer(
+      [&](std::string_view device_id, std::string_view updates_json,
+          std::int64_t timestamp_s) {
+        return onion::swim::sign_beacon(device_id, updates_json,
+                                        timestamp_s, signer);
+      });
+  nodes.b.set_updates_verifier(
+      [&](std::string_view device_id, std::string_view updates_json,
+          std::string_view signature_hex, std::int64_t timestamp_s,
+          std::int64_t now_s) {
+        if (device_id != "dev-a") return false;
+        return onion::swim::beacon_signature_valid(
+            device_id, updates_json, signature_hex, key.public_key,
+            timestamp_s, now_s);
+      });
+
+  // a raises its incarnation and announces through a ping; only a valid
+  // signature can move b's copy of dev-a to the new incarnation.
+  nodes.a.mutable_membership().set_self_state(MemberState::ACTIVE, 7);
+  nodes.a.announce();
+  nodes.a.probe_now("dev-b");
+  EXPECT_EQ(nodes.b.membership().get("dev-a")->incarnation, 7);
 }
 
 TEST(SwimUdpTest, PingAckOverRealLoopbackSockets) {

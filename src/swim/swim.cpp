@@ -31,6 +31,15 @@ std::int64_t json_int(const nlohmann::json& value, std::string_view key,
   return value[key].get<std::int64_t>();
 }
 
+// Wall-clock seconds for signature timestamps (protocol timers use the
+// injected monotonic clock; signatures must be comparable across devices).
+std::int64_t wall_clock_s() {
+  return static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
 }  // namespace
 
 std::int64_t SteadyClock::now_ms() const {
@@ -52,6 +61,14 @@ Swim::Swim(Options options)
 }
 
 void Swim::set_transport(Transport* transport) { transport_ = transport; }
+
+void Swim::set_updates_signer(UpdatesSigner signer) {
+  updates_signer_ = std::move(signer);
+}
+
+void Swim::set_updates_verifier(UpdatesVerifier verifier) {
+  updates_verifier_ = std::move(verifier);
+}
 
 void Swim::set_clock(Clock* clock) {
   clock_ = clock;
@@ -122,6 +139,7 @@ void Swim::send_ping(const std::string& to, std::int64_t seq) {
       {std::string(kSeq), seq},
   };
   flush_gossip(message);
+  sign_updates(message);
   const Member* target = membership_.get(to);
   transport_->send(target ? target->address : to, message.dump());
 }
@@ -185,6 +203,7 @@ void Swim::expire_and_probe() {
             {std::string(kTarget), target},
         };
         flush_gossip(message);
+        sign_updates(message);
         sends.emplace_back(prober.address, message.dump());
       }
       // The indirect phase gets its full window from when the indirect
@@ -209,6 +228,9 @@ void Swim::maybe_beacon() {
   const std::int64_t now = clock_->now_ms();
   if (now < next_beacon_ms_) return;
   next_beacon_ms_ = now + options_.beacon_period_ms;
+  // Every beacon carries the local device's record: the LAN beacon is the
+  // discovery channel (DESIGN › Discovery).
+  announce();
   if (!beacon_hook) return;
   nlohmann::json payload = {
       {std::string(kMsgType), "beacon"},
@@ -216,7 +238,35 @@ void Swim::maybe_beacon() {
       {std::string(kSeq), next_seq()},
   };
   flush_gossip(payload);
+  sign_updates(payload);
   beacon_hook(payload.dump());
+}
+
+void Swim::sign_updates(nlohmann::json& message) {
+  if (!updates_signer_) return;
+  if (!message.contains(kUpdates) || !message[kUpdates].is_array() ||
+      message[kUpdates].empty())
+    return;
+  const std::string updates_json = message[kUpdates].dump();
+  const std::int64_t timestamp_s = wall_clock_s();
+  message["sig"] = updates_signer_(options_.self_id, updates_json,
+                                   timestamp_s);
+  message["ts"] = timestamp_s;
+}
+
+bool Swim::updates_verified(const nlohmann::json& message,
+                            std::string_view sender_device_id) {
+  if (!updates_verifier_) return true;  // no verifier: accept (tests)
+  if (!message.contains(kUpdates) || !message[kUpdates].is_array())
+    return true;  // no updates: nothing to verify
+  if (message[kUpdates].empty()) return true;
+  if (!message.contains("sig") || !message["sig"].is_string() ||
+      !message.contains("ts") || !message["ts"].is_number_integer())
+    return false;  // missing or malformed signature fields
+  return updates_verifier_(sender_device_id, message[kUpdates].dump(),
+                           message["sig"].get<std::string>(),
+                           message["ts"].get<std::int64_t>(),
+                           wall_clock_s());
 }
 
 void Swim::handle_datagram(const std::string& from_address,
@@ -234,8 +284,10 @@ void Swim::handle_datagram(const std::string& from_address,
   const std::int64_t seq = json_int(message, kSeq);
 
   const auto merge_updates = [&]() {
-    if (message.contains(kUpdates) && message[kUpdates].is_array())
-      on_gossip_updates(message[kUpdates]);
+    if (!message.contains(kUpdates) || !message[kUpdates].is_array())
+      return;
+    if (!updates_verified(message, from)) return;
+    on_gossip_updates(message[kUpdates]);
   };
 
   if (type == kGossip) {
@@ -257,6 +309,7 @@ void Swim::handle_datagram(const std::string& from_address,
         {std::string(kSeq), seq},
     };
     flush_gossip(reply);
+    sign_updates(reply);
     if (transport_) {
       const Member* sender = membership_.get(from);
       transport_->send(sender && !sender->address.empty() ? sender->address
@@ -280,6 +333,7 @@ void Swim::handle_datagram(const std::string& from_address,
         {std::string(kSeq), local_seq},
     };
     flush_gossip(forward);
+    sign_updates(forward);
     if (transport_) {
       indirect_forwards_[local_seq] = IndirectForward{
           from, from_address, target, seq,

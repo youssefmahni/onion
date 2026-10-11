@@ -131,13 +131,29 @@ class Swim {
   void start_leaving();
   void confirm_left();
 
-  // The beacon: when the beacon period elapses, tick() hands the payload to
-  // this hook (unsigned here; the platform layer signs it, and the group
-  // address comes from a decision record). Tests may capture it.
+  // The beacon: when the beacon period elapses, tick() hands the payload
+  // to this hook — signed when an updates signer is configured (decision
+  // 0013) and carrying the local device's record. The group address and
+  // the UDP send belong to the transport layer. Tests may capture it.
   std::function<void(std::string payload)> beacon_hook;
 
   // Test/chaos seams: pick the next probe target and see what is pending.
   std::optional<std::string> pending_ping_target() const;
+
+  // Signature hooks (decision 0013). When the signer is set, outbound
+  // messages sign their piggybacked updates (beacon-scheme); when the
+  // verifier is set, inbound updates are dropped unless the sender's
+  // signature over the exact updates payload verifies within ±60 s.
+  // Ping/ack counters themselves stay unsigned either way.
+  using UpdatesSigner = std::function<std::string(
+      std::string_view device_id, std::string_view updates_json,
+      std::int64_t timestamp_s)>;
+  using UpdatesVerifier = std::function<bool(
+      std::string_view device_id, std::string_view updates_json,
+      std::string_view signature_hex, std::int64_t timestamp_s,
+      std::int64_t now_s)>;
+  void set_updates_signer(UpdatesSigner signer);
+  void set_updates_verifier(UpdatesVerifier verifier);
 
  private:
   struct InFlightProbe {
@@ -169,10 +185,15 @@ class Swim {
   void mark_suspect(const std::string& device_id);
   void mark_dead(const std::string& device_id);
   void on_gossip_updates(const nlohmann::json& updates);
+  void sign_updates(nlohmann::json& message);
+  bool updates_verified(const nlohmann::json& message,
+                        std::string_view sender_device_id);
   std::int64_t next_seq();
 
   Options options_;
   Membership membership_;
+  UpdatesSigner updates_signer_;
+  UpdatesVerifier updates_verifier_;
   std::unique_ptr<Clock> default_clock_;
   Clock* clock_{default_clock_.get()};
   Transport* transport_{nullptr};

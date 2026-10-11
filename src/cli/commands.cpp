@@ -28,6 +28,9 @@
 #include "llm/llm.hpp"
 #include "platform/platform.hpp"
 #include "sched/sched.hpp"
+#include "swim/beacon.hpp"
+#include "swim/swim.hpp"
+#include "swim/udp_transport.hpp"
 #include "state/state.hpp"
 #include "store/store.hpp"
 
@@ -41,6 +44,15 @@ std::string flag(int argc, char** argv, const std::string& name,
     if (std::string(argv[index]) == name && index + 1 < argc)
       return argv[index + 1];
   return fallback;
+}
+
+// A TCP/UDP port from a flag: 1..65535, else the fallback.
+int parse_port(const std::string& text, int fallback) {
+  char* end = nullptr;
+  const long value = std::strtol(text.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0' || value < 1 || value > 65535)
+    return fallback;
+  return static_cast<int>(value);
 }
 
 bool has_flag(int argc, char** argv, const std::string& name) {
@@ -533,6 +545,94 @@ int node_cmd(int argc, char** argv) {
                  lane_members.size());
   }
 
+  // M7: the SWIM membership engine over UDP (DESIGN › Transport: 7946)
+  // and the signed LAN beacon (decision 0013: group 239.255.77.31).
+  const int self_swim_port =
+      parse_port(flag(argc, argv, "--swim-port", "7946"), 7946);
+  constexpr std::string_view beacon_group = "239.255.77.31";
+  std::unique_ptr<onion::swim::Swim> swim;
+  std::unique_ptr<onion::swim::UdpTransport> swim_transport;
+  if (!lane_members.empty()) {
+    onion::swim::Options swim_options;
+    swim_options.self_id = device_key->device_id;
+    swim_options.self_address =
+        self_host + ":" + std::to_string(self_swim_port);
+    swim = std::make_unique<onion::swim::Swim>(std::move(swim_options));
+    swim_transport = std::make_unique<onion::swim::UdpTransport>();
+    std::string swim_error;
+    if (!swim_transport->open(static_cast<std::uint16_t>(self_swim_port),
+                              std::string(beacon_group), &swim_error)) {
+      // Several nodes on ONE machine share UDP 7946 (the multi-process
+      // test); the second binder runs without swim instead of dying.
+      // Distinct devices on a real LAN each hold the port.
+      std::cerr << "swim disabled (udp:" << self_swim_port
+                << " unavailable): " << swim_error << "\n";
+      swim.reset();
+      swim_transport.reset();
+    }
+    if (swim) {
+      swim->set_transport(swim_transport.get());
+      swim_transport->set_receiver(
+          [&](const std::string& from, std::string datagram) {
+            swim->handle_datagram(from, std::move(datagram));
+          });
+    // Beacon signing with the device key (decision 0013). The signer is
+    // captured by value: the lambda outlives this block.
+    swim->set_updates_signer(
+        [signer = onion::log::Ed25519Signer(*device_key)](
+            std::string_view device_id, std::string_view updates_json,
+            std::int64_t timestamp_s) mutable {
+          return onion::swim::sign_beacon(device_id, updates_json,
+                                          timestamp_s, signer);
+        });
+    // Inbound updates must be signed by a known member; failures are
+    // rate-limited so a clock-skewed or stale member does not spam.
+    swim->set_updates_verifier(
+        [&](std::string_view device_id, std::string_view updates_json,
+            std::string_view signature_hex, std::int64_t timestamp_s,
+            std::int64_t now_s) {
+          for (const auto& member : sync_members)
+            if (member.device_id == device_id) {
+              const bool valid = onion::swim::beacon_signature_valid(
+                  device_id, updates_json, signature_hex,
+                  member.public_key, timestamp_s, now_s);
+              if (!valid) {
+                static int failures = 0;
+                if (++failures % 100 == 1)
+                  std::cerr << "swim: dropped a bad signature from "
+                            << device_id << "\n";
+              }
+              return valid;
+            }
+          static int unknown = 0;
+          if (++unknown % 100 == 1)
+            std::cerr << "swim: dropped an update from unknown device "
+                      << device_id << "\n";
+          return false;
+        });
+    // The beacon payload (already signed by the engine) goes to the group.
+    swim->beacon_hook = [&](std::string payload) {
+      swim_transport->send_beacon(payload);
+    };
+    // Seed the static member list as ACTIVE and the device itself as
+    // ACTIVE; addresses arrive through beacons and gossip.
+    swim->mutable_membership().set_self_state(
+        onion::swim::MemberState::ACTIVE, 1);
+    for (const auto& member : sync_members) {
+      if (member.device_id == device_key->device_id) continue;
+      onion::swim::Member seed;
+      seed.device_id = member.device_id;
+      seed.state = onion::swim::MemberState::ACTIVE;
+      seed.incarnation = 1;
+      swim->mutable_membership().upsert(std::move(seed));
+    }
+    swim->announce();
+    std::fprintf(stderr, "swim on udp:%d beacon group %.*s members=%zu\n",
+                 self_swim_port, static_cast<int>(beacon_group.size()),
+                 beacon_group.data(), swim->membership().size());
+    }
+  }
+
   const auto campaign_action = [&](std::string id,
                                    std::string state) -> bool {
     const auto existing = writer->campaign(id);
@@ -688,6 +788,11 @@ int node_cmd(int argc, char** argv) {
                          sync_error.empty() ? "none" : sync_error.c_str());
         }
       }
+    }
+    // SWIM: one protocol step plus a drain of the UDP socket each loop.
+    if (swim && swim_transport) {
+      swim->tick();
+      swim_transport->poll();
     }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }

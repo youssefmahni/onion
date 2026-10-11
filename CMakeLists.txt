@@ -183,8 +183,8 @@ target_link_libraries(sync PUBLIC nlohmann_json::nlohmann_json onion::log onion:
 if(WIN32)
   target_link_libraries(sync PUBLIC ws2_32)
 endif()
-onion_add_compiled_module(swim src/swim/membership.cpp src/swim/swim.cpp src/swim/udp_transport.cpp)
-target_link_libraries(swim PUBLIC nlohmann_json::nlohmann_json onion::core onion::platform)
+onion_add_compiled_module(swim src/swim/membership.cpp src/swim/swim.cpp src/swim/udp_transport.cpp src/swim/beacon.cpp)
+target_link_libraries(swim PUBLIC nlohmann_json::nlohmann_json onion::core onion::platform onion::log)
 onion_add_compiled_module(profile src/profile/profile.cpp src/profile/service.cpp)
 target_link_libraries(profile PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onion::log onion::llm)
@@ -336,7 +336,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 
