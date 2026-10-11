@@ -40,6 +40,7 @@ class Limiter {
 
  private:
   void enter_plateau_now();
+  void reset_ramp_state();
   int starting_limit_;
   int limit_;
   int ceiling_;
@@ -53,7 +54,7 @@ class Limiter {
   double goodput_{0};
   bool goodput_valid_{false};
   bool assessing_{false};
-  double g_at_increase_{0};
+  double goodput_at_increase_{0};
   int pre_increase_limit_{0};
   bool plateau_{false};
   int plateau_windows_{0};

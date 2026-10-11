@@ -28,6 +28,20 @@ onion::llm::LimitWindow pressured(std::size_t rate_limited, std::size_t server_e
   return window;
 }
 
+// Simulated provider: throughput caps at N in flight and the p95 doubles by
+// the time the limit is 10% past the cap (the sharp saturation the
+// `plateau_flat_median` fake-server scenario models).
+void sim_window(onion::llm::Limiter& limiter, int n, std::uint64_t t) {
+  const int used = limiter.begin_window(t);
+  const auto out = static_cast<std::uint64_t>(std::min(used, n)) * 40;
+  const double p95 = 1.0 + 10.0 * static_cast<double>(std::max(0, used - n)) / n;
+  limiter.on_window(ok(out, 1.0, p95, static_cast<std::size_t>(used), t + 1));
+}
+
+void sim_run(onion::llm::Limiter& limiter, int n, std::uint64_t from, std::uint64_t to) {
+  for (std::uint64_t t = from; t < to; ++t) sim_window(limiter, n, t);
+}
+
 TEST(Limiter, GoodputSignalIsAnEwmaOverTwoWindows) {
   onion::llm::Limiter limiter(16, 2000, 1.0);
   limiter.on_window(ok(100));
@@ -68,7 +82,7 @@ TEST(Limiter, RevertsToThePreviousLimitWhenGoodputDoesNotRise) {
 
 TEST(Limiter, PlateauProbeAdoptsWhenCapacityGrew) {
   onion::llm::Limiter limiter(16, 2000, 1.0);
-  limiter.on_window(ok(160));  // anchor + increase to 20 (G = 160)
+  limiter.on_window(ok(160));  // anchor + increase to 20
   limiter.on_window(ok(160));  // flat goodput: revert to 16, hold two windows
   limiter.on_window(ok(160));  // hold 1
   limiter.on_window(ok(160));  // hold 2
@@ -77,7 +91,9 @@ TEST(Limiter, PlateauProbeAdoptsWhenCapacityGrew) {
   // The provider's capacity grew: at the probed limit the goodput rises more
   // than enough to move the signal 5% above the plateau entry signal.
   limiter.on_window(ok(340));
-  EXPECT_EQ(limiter.limit(), 21);  // adopted 17, then resumed the ramp x1.25
+  EXPECT_EQ(limiter.limit(), 17);  // adopted the probed limit
+  limiter.on_window(ok(340));      // the ramp resumes with the next window
+  EXPECT_EQ(limiter.limit(), 21);  // unassessed increase x1.25
 }
 
 TEST(Limiter, PlateauProbeReturnsAndRestartsTheCounter) {
@@ -187,27 +203,14 @@ TEST(Limiter, HourlyProbeCapsRestoresAndRecordsTheP95Baseline) {
 }
 
 TEST(Limiter, SettlesWithinTenPercentOfThePlateauAndStays) {
-  // Simulated provider: throughput caps at N = 1,000 in flight; the p95
-  // doubles by the time the limit is 10% past the cap (the sharp saturation
-  // the `plateau_flat_median` fake-server scenario models).
   constexpr int n = 1000;
   onion::llm::Limiter limiter(400, 2000, 1.0);
-  int last_limit = limiter.limit();
-  for (std::uint64_t t = 0; t < 8 * 3600; ++t) {
-    const int used = limiter.begin_window(t);
-    const auto out = static_cast<std::uint64_t>(std::min(used, n)) * 40;
-    const double p95 = 1.0 + 10.0 * static_cast<double>(std::max(0, used - n)) / n;
-    limiter.on_window(ok(out, 1.0, p95, static_cast<std::size_t>(used), t + 1));
-    last_limit = limiter.limit();
-    ASSERT_LE(last_limit, 2000);
-  }
+  sim_run(limiter, n, 0, 7 * 3600);
   // The last simulated hour must be settled within 10% of the plateau.
   bool settled = true;
   for (std::uint64_t t = 7 * 3600; t < 8 * 3600; ++t) {
-    const int used = limiter.begin_window(t);
-    const auto out = static_cast<std::uint64_t>(std::min(used, n)) * 40;
-    const double p95 = 1.0 + 10.0 * static_cast<double>(std::max(0, used - n)) / n;
-    limiter.on_window(ok(out, 1.0, p95, static_cast<std::size_t>(used), t + 1));
+    sim_window(limiter, n, t);
+    ASSERT_LE(limiter.limit(), 2000);
     if (std::abs(limiter.limit() - n) > n / 10) settled = false;
   }
   EXPECT_TRUE(settled);
@@ -216,14 +219,8 @@ TEST(Limiter, SettlesWithinTenPercentOfThePlateauAndStays) {
 TEST(Limiter, ReachesNinetyPercentOfThePlateauWithinThreeMinutes) {
   // Start 400, plateau 1,000: four x1.25 steps reach 977 in four windows
   // (two simulated minutes), each backed by rising goodput.
-  constexpr int n = 1000;
   onion::llm::Limiter limiter(400, 2000, 1.0);
-  for (std::uint64_t t = 0; t < 6; ++t) {
-    const int used = limiter.begin_window(t);
-    const auto out = static_cast<std::uint64_t>(std::min(used, n)) * 40;
-    const double p95 = 1.0 + 10.0 * static_cast<double>(std::max(0, used - n)) / n;
-    limiter.on_window(ok(out, 1.0, p95, static_cast<std::size_t>(used), t + 1));
-  }
+  sim_run(limiter, 1000, 0, 6);
   EXPECT_GE(limiter.limit(), 900);
 }
 
@@ -231,12 +228,7 @@ TEST(Limiter, BacksOffWithinOneWindowOnPressureAndDescendsOnCapacityLoss) {
   // Capacity drops from 1,000 to 400 mid-run: the p95 blows past 2x and the
   // tail guard descends while the ramp stays out of the way.
   onion::llm::Limiter limiter(400, 2000, 1.0);
-  // Warm up to the plateau at 1,000.
-  for (std::uint64_t t = 0; t < 40; ++t) {
-    const int used = limiter.begin_window(t);
-    const auto out = static_cast<std::uint64_t>(std::min(used, 1000)) * 40;
-    limiter.on_window(ok(out, 1.0, 1.0, static_cast<std::size_t>(used), t + 1));
-  }
+  sim_run(limiter, 1000, 0, 40);  // warm up to the plateau at 1,000
   const int before = limiter.limit();
   ASSERT_GE(before, 500);
   // Capacity 400 from here on.

@@ -4,6 +4,17 @@
 
 namespace onion::llm {
 namespace {
+// Spec constants (decision 0011).
+constexpr double kRampFactor = 1.25;
+constexpr double kPlateauProbeFactor = 1.1;
+constexpr double kTailGuardFactor = 0.9;
+constexpr double kGoodputRiseThreshold = 1.05;
+constexpr double kTailGuardP95Ratio = 2.0;
+constexpr double kEwmaAlpha = 0.5;
+constexpr int kPlateauProbeInterval = 10;
+constexpr int kBackoffHoldWindows = 1;
+constexpr int kRevertHoldWindows = 2;
+
 bool pressure(const LimitWindow& window) {
   return window.rate_limited != 0 || window.server_errors != 0 ||
       (window.calls != 0 && window.timeouts * 100 > window.calls * 5) ||
@@ -47,11 +58,8 @@ void Limiter::on_window(const LimitWindow& window) {
     limit_ = press ? std::max(1, pre_probe_limit_ / 2) : pre_probe_limit_;
     probe_active_ = false;
     if (press) {
-      hold_windows_ = 1;
-      assessing_ = false;
-      plateau_ = false;
-      plateau_probe_active_ = false;
-      plateau_windows_ = 0;
+      hold_windows_ = kBackoffHoldWindows;
+      reset_ramp_state();
     }
     return;
   }
@@ -68,11 +76,8 @@ void Limiter::on_window(const LimitWindow& window) {
   // limit and hold one window.
   if (press) {
     limit_ = std::max(1, limit_ / 2);
-    hold_windows_ = 1;
-    assessing_ = false;
-    plateau_ = false;
-    plateau_probe_active_ = false;
-    plateau_windows_ = 0;
+    hold_windows_ = kBackoffHoldWindows;
+    reset_ramp_state();
     return;
   }
 
@@ -84,34 +89,32 @@ void Limiter::on_window(const LimitWindow& window) {
   // two windows).
   const double window_goodput =
       static_cast<double>(window.completed_out_tokens) / window_length_s_;
-  goodput_ = goodput_valid_ ? 0.5 * window_goodput + 0.5 * goodput_ : window_goodput;
+  goodput_ = goodput_valid_ ? kEwmaAlpha * window_goodput + (1.0 - kEwmaAlpha) * goodput_
+                            : window_goodput;
   goodput_valid_ = true;
 
   // 3. Tail guard: p95 more than twice the low-load baseline p95 steps back
-  // ×0.9, holds one window and enters the plateau state.  The step-back plays
-  // the role of a revert, so the ramp cannot blindly re-increase into the
-  // danger zone; the plateau probe tracks capacity recovery.
-  if (baseline_p95_s_ && window.p95_latency_s > 2.0 * *baseline_p95_s_) {
-    limit_ = std::max(1, static_cast<int>(limit_ * 0.9));
-    hold_windows_ = 1;
-    assessing_ = false;
-    plateau_probe_active_ = false;
+  // ×0.9 and enters the plateau state.  The step-back plays the role of a
+  // revert, so the ramp cannot blindly re-increase into the danger zone; the
+  // plateau probe tracks capacity recovery.  While the p95 stays above the
+  // threshold the guard keeps stepping down every window; once it recovers,
+  // the hold passes before the plateau counter starts.
+  if (baseline_p95_s_ && window.p95_latency_s > kTailGuardP95Ratio * *baseline_p95_s_) {
+    limit_ = std::max(1, static_cast<int>(limit_ * kTailGuardFactor));
+    hold_windows_ = kBackoffHoldWindows;
+    reset_ramp_state();
     enter_plateau_now();
     return;
   }
 
   // 4. Plateau probe: one window at ×1.1 after 10 plateau windows.
   if (plateau_probe_active_) {
-    if (goodput_ >= 1.05 * plateau_signal_) {
-      // Capacity moved: adopt the probed limit and resume ramping.
+    if (goodput_ >= kGoodputRiseThreshold * plateau_signal_) {
+      // Capacity moved: adopt the probed limit; the ramp resumes with the
+      // next window's unassessed increase.
       plateau_ = false;
       plateau_probe_active_ = false;
       plateau_windows_ = 0;
-      g_at_increase_ = goodput_;
-      pre_increase_limit_ = limit_;
-      limit_ = std::min(ceiling_, static_cast<int>(limit_ * 1.25));
-      assessing_ = limit_ != pre_increase_limit_;
-      if (!assessing_) enter_plateau_now();
     } else {
       limit_ = plateau_limit_;
       plateau_probe_active_ = false;
@@ -131,9 +134,9 @@ void Limiter::on_window(const LimitWindow& window) {
   if (plateau_) {
     if (limit_ >= ceiling_) return;  // nothing above the ceiling to probe
     ++plateau_windows_;
-    if (plateau_windows_ >= 10) {
+    if (plateau_windows_ >= kPlateauProbeInterval) {
       plateau_limit_ = limit_;
-      limit_ = std::min(ceiling_, static_cast<int>(limit_ * 1.1));
+      limit_ = std::min(ceiling_, static_cast<int>(limit_ * kPlateauProbeFactor));
       plateau_probe_active_ = true;
       plateau_windows_ = 0;
     }
@@ -143,33 +146,40 @@ void Limiter::on_window(const LimitWindow& window) {
   // 5/6. Ramp: increase by ×1.25 while goodput rises at least 5% per
   // increase; otherwise return to the previous limit and hold two windows.
   if (assessing_) {
-    if (goodput_ >= 1.05 * g_at_increase_) {
+    if (goodput_ >= kGoodputRiseThreshold * goodput_at_increase_) {
       const int before = limit_;
-      limit_ = std::min(ceiling_, static_cast<int>(limit_ * 1.25));
+      limit_ = std::min(ceiling_, static_cast<int>(limit_ * kRampFactor));
       if (limit_ == before) {
         // Ceiling reached: hold there, no revert.
         assessing_ = false;
         enter_plateau_now();
       } else {
-        g_at_increase_ = goodput_;
+        goodput_at_increase_ = goodput_;
         pre_increase_limit_ = before;
       }
     } else {
       limit_ = pre_increase_limit_;
       assessing_ = false;
-      hold_windows_ = 2;
+      hold_windows_ = kRevertHoldWindows;
       enter_plateau_now();
     }
   } else {
-    g_at_increase_ = goodput_;
+    goodput_at_increase_ = goodput_;
     pre_increase_limit_ = limit_;
-    limit_ = std::min(ceiling_, static_cast<int>(limit_ * 1.25));
+    limit_ = std::min(ceiling_, static_cast<int>(limit_ * kRampFactor));
     if (limit_ == pre_increase_limit_) {
       enter_plateau_now();
     } else {
       assessing_ = true;
     }
   }
+}
+
+void Limiter::reset_ramp_state() {
+  assessing_ = false;
+  plateau_ = false;
+  plateau_probe_active_ = false;
+  plateau_windows_ = 0;
 }
 
 void Limiter::enter_plateau_now() {
