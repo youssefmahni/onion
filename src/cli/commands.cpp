@@ -552,12 +552,8 @@ int node_cmd(int argc, char** argv) {
   constexpr std::string_view beacon_group = "239.255.77.31";
   std::unique_ptr<onion::swim::Swim> swim;
   std::unique_ptr<onion::swim::UdpTransport> swim_transport;
+  int bound_swim_port = 0;
   if (!lane_members.empty()) {
-    onion::swim::Options swim_options;
-    swim_options.self_id = device_key->device_id;
-    swim_options.self_address =
-        self_host + ":" + std::to_string(self_swim_port);
-    swim = std::make_unique<onion::swim::Swim>(std::move(swim_options));
     swim_transport = std::make_unique<onion::swim::UdpTransport>();
     std::string swim_error;
     if (!swim_transport->open(static_cast<std::uint16_t>(self_swim_port),
@@ -567,10 +563,18 @@ int node_cmd(int argc, char** argv) {
       // Distinct devices on a real LAN each hold the port.
       std::cerr << "swim disabled (udp:" << self_swim_port
                 << " unavailable): " << swim_error << "\n";
-      swim.reset();
       swim_transport.reset();
     }
-    if (swim) {
+  }
+  if (swim_transport) {
+    bound_swim_port = *swim_transport->port();
+    onion::swim::Options swim_options;
+    swim_options.self_id = device_key->device_id;
+    // The engine advertises the REAL bound port (port 0 = ephemeral).
+    swim_options.self_address =
+        self_host + ":" + std::to_string(bound_swim_port);
+    swim = std::make_unique<onion::swim::Swim>(std::move(swim_options));
+    {
       swim->set_transport(swim_transport.get());
       swim_transport->set_receiver(
           [&](const std::string& from, std::string datagram) {
@@ -628,7 +632,7 @@ int node_cmd(int argc, char** argv) {
     }
     swim->announce();
     std::fprintf(stderr, "swim on udp:%d beacon group %.*s members=%zu\n",
-                 self_swim_port, static_cast<int>(beacon_group.size()),
+                 bound_swim_port, static_cast<int>(beacon_group.size()),
                  beacon_group.data(), swim->membership().size());
     }
   }
@@ -719,8 +723,56 @@ int node_cmd(int argc, char** argv) {
   std::cout << "node listening on 127.0.0.1:" << server.bound_port()
             << " data=" << dir << "\n";
 
+  // --port-file: the real bound ports (port 0 = ephemeral), so tests and
+  // orchestration never guess or hard-code ports.
+  const std::string port_file = flag(argc, argv, "--port-file", "");
+  if (!port_file.empty()) {
+    nlohmann::json ports = {
+        {"api", server.bound_port()},
+        {"sync", sync_server ? sync_server->bound_port() : 0},
+        {"swim", bound_swim_port},
+    };
+    std::ofstream out(port_file);
+    out << ports.dump();
+  }
+
   // Engine loop: run every running campaign until stopped. With a member
   // list, the engine works only its own home-lane tickets.
+  const auto reload_members = [&]() {
+    static std::filesystem::file_time_type last_write{};
+    const auto path = std::filesystem::path(members_path);
+    std::error_code ec;
+    const auto write = std::filesystem::last_write_time(path, ec);
+    if (ec || write == last_write) return;
+    last_write = write;
+    std::ifstream file(members_path);
+    auto parsed = json::parse(file, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_array()) return;
+    std::vector<onion::sched::LaneMember> new_lanes;
+    std::vector<onion::sync::MemberKey> new_members;
+    std::map<std::string, std::string> new_urls;
+    for (const auto& member : parsed) {
+      if (!member.contains("device_id") || !member.contains("public_key"))
+        continue;
+      const std::string member_id = member["device_id"].get<std::string>();
+      const std::string public_key_hex =
+          member["public_key"].get<std::string>();
+      std::vector<std::uint8_t> public_key;
+      for (std::size_t i = 0; i + 1 < public_key_hex.size(); i += 2)
+        public_key.push_back(static_cast<std::uint8_t>(
+            std::stoul(public_key_hex.substr(i, 2), nullptr, 16)));
+      new_lanes.push_back({member_id, member.value("weight", 1.0)});
+      new_members.push_back({member_id, public_key});
+      if (member.contains("url"))
+        new_urls[member_id] = member["url"].get<std::string>();
+    }
+    lane_members = std::move(new_lanes);
+    sync_members = std::move(new_members);
+    member_urls = std::move(new_urls);
+    if (std::getenv("ONION_SYNC_DEBUG"))
+      std::fprintf(stderr, "members.json reloaded: %zu members, %zu urls\n",
+                   lane_members.size(), member_urls.size());
+  };
   onion::sched::Engine engine(
       {*writer, ask, budget, 1, device_key->device_id, "0.02", prices,
        device_key->slot, lane_members, device_key->device_id});
@@ -789,6 +841,7 @@ int node_cmd(int argc, char** argv) {
         }
       }
     }
+    if (!members_path.empty()) reload_members();
     // SWIM: one protocol step plus a drain of the UDP socket each loop.
     if (swim && swim_transport) {
       swim->tick();
