@@ -371,6 +371,68 @@ int node_cmd(int argc, char** argv) {
     std::cout << (leave ? "leaving" : "stopping") << "\n";
     return 0;
   }
+  if (argc >= 3 && std::string(argv[2]) == "evict") {
+    // M7 eviction (DESIGN › Eviction and retirement): any member drafts
+    // MEMBER_EVICT; it is valid once a majority of members signed it (or
+    // the offline admin key). This command builds the record with the
+    // local signature plus any collected signatures, and submits it to a
+    // running node's API.
+    const std::filesystem::path dir = data_dir_arg(argc, argv);
+    onion::platform::KeyStore store(dir / "keys");
+    std::string error;
+    const auto key = load_device_key(store, &error);
+    if (!key) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    const std::string device_id = flag(argc, argv, "--device", "");
+    if (device_id.empty()) {
+      std::cerr << "usage: data_depot node evict --device <id> "
+                   "[--sigs-file <f>] [--accept-until <seq>] "
+                   "[--api-port <p>]\n";
+      return 2;
+    }
+    const std::int64_t cutoff =
+        std::atoll(flag(argc, argv, "--accept-until", "0").c_str());
+    nlohmann::json record = {{"type", "MEMBER_EVICT"},
+                             {"payload", {{"device_id", device_id},
+                                          {"accept_until_seq", cutoff},
+                                          {"sigs", json::array()},
+                                          {"kind", "majority"}}}};
+    // The local signature over the canonical payload (sigs empty).
+    {
+      nlohmann::json unsigned_payload = record["payload"];
+      unsigned_payload.erase("sigs");
+      onion::log::Ed25519Signer signer(*key);
+      record["payload"]["sigs"].push_back(
+          signer.sign(onion::log::canonical_json(unsigned_payload)));
+    }
+    const std::string sigs_file = flag(argc, argv, "--sigs-file", "");
+    if (!sigs_file.empty()) {
+      std::ifstream in(sigs_file);
+      std::string line;
+      while (std::getline(in, line)) {
+        if (!line.empty()) record["payload"]["sigs"].push_back(line);
+      }
+    }
+    if (has_flag(argc, argv, "--draft")) {
+      std::cout << record.dump() << "\n";
+      return 0;
+    }
+    const int port = parse_port(flag(argc, argv, "--api-port", "8080"), 8080);
+    httplib::Client client(
+        ("http://127.0.0.1:" + std::to_string(port)).c_str());
+    client.set_connection_timeout(3, 0);
+    client.set_read_timeout(5, 0);
+    const auto response =
+        client.Post("/api/evict", record.dump(), "application/json");
+    if (!response || response->status != 200) {
+      std::cerr << "no running node answered on port " << port << "\n";
+      return 1;
+    }
+    std::cout << response->body << "\n";
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[2]) == "invite") {
     // M7 joining: print a signed, single-use invitation token
     // (DESIGN › Joining): the invited public key, the inviter, an expiry
@@ -917,6 +979,20 @@ int node_cmd(int argc, char** argv) {
        [&](bool leave) {
          leave_requested.store(leave);
          stop_flag.store(true);
+       },
+       [&](std::string record_json, std::string) {
+         // M7 eviction: submit a collected MEMBER_EVICT record; the
+         // fold validates the majority (or the admin key).
+         const auto record = json::parse(record_json, nullptr, false);
+         if (record.is_discarded() || !record.contains("type") ||
+             record["type"] != "MEMBER_EVICT")
+           return false;
+         onion::log::Record parsed;
+         parsed.type = "MEMBER_EVICT";
+         parsed.payload = record.value("payload", json::object());
+         writer->submit(onion::state::CommitTerminal{{std::move(parsed)}});
+         writer->sync();
+         return true;
        }});
   if (!server.start(&error)) {
     std::cerr << error << "\n";

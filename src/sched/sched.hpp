@@ -146,6 +146,13 @@ class Engine {
   // RESERVE per sync round per device).
   void note_sync_round();
 
+  // M7: the live lane list (the node loop derives it from the SWIM
+  // membership — DEAD members drop out once a majority is visible, so
+  // their tickets re-hash to the survivors). Replaces the static list.
+  void set_lane_members(std::vector<LaneMember> members);
+  // The effective lane list: the live one when set, else the static one.
+  const std::vector<LaneMember>& live_lane_members() const;
+
   // Review decisions as record submissions. `accept` settles the node so its
   // children become tickets; `retry` re-queues it with the note injected;
   // `reject` tombstones the node and its children.

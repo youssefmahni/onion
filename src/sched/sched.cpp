@@ -162,6 +162,7 @@ std::int64_t NodeIdAllocator::counter_from_code(std::string_view code) {
 
 struct Engine::Impl {
   Options options;
+  std::vector<LaneMember> lane_members;  // the live list (M7)
   std::atomic<bool> internal_stop{false};
   // Decision 0014: sync-round pacing for fleet reservations, per campaign
   // (one Engine runs every campaign, so the round state must not leak
@@ -177,8 +178,19 @@ struct Engine::Impl {
 };
 
 Engine::Engine(Options options)
-    : impl_(new Impl{std::move(options), {false}}) {}
+    : impl_(new Impl{std::move(options), {}, {false}}) {}
 Engine::~Engine() = default;
+
+void Engine::set_lane_members(std::vector<LaneMember> members) {
+  impl_->lane_members = std::move(members);
+}
+
+const std::vector<LaneMember>& Engine::live_lane_members() const {
+  // The live list when set, the static one otherwise.
+  return impl_->lane_members.empty() && !impl_->options.members.empty()
+             ? impl_->options.members
+             : impl_->lane_members;
+}
 
 void Engine::note_sync_round() {
   for (auto& [campaign, state] : impl_->round_states) {
@@ -350,12 +362,13 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     std::vector<Ticket> tickets = refresh_tickets();
     // M6: only the tickets whose home lane is this device are worked; the
     // rest stay for their owners.
-    if (!impl_->options.self.empty() && !impl_->options.members.empty()) {
+    const auto& live_members = live_lane_members();
+    if (!impl_->options.self.empty() && !live_members.empty()) {
       tickets.erase(
           std::remove_if(tickets.begin(), tickets.end(),
                          [&](const Ticket& ticket) {
-                           const auto owner = lane_owner(
-                               ticket.path, impl_->options.members);
+                           const auto owner =
+                               lane_owner(ticket.path, live_members);
                            return !owner || *owner != impl_->options.self;
                          }),
           tickets.end());
@@ -364,7 +377,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // Decision 0014: a device whose own reservation folded past the
     // budget cap starts no new attempts for the campaign (in-flight
     // attempts finish).
-    if (!impl_->options.self.empty() && !impl_->options.members.empty()) {
+    if (!impl_->options.self.empty() && !live_lane_members().empty()) {
       const auto hlcs = impl_->own_reserve_hlcs.find(spec.id);
       if (hlcs != impl_->own_reserve_hlcs.end() && !hlcs->second.empty() &&
           writer.reservation_void(spec.id, impl_->options.origin,
@@ -377,7 +390,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       // No work here. In fleet mode the campaign is over once the fleet
       // budget is exhausted (the synced RESERVE records say so); otherwise
       // the device waits for the next sync round to bring lane work.
-      if (!impl_->options.members.empty() &&
+      if (!live_lane_members().empty() &&
           writer.reserved_total(spec.id) >= spec.loop_budget) {
         result.end_reason = "budget";
       } else {
@@ -389,7 +402,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // A spent chunk asks for the next one, only now that work exists.
     if (used_in_chunk >= current_chunk_size_) {
       const std::int64_t reserved = writer.reserved_total(spec.id);
-      const bool fleet = !impl_->options.members.empty();
+      const bool fleet = !live_lane_members().empty();
       auto& round_state = impl_->round_states[spec.id];
       if (fleet && !round_state.sync_round_complete) {
         // Decision 0014: at most one reservation per sync round. The node
@@ -641,7 +654,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   // stop rule, or a drain in single-device mode. Exhaustion ("budget")
   // never closes it — open tickets resume if the budget is raised, and a
   // drained fleet lane waits for sync.
-  const bool fleet = !impl_->options.members.empty();
+  const bool fleet = !live_lane_members().empty();
   if (result.end_reason == "stop rule" ||
       (result.end_reason == "drained" && !fleet)) {
     writer.submit(state::CommitTerminal{{make_record(

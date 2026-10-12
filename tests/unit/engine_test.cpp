@@ -386,3 +386,28 @@ TEST_F(EngineTest, StructureReviewDoesNotReprocessTheTicket) {
   // second run added nothing.
   EXPECT_EQ(writer_->db().all_nodes(&error).size(), 4u);
 }
+
+TEST_F(EngineTest, DeadMemberDropsOutOfTheLiveLaneList) {
+  seed_root();
+  Budget budget("10");
+  // The static list gives the OTHER device every lane (weight 100 vs
+  // 0.1): this device skips the work.
+  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001", std::nullopt,
+                                0,
+                                {{"dev0000000000000001", 0.1},
+                                 {"dev0000000000000002", 100.0}},
+                                "dev0000000000000001"});
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  const Engine::RunResult idle = engine.run(campaign, nullptr);
+  EXPECT_EQ(idle.end_reason, "drained");
+  EXPECT_EQ(idle.settled, 0);
+
+  // The other device went DEAD and the majority rule dropped it: the
+  // live lane list re-hashes its tickets to this device.
+  engine.set_lane_members({{"dev0000000000000001", 0.1}});
+  const Engine::RunResult resumed = engine.run(campaign, nullptr);
+  EXPECT_EQ(resumed.end_reason, "drained");
+  EXPECT_GT(resumed.settled, 0);
+}

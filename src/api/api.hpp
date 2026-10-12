@@ -31,6 +31,8 @@ class Server {
     std::function<bool(std::string, std::string)> review_retry;
     std::function<bool(std::string, std::string)> review_reject;
     std::function<void(bool leave)> stop_node;
+    // M7: submit a MEMBER_EVICT record through the running writer.
+    std::function<bool(std::string, std::string)> evict;
   };
 
   explicit Server(Options options);
