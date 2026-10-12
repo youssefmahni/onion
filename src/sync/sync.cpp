@@ -391,6 +391,12 @@ bool SyncServer::start(std::string* error) {
     // The joiner learns the fleet from this response: the static list
     // plus every admitted member.
     nlohmann::json members = nlohmann::json::array();
+    const auto url_of = [&](const std::string& device_id) {
+      const auto found = impl_->options.member_urls.find(device_id);
+      return found == impl_->options.member_urls.end()
+                 ? std::string{}
+                 : found->second;
+    };
     for (const auto& entry : impl_->options.members) {
       std::string hex;
       static const char* digits = "0123456789abcdef";
@@ -398,12 +404,23 @@ bool SyncServer::start(std::string* error) {
         hex.push_back(digits[byte >> 4]);
         hex.push_back(digits[byte & 0xf]);
       }
+      const std::string url =
+          entry.device_id == impl_->options.key->device_id
+              ? impl_->options.self_url
+              : url_of(entry.device_id);
       members.push_back({{"device_id", entry.device_id},
-                         {"public_key", hex}});
+                         {"public_key", hex},
+                         {"url", url}});
     }
-    for (const auto& row : impl_->options.writer->members_table())
+    for (const auto& row : impl_->options.writer->members_table()) {
+      const std::string url =
+          row.device_id == impl_->options.key->device_id
+              ? impl_->options.self_url
+              : url_of(row.device_id);
       members.push_back({{"device_id", row.device_id},
-                         {"public_key", row.pubkey_hex}});
+                         {"public_key", row.pubkey_hex},
+                         {"url", url}});
+    }
     response.status = 200;
     response.set_content(
         nlohmann::json{{"ok", true},

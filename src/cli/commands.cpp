@@ -700,6 +700,8 @@ int node_cmd(int argc, char** argv) {
     sync_options.writer = writer.get();
     sync_options.key = device_key;
     sync_options.members = sync_members;
+    sync_options.member_urls = member_urls;
+    sync_options.self_url = self_host + ":" + std::to_string(self_sync_port);
     sync_server = std::make_unique<onion::sync::SyncServer>(std::move(sync_options));
     std::string sync_error;
     if (!sync_server->start(&sync_error)) {
@@ -792,6 +794,14 @@ int node_cmd(int argc, char** argv) {
         joined_device ? onion::swim::MemberState::JOINING
                       : onion::swim::MemberState::ACTIVE,
         1);
+    if (std::getenv("ONION_SYNC_DEBUG"))
+      std::fprintf(stderr, "swim self state: %.*s (joined=%d)\n",
+                   static_cast<int>(onion::swim::to_string(
+                       swim->membership().self().state)
+                                       .size()),
+                   onion::swim::to_string(swim->membership().self().state)
+                       .data(),
+                   joined_device ? 1 : 0);
     for (const auto& member : sync_members) {
       if (member.device_id == device_key->device_id) continue;
       onion::swim::Member seed;
@@ -989,10 +999,8 @@ int node_cmd(int argc, char** argv) {
         if (std::getenv("ONION_SYNC_DEBUG"))
           std::fprintf(stderr, "sync timer fired, members=%zu\n",
                        lane_members.size());
-        last_sync = std::chrono::steady_clock::now();
-        // Decision 0014: one completed sync round re-opens reservations
-        // and feeds the measured-chunk window.
-        engine.note_sync_round();
+                last_sync = std::chrono::steady_clock::now();
+        bool any_peer_answered = false;
         for (const auto& member : lane_members) {
           if (member.device_id == device_key->device_id) continue;
           const auto peer_entry = member_urls.find(member.device_id);
@@ -1007,6 +1015,7 @@ int node_cmd(int argc, char** argv) {
               {*writer, device_key, std::move(client_members)});
           const int applied =
               client.run_round(peer, &quarantined, &sync_error);
+          if (sync_error.empty()) any_peer_answered = true;
           if (std::getenv("ONION_SYNC_DEBUG")) {
             std::string quarantine_note;
             for (const auto& [origin, reason] : quarantined)
@@ -1018,9 +1027,44 @@ int node_cmd(int argc, char** argv) {
                          quarantine_note.c_str());
           }
         }
+        // Decision 0014: only a COMPLETED sync round re-opens
+        // reservations and feeds the measured-chunk window — a fully
+        // partitioned round must not unlock more spending.
+        if (any_peer_answered) engine.note_sync_round();
+        // M7 joining: a JOINING device turns ACTIVE once its lag behind
+        // every origin is under 100 ops.
+        if (swim && swim->membership().self().state ==
+                        onion::swim::MemberState::JOINING) {
+          std::int64_t worst_lag = 0;
+          bool lag_known = false;
+          for (const auto& member : lane_members) {
+            if (member.device_id == device_key->device_id) continue;
+            const auto peer_entry = member_urls.find(member.device_id);
+            if (peer_entry == member_urls.end()) continue;
+            std::map<std::string, onion::sync::MemberKey> client_members;
+            for (const auto& entry : sync_members)
+              client_members[entry.device_id] = entry;
+            onion::sync::SyncClient lag_client(
+                {*writer, device_key, std::move(client_members)});
+            std::string lag_error;
+            const std::int64_t lag =
+                lag_client.peer_lag(peer_entry->second, &lag_error);
+            if (lag < 0) continue;
+            lag_known = true;
+            worst_lag = std::max(worst_lag, lag);
+          }
+          if (lag_known && worst_lag < 100) {
+            swim->mutable_membership().set_self_state(
+                onion::swim::MemberState::ACTIVE,
+                swim->membership().self().incarnation + 1);
+            swim->announce();
+            std::fprintf(stderr, "joined: ACTIVE (lag %lld)\n",
+                         static_cast<long long>(worst_lag));
+          }
+        }
       }
     }
-    if (!members_path.empty()) reload_members();
+if (!members_path.empty()) reload_members();
     // SWIM: one protocol step plus a drain of the UDP socket each loop.
     if (swim && swim_transport) {
       swim->tick();

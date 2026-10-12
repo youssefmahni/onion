@@ -80,6 +80,10 @@ class SyncServer {
     state::StateWriter* writer{};
     std::shared_ptr<const log::DeviceKey> key;
     std::vector<MemberKey> members;  // device_id -> public key
+    // M7 joining: the fleet's reachable addresses, so the admission
+    // response can tell the joiner where every member syncs.
+    std::map<std::string, std::string> member_urls;
+    std::string self_url;  // this device's own host:port
   };
 
   explicit SyncServer(Options options);
