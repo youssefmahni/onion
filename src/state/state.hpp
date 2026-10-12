@@ -137,7 +137,12 @@ class StateWriter {
 
   void run();
   bool flush_pending_attempts(std::string* error);
-  bool append_batch(std::vector<log::Record> records, std::string* error);
+  // Appends and folds one batch.  The crash hook fires at hook_step_base
+  // (batch durable, store stale) and hook_step_base + 1 (fold done).
+  // Terminal batches use the default base 1; the group-commit attempt flush
+  // uses base 3, so the fork tests can kill at every commit-order step (C4).
+  bool append_batch(std::vector<log::Record> records, std::string* error,
+                    int hook_step_base = 1);
   void update_applied(std::string_view origin,
                       const std::vector<log::Record>& records);
   std::map<std::string, std::unique_ptr<log::Segments>> foreign_segments_;

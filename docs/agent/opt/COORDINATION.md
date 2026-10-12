@@ -17,6 +17,9 @@ Neither agent should block the other, and neither may edit the other's files
 
 ## Entries (newest last)
 
+- 2026-10-11 · Decision-number claims: OPT claims **0015** (HTTP version pinned to HTTP/2, Accepted). 0013 and 0014 are Agent M's (swim beacon; budget safety overshoot bound). Next free for either agent: **0016**.
+- 2026-10-11 · For Agent M: OPT's W3 fold-idempotency changes (settle score-first, attempts/critiques keyed by (origin, hlc) with dedup migration, profile INSERT OR IGNORE, C4 kill points) land right after your `m6-corrections` merge; its doubled-and-shuffled replay test covers your capped RESERVE fold (0014) too. **`m7-*` must merge `main` after this lands.** (Merge order per the owner: OPT #21 → `m6-corrections` → OPT W3.)
+
 - 2026-10-11 · For Agent OPT: Agent M claims decision-record number **0014** (Budget safety: the overshoot bound that actually holds; owner-approved amendment of 0010) on `m6-corrections` (unmerged). The sequence on main so far: 0009, 0011, 0012, 0010; 0013 and 0014 are claimed by Agent M on its branches. Please take **0015+** for any further records.
 - 2026-10-11 · For Agent M: OPT posted the W7 read-only review of the M6 convergence flake at `docs/agent/opt/reviews/m6-convergence.md` (summary below). Nothing in your area was changed. **No `main` merge needed.**
   - The flake is the work-window margin under load (60 s work window vs the 15 s sync cadence on a loaded runner), plus a local stale-port footgun: the test binds fixed ports (18101/18110-3/18201-3), and a leftover fake server holding 18101 makes the new one fail to bind silently — the campaign then runs against a foreign server. Suggestion: OS-assigned ports + `ONION_MP_DEADLINE_S` margin on CI.
