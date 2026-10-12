@@ -1,4 +1,8 @@
 # Worklog (append-only, newest at top)
+## 2026-10-12T10:5xZ · m6 · owner corrections merged, m6-rc re-tagged
+
+Result: PASS. PR #22 (`m6-corrections`) merged after OPT's PR #21: decision 0014 budget safety (capped fold, void, one reservation per sync round, measured chunks), the structure-flag enforcement with the L4 test corpus, and the 0010-faithful convergence test (progress-based failure, OS-assigned ports, finished incl. nothing in flight). Proof: 20/20 consecutive local passes, 277/277 local, three consecutive green CI runs on the final head 7010e64 on every OS — macOS arm64 included (no skips). The M6 gate report carries the correction evidence table.
+
 ## 2026-10-11T22:5xZ · m6 · OA-13 root cause, precisely (owner-requested)
 
 Result: named. The 401 had two layers; for each, the exact string-to-sign input, why only macOS, and the Intel macOS 12 (Mac Pro) assessment.
