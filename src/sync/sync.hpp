@@ -57,6 +57,19 @@ struct MemberKey {
   std::vector<std::uint8_t> public_key;
 };
 
+// M7 joining: clone the peer's newest checkpoint into `destination` (the
+// joiner's data dir): fetch the manifest, verify its signature against
+// the peer's key, download the snapshot, verify its hash and its Merkle
+// root, and install it as onion.db. Returns "" on success or the reason.
+struct CloneOptions {
+  std::string device_id;              // the JOINING device's id
+  log::Ed25519Signer& signer;         // the joining device's key
+  std::map<std::string, MemberKey> members;  // the known fleet (device -> key)
+  std::filesystem::path destination;  // data dir receiving onion.db
+};
+std::string clone_checkpoint(std::string_view peer_base_url,
+                             const CloneOptions& options);
+
 // HTTP sync server on TCP 7947 (DESIGN › Sync protocol). Every endpoint
 // authenticates the caller with the signed-request scheme.
 class SyncServer {

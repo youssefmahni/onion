@@ -101,6 +101,7 @@ class Statement {
   void reset(std::string* error);
 
   std::string text(int column) const;
+  std::string blob(int column) const;  // raw bytes (BLOB-safe)
   int column_count() const;
   std::int64_t integer(int column) const;
   int integer_int(int column) const;

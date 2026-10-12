@@ -1027,6 +1027,42 @@ bool StateWriter::member_exists(std::string_view device_id) const {
   return false;
 }
 
+std::optional<std::vector<std::uint8_t>> StateWriter::member_public_key(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT pubkey FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string blob = statement->blob(0);
+  return std::vector<std::uint8_t>(blob.begin(), blob.end());
+}
+
+std::vector<StateWriter::MemberRow> StateWriter::members_table() const {
+  std::vector<MemberRow> rows;
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT device_id, pubkey, slot, state FROM members ORDER BY device_id;",
+      &error);
+  if (!statement) return rows;
+  std::string step_error;
+  while (statement->step_row(&step_error)) {
+    const std::string pubkey = statement->blob(1);
+    std::string hex;
+    static const char* digits = "0123456789abcdef";
+    for (const unsigned char byte : pubkey) {
+      hex.push_back(digits[byte >> 4]);
+      hex.push_back(digits[byte & 0xf]);
+    }
+    rows.push_back(MemberRow{statement->text(0), hex,
+                             statement->integer(2), statement->text(3)});
+  }
+  return rows;
+}
+
 bool StateWriter::member_slot_collides(std::int64_t slot,
                                        std::string_view device_id) const {
   // Fail CLOSED: a database error must not disable the slot protection.

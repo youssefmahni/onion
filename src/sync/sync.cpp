@@ -62,6 +62,38 @@ std::string signed_bytes_hex(std::string_view device_id,
   return hex;
 }
 
+
+// Signed request headers for a GET: a fresh random nonce per attempt (the
+// macOS 401 fix — a retry signs new bytes), the device id, the timestamp
+// and the signature.
+httplib::Headers signed_headers(std::string_view device_id,
+                                std::string_view path, std::int64_t ts,
+                                log::Signer& signer) {
+  std::random_device entropy;
+  std::mt19937_64 generator(entropy());
+  std::uniform_int_distribution<std::uint64_t> distribution;
+  std::ostringstream nonce_stream;
+  nonce_stream << std::hex << distribution(generator)
+               << distribution(generator);
+  const std::string nonce = nonce_stream.str();
+  const std::string signature =
+      sign_request(device_id, "GET", path, "", nonce, ts, signer);
+  if (std::getenv("ONION_SYNC_DEBUG"))
+    std::fprintf(stderr,
+                 "[sync-client] device=%s path=%s ts=%lld nonce=%s "
+                 "body-hash=%s sig=%s signed-bytes-hex=%s\n",
+                 std::string(device_id).c_str(),
+                 std::string(path).c_str(), static_cast<long long>(ts),
+                 nonce.c_str(), onion::log::blake2b_hex("").c_str(),
+                 signature.c_str(),
+                 signed_bytes_hex(device_id, "GET", path, "", nonce, ts)
+                     .c_str());
+  return httplib::Headers{{"X-Onion-Device", std::string(device_id)},
+                          {"X-Onion-Time", std::to_string(ts)},
+                          {"X-Onion-Nonce", nonce},
+                          {"X-Onion-Sig", signature}};
+}
+
 }  // namespace
 
 std::string sign_request(std::string_view device_id, std::string_view method,
@@ -130,9 +162,112 @@ struct SyncServer::Impl {
   std::atomic<bool> running{false};
   std::atomic<int> port{0};
   NonceCache nonces;
-  std::function<const MemberKey*(const httplib::Request&, httplib::Response&)>
+  // Returns true when the request is authorized (static members.json or
+  // a device admitted through the join endpoint's members-table row).
+  std::function<bool(const httplib::Request&, httplib::Response&)>
       authenticate;
 };
+
+
+std::string clone_checkpoint(std::string_view peer_base_url,
+                             const CloneOptions& options) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(20, 0);
+  client.set_write_timeout(5, 0);
+  // Fresh timestamp per request: a large snapshot can outlive one 60 s
+  // window (the signed-request skew tolerance).
+  const auto fetch = [&](std::string_view path) {
+    return client.Get(std::string(path).c_str(),
+                      signed_headers(options.device_id, path, now_s(),
+                                     options.signer));
+  };
+
+  // Learn the peer's identity from its vector (an authenticated request).
+  auto vector = fetch("/sync/v1/vector");
+  if (!vector || vector->status != 200)
+    return "vector request failed (status " +
+           std::to_string(vector ? vector->status : -1) + ")";
+  auto vector_json = nlohmann::json::parse(vector->body, nullptr, false);
+  if (vector_json.is_discarded())
+    return "malformed vector response: " + vector->body;
+  const std::string peer_id = vector_json.value("device_id", std::string{});
+  const auto peer_entry = options.members.find(peer_id);
+  if (peer_id.empty() || peer_entry == options.members.end())
+    return "unknown peer identity";
+
+  // The manifest: signature over the canonical JSON with the signature
+  // fields emptied.
+  auto manifest_response = fetch("/sync/v1/checkpoint/latest");
+  if (!manifest_response || manifest_response->status != 200)
+    return "checkpoint manifest request failed (status " +
+           std::to_string(manifest_response ? manifest_response->status : -1) +
+           ")";
+  nlohmann::json manifest =
+      nlohmann::json::parse(manifest_response->body, nullptr, false);
+  if (manifest.is_discarded() || !manifest.contains("signature") ||
+      !manifest.contains("snapshot_hash") ||
+      !manifest.contains("merkle_root") || !manifest.contains("hlc"))
+    return "malformed checkpoint manifest";
+  const std::string signature = manifest["signature"].get<std::string>();
+  manifest["signature"] = "";
+  manifest["cosignature"] = "";
+  const std::string canonical = onion::log::canonical_json(manifest);
+  const auto signature_raw = onion::log::unhex_bytes(signature);
+  if (signature_raw.size() != 64 ||
+      crypto_ed25519_check(
+          signature_raw.data(), peer_entry->second.public_key.data(),
+          reinterpret_cast<const std::uint8_t*>(canonical.data()),
+          canonical.size()) != 0)
+    return "checkpoint manifest signature invalid";
+
+  // The snapshot: hash must match the manifest.
+  const std::string snapshot_path =
+      "/sync/v1/checkpoint/" +
+      std::to_string(manifest["hlc"].get<std::uint64_t>()) + ".db";
+  auto snapshot_response = fetch(snapshot_path);
+  if (!snapshot_response || snapshot_response->status != 200)
+    return "checkpoint snapshot request failed (status " +
+           std::to_string(snapshot_response ? snapshot_response->status : -1) +
+           ")";
+  if (onion::log::blake2b_hex(snapshot_response->body) !=
+      manifest["snapshot_hash"].get<std::string>())
+    return "checkpoint snapshot hash mismatch";
+
+  // Install, then verify the Merkle root against the manifest.
+  std::error_code ec;
+  std::filesystem::create_directories(options.destination, ec);
+  const auto tmp = options.destination / "onion.db.clone-tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return "cannot write the snapshot";
+    out.write(snapshot_response->body.data(),
+              static_cast<std::streamsize>(snapshot_response->body.size()));
+  }
+  std::string error;
+  std::string root_check;
+  {
+    store::Db verify_db(tmp);
+    if (!verify_db.open(&error)) {
+      std::filesystem::remove(tmp, ec);
+      return "cannot open the cloned snapshot";
+    }
+    const auto nodes = verify_db.all_nodes(&error);
+    root_check = store::merkle_root(nodes);
+    verify_db.close();  // release the file before the rename (Windows locks)
+  }
+  if (root_check != manifest["merkle_root"].get<std::string>()) {
+    std::filesystem::remove(tmp, ec);
+    return "checkpoint merkle root mismatch";
+  }
+  std::filesystem::remove(options.destination / "onion.db", ec);
+  std::filesystem::rename(tmp, options.destination / "onion.db", ec);
+  if (ec) {
+    std::filesystem::remove(tmp, ec);
+    return "cannot install the snapshot";
+  }
+  return "";
+}
 
 SyncServer::SyncServer(Options options)
     : impl_(new Impl{std::move(options), nullptr, {}, false, 0, {}}) {}
@@ -158,12 +293,12 @@ bool SyncServer::start(std::string* error) {
   // Authentication for every endpoint. The handler lambdas must capture
   // `this` (not stack locals of start(), which dangle once start returns).
   impl_->authenticate = [this](const httplib::Request& request,
-                                httplib::Response& response) -> const MemberKey* {
+                                httplib::Response& response) -> bool {
     const std::string device_id = request.get_header_value("X-Onion-Device");
     const std::string timestamp = request.get_header_value("X-Onion-Time");
     const std::string signature = request.get_header_value("X-Onion-Sig");
     const std::string nonce = request.get_header_value("X-Onion-Nonce");
-    const auto reject = [&](const char* reason) -> const MemberKey* {
+    const auto reject = [&](const char* reason) -> bool {
       if (std::getenv("ONION_SYNC_DEBUG"))
         std::fprintf(stderr,
                      "[sync-auth] REJECT %s: device=%s ts-header=%s "
@@ -182,23 +317,32 @@ bool SyncServer::start(std::string* error) {
       response.set_content(std::string("{\"error\":\"") + reason +
                                "\"}",
                            "application/json");
-      return nullptr;
+      return false;
     };
     if (device_id.empty() || timestamp.empty() || signature.empty() ||
         nonce.empty())
       return reject("missing auth header");
+    // The static members.json first; a device admitted through the join
+    // endpoint resolves from the members TABLE (M7 dynamic membership).
+    std::vector<std::uint8_t> public_key;
     const MemberKey* member = find_member(impl_->options.members, device_id);
-    if (!member) return reject("unknown device");
+    if (member) {
+      public_key = member->public_key;
+    } else if (const auto stored =
+                   impl_->options.writer->member_public_key(device_id)) {
+      public_key = *stored;
+    } else {
+      return reject("unknown device");
+    }
     const std::int64_t ts = std::atoll(timestamp.c_str());
     // The signature covers the full target (path + query); httplib keeps
     // the query only in request.target.
     if (!request_signature_valid(device_id, "GET", request.target, request.body,
-                                 nonce, signature, member->public_key, ts,
-                                 now_s()))
+                                 nonce, signature, public_key, ts, now_s()))
       return reject("bad signature");
     if (impl_->nonces.seen_and_add(device_id, nonce, now_s()))
       return reject("replayed nonce");
-    return member;
+    return true;
   };
 
   // M7 joining: the invitation token is the credential (it is signed by a
@@ -239,18 +383,85 @@ bool SyncServer::start(std::string* error) {
     impl_->options.writer->submit(
         state::CommitTerminal{{std::move(admission)}});
     impl_->options.writer->sync();
-    // The fold is the authority: sync() drained it. Presence in the
-    // members table means OUR add (or an earlier add of the same device)
-    // won; absence means a concurrent same-slot admission beat us.
+    // The fold is the authority: sync() drained it. Presence means OUR add
+    // (or an earlier add of the same device) won; absence means a
+    // concurrent same-slot admission beat us.
     if (!impl_->options.writer->member_exists(identity->device_id))
       return reject(409, "slot collision");
+    // The joiner learns the fleet from this response: the static list
+    // plus every admitted member.
+    nlohmann::json members = nlohmann::json::array();
+    for (const auto& entry : impl_->options.members) {
+      std::string hex;
+      static const char* digits = "0123456789abcdef";
+      for (const std::uint8_t byte : entry.public_key) {
+        hex.push_back(digits[byte >> 4]);
+        hex.push_back(digits[byte & 0xf]);
+      }
+      members.push_back({{"device_id", entry.device_id},
+                         {"public_key", hex}});
+    }
+    for (const auto& row : impl_->options.writer->members_table())
+      members.push_back({{"device_id", row.device_id},
+                         {"public_key", row.pubkey_hex}});
     response.status = 200;
     response.set_content(
         nlohmann::json{{"ok", true},
                        {"device_id", identity->device_id},
-                       {"slot", identity->slot}}
+                       {"slot", identity->slot},
+                       {"members", std::move(members)}}
             .dump(),
         "application/json");
+  });
+
+
+  // M7 joining: the newest checkpoint manifest and its snapshot (DESIGN ›
+  // Joining — the new device clones a checkpoint instead of replaying the
+  // whole log, verifies the Merkle root and the signature, then pulls
+  // the tails).
+  impl_->server->Get("/sync/v1/checkpoint/latest",
+                     [this](const httplib::Request& request,
+                            httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const auto dir = impl_->options.writer->data_dir();
+    std::vector<std::filesystem::path> manifests;
+    std::error_code ec;
+    if (std::filesystem::exists(dir))
+      for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("checkpoint-", 0) == 0 &&
+            name.size() > 9 && name.substr(name.size() - 9) == ".manifest")
+          manifests.push_back(entry.path());
+      }
+    if (manifests.empty()) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no checkpoint yet\"}",
+                           "application/json");
+      return;
+    }
+    std::sort(manifests.begin(), manifests.end());
+    std::ifstream in(manifests.back(), std::ios::binary);
+    std::string manifest((std::istreambuf_iterator<char>(in)), {});
+    response.set_content(manifest, "application/json");
+  });
+
+  impl_->server->Get("/sync/v1/checkpoint/([0-9]+).db",
+                     [this](const httplib::Request& request,
+                            httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const std::string name =
+        std::string("checkpoint-") + request.matches[1].str() + ".db";
+    const auto path = impl_->options.writer->data_dir() / name;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no such snapshot\"}",
+                           "application/json");
+      return;
+    }
+    std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    response.set_content(bytes, "application/octet-stream");
   });
 
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,
@@ -433,31 +644,7 @@ int SyncClient::run_round(std::string_view peer_base_url,
   const std::int64_t ts = now_s();
   log::Ed25519Signer signer(*impl_->options.key);
   auto request_headers = [&](std::string_view path) {
-    // A fresh random nonce per ATTEMPT: a transport retry signs a new
-    // nonce, so the anti-replay cache never rejects a legitimate retry
-    // (the macOS 401 root cause: httplib retried with the same bytes).
-    std::random_device entropy;
-    std::mt19937_64 generator(entropy());
-    std::uniform_int_distribution<std::uint64_t> distribution;
-    std::ostringstream nonce_stream;
-    nonce_stream << std::hex << distribution(generator)
-                 << distribution(generator);
-    const std::string nonce = nonce_stream.str();
-    const std::string signature =
-        sign_request(self, "GET", path, "", nonce, ts, signer);
-    if (std::getenv("ONION_SYNC_DEBUG"))
-      std::fprintf(stderr,
-                   "[sync-client] device=%s path=%s ts=%lld nonce=%s "
-                   "body-hash=%s sig=%s signed-bytes-hex=%s\n",
-                   self.c_str(), std::string(path).c_str(),
-                   static_cast<long long>(ts), nonce.c_str(),
-                   onion::log::blake2b_hex("").c_str(), signature.c_str(),
-                   signed_bytes_hex(self, "GET", path, "", nonce, ts)
-                       .c_str());
-    return httplib::Headers{{"X-Onion-Device", self},
-                            {"X-Onion-Time", std::to_string(ts)},
-                            {"X-Onion-Nonce", nonce},
-                            {"X-Onion-Sig", signature}};
+    return signed_headers(self, path, ts, signer);
   };
   auto response = client.Get("/sync/v1/vector",
                              request_headers("/sync/v1/vector"));

@@ -115,6 +115,14 @@ int Statement::column_count() const {
   return stmt_ ? sqlite3_column_count(stmt_) : 0;
 }
 
+std::string Statement::blob(int column) const {
+  const auto* value = sqlite3_column_blob(stmt_, column);
+  if (!value) return {};
+  const int bytes = sqlite3_column_bytes(stmt_, column);
+  return std::string(reinterpret_cast<const char*>(value),
+                     static_cast<std::size_t>(bytes));
+}
+
 std::string Statement::text(int column) const {
   const auto* value = sqlite3_column_text(stmt_, column);
   if (!value) return {};

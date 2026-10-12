@@ -96,6 +96,8 @@ class StateWriter {
   void sync();
   // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
   bool write_checkpoint(std::string* error);
+  // The data directory (checkpoints live next to onion.db).
+  const std::filesystem::path& data_dir() const { return options_.data_dir; }
   // Drains and joins the writer thread.
   void stop();
 
@@ -130,6 +132,17 @@ class StateWriter {
                             std::string_view device_id) const;
   // M7 joining: whether the members table holds this device.
   bool member_exists(std::string_view device_id) const;
+  // M7 joining: a member's public key (32 bytes) from the members table.
+  std::optional<std::vector<std::uint8_t>> member_public_key(
+      std::string_view device_id) const;
+  // M7 joining: every member row (device_id, pubkey hex, slot, state).
+  struct MemberRow {
+    std::string device_id;
+    std::string pubkey_hex;
+    std::int64_t slot{};
+    std::string state;
+  };
+  std::vector<MemberRow> members_table() const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;

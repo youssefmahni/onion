@@ -291,7 +291,62 @@ int node_cmd(int argc, char** argv) {
       return 1;
     }
     std::cout << response->body << "\n";
-    return response->status == 200 ? 0 : 1;
+    if (response->status != 200) return 1;
+
+    // Admitted: the response carries the fleet's member list — write the
+    // joiner's members.json, then clone the seed's newest checkpoint
+    // (manifest signature, snapshot hash and Merkle root all verified).
+    const std::filesystem::path join_dir = data_dir_arg(argc, argv);
+    const auto body = json::parse(response->body, nullptr, false);
+    if (body.is_object() && body.contains("members")) {
+      std::filesystem::create_directories(join_dir);
+      const auto tmp_members = join_dir / "members.json.tmp";
+      {
+        std::ofstream members_file(tmp_members);
+        if (!members_file) {
+          std::cerr << "cannot write members.json\n";
+          return 1;
+        }
+        members_file << body["members"].dump() << "\n";
+      }
+      onion::platform::atomic_replace(tmp_members, join_dir / "members.json");
+    }
+    onion::platform::KeyStore store(join_dir / "keys");
+    std::string key_error;
+    const auto device_key = load_device_key(store, &key_error);
+    if (!device_key) {
+      std::cerr << key_error << "\n";
+      return 1;
+    }
+    std::map<std::string, onion::sync::MemberKey> members;
+    if (body.is_object() && body.contains("members")) {
+      for (const auto& entry : body["members"]) {
+        if (!entry.contains("device_id") || !entry.contains("public_key"))
+          continue;
+        const std::string key_hex = entry["public_key"].get<std::string>();
+        std::vector<std::uint8_t> key_bytes = onion::log::unhex_bytes(key_hex);
+        if (key_bytes.size() != 32) continue;
+        members[entry["device_id"].get<std::string>()] =
+            onion::sync::MemberKey{entry["device_id"].get<std::string>(),
+                                   std::move(key_bytes)};
+      }
+    }
+    onion::log::Ed25519Signer signer(*device_key);
+    onion::sync::CloneOptions clone_options{
+        device_key->device_id, signer, std::move(members), join_dir};
+    const std::string clone_error =
+        onion::sync::clone_checkpoint(seed, clone_options);
+    if (!clone_error.empty() &&
+        clone_error.find("404") == std::string::npos) {
+      std::cerr << "checkpoint clone failed: " << clone_error << "\n";
+      return 1;
+    }
+    std::cout << "joined: members.json written"
+              << (clone_error.empty()
+                      ? ", checkpoint cloned from " + seed + "\n"
+                      : " (no checkpoint yet — the tails will sync at "
+                        "run)\n");
+    return 0;
   }
   if (argc >= 3 && std::string(argv[2]) == "invite") {
     // M7 joining: print a signed, single-use invitation token
