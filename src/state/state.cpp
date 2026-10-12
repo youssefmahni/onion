@@ -945,7 +945,7 @@ std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
 
 bool StateWriter::reservation_void(std::string_view campaign,
                                    std::string_view origin,
-                                   std::int64_t hlc) const {
+                                   log::Hlc hlc) const {
   const std::int64_t budget = campaign_budget(campaign);
   std::int64_t total = 0;
   for (const ReserveEntry& entry : reserve_entries_sorted(campaign)) {

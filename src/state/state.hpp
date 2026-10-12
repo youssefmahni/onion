@@ -59,7 +59,7 @@ struct CampaignInfo {
   std::string id;
   std::string spec;    // JSON
   std::string state;   // running | paused | stopped
-  std::int64_t hlc{};        // latest (hlc, origin) wins
+  log::Hlc hlc{};      // latest (hlc, origin) wins
   std::string origin;
 };
 
@@ -118,7 +118,7 @@ class StateWriter {
   // Whether one specific RESERVE record (origin, hlc) falls past the cap:
   // its device must stop starting new attempts for the campaign.
   bool reservation_void(std::string_view campaign, std::string_view origin,
-                        std::int64_t hlc) const;
+                        log::Hlc hlc) const;
   // Per-origin RESERVE totals for one campaign, for diagnostics.
   std::map<std::string, std::int64_t> reserved_by_origin(
       std::string_view campaign) const;
@@ -187,7 +187,7 @@ class StateWriter {
   // Decision 0014: the per-campaign RESERVE entry list for the capped,
   // order-independent fold.
   struct ReserveEntry {
-    std::int64_t hlc{};
+    log::Hlc hlc{};
     std::string origin;
     std::int64_t attempts{};
   };

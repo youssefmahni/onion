@@ -172,7 +172,7 @@ struct Engine::Impl {
     std::int64_t last_window_attempts{0};
   };
   std::map<std::string, RoundState> round_states;
-  std::map<std::string, std::vector<std::int64_t>> own_reserve_hlcs;
+  std::map<std::string, std::vector<log::Hlc>> own_reserve_hlcs;
   log::HlcClock hlc;
 };
 
