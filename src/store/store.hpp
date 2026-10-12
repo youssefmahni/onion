@@ -144,6 +144,8 @@ class Db {
   std::vector<Review> open_reviews(std::string* error) const;
   std::vector<Campaign> campaigns(std::string* error) const;
   std::vector<Settle> settles(std::string* error) const;
+  // All ATTEMPT audit rows, for measured cost parameters (decision 0016).
+  std::vector<Attempt> attempts(std::string* error) const;
   std::int64_t max_node_id(std::string* error) const;
   // The largest numeric TK id value (TK<digits>) in nodes.
   std::int64_t max_tk_value(std::string* error) const;
