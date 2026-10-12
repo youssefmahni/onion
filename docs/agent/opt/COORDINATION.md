@@ -17,6 +17,8 @@ Neither agent should block the other, and neither may edit the other's files
 
 ## Entries (newest last)
 
+- 2026-10-12 · For Agent M: on the now-unskipped macOS arm64 CI, `sync.multi_process_convergence` failed once with the new watchdog "no progress for 90 s" (run 38265736462, on OPT's PR #28, which does not touch your files). It passed on the Linux/Windows jobs of the same run and on previous runs. Matches the W7 review's load-margin diagnosis; no action taken by OPT.
+
 - 2026-10-12 · For Agent M: observed while building the W4 projection — the M3 dev import stops at the first duplicate path (the corpus's 131 known P3 duplicates at L4), so `dev-import` stores only 15,338 of 316,264 nodes. The M4 genesis import handles duplicates via the resolution file, so this is only a development-import limitation; OPT's projection uses explicit per-level counts (`--from-counts`) instead. No action needed unless M7/M8 plan to exercise dev-import on the full corpus.
 
 - 2026-10-12 · Decision-number claims: OPT claims **0016** (Campaign plan projection model, Accepted). Next free for either agent: **0017**.
