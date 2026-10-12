@@ -16,6 +16,13 @@
 namespace onion::state {
 namespace {
 
+std::int64_t wall_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+
 // The deterministic fold: one record type, one store mutation. Upserts use
 // the highest (hlc, origin) so a replay after a crash is idempotent.
 void upsert_node(store::Db& db, const log::Record& record,
@@ -534,7 +541,16 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   const std::string& type = record.type;
   const std::string origin(batch_origin);
   if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
-  else if (type == "SETTLE") upsert_settle(db_, record, origin, error);
+  else if (type == "SETTLE") {
+    upsert_settle(db_, record, origin, error);
+    // A settle ends any CLAIM and REEXPAND lock on the path.
+    const std::string settle_path = record.payload.value("path", std::string{});
+    if (!settle_path.empty()) {
+      std::unique_lock lock(index_mutex_);
+      claims_.erase(settle_path);
+      reexpand_paths_.erase(settle_path);
+    }
+  }
   else if (type == "ATTEMPT") upsert_attempt(db_, record, origin, error);
   else if (type == "CRITIQUE") upsert_critique(db_, record, origin, error);
   else if (type == "NEEDS_REVIEW") upsert_review(db_, record, origin, error);
@@ -550,7 +566,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       statement->bind(2, payload.value("note", std::string{}), &bind_error);
       statement->step(&bind_error);
     }
-  } else if (type == "TOMBSTONE") {
+} else if (type == "TOMBSTONE") {
     const auto& payload = record.payload;
     auto statement = db_.prepare(
         "UPDATE nodes SET tombstone=1 WHERE path=?1;", error);
@@ -614,6 +630,29 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       std::string step_error;
       statement->step(&step_error);
     }
+  } else if (type == "CLAIM") {
+    // M7 stealing: a 10-minute lease timed from THIS device's receipt.
+    // Racing claims resolve on the highest (hlc, origin), exactly like
+    // the rest of the fold, so every replica agrees on the holder.
+    const std::string path = record.payload.value("path", std::string{});
+    if (path.empty()) return;
+    const std::int64_t lease_s =
+        std::clamp(record.payload.value("lease_s", std::int64_t{600}),
+                   std::int64_t{1}, std::int64_t{86400});
+    std::unique_lock lock(index_mutex_);
+    const auto existing = claims_.find(path);
+    if (existing == claims_.end() ||
+        record.hlc > existing->second.hlc ||
+        (record.hlc == existing->second.hlc &&
+         origin > existing->second.origin))
+      claims_[path] = ClaimEntry{origin, record.hlc, origin, wall_ms(),
+                                 lease_s};
+  } else if (type == "REEXPAND") {
+    // M7 re-expansion lock: the subtree pauses until the settle.
+    const std::string path = record.payload.value("path", std::string{});
+    if (path.empty()) return;
+    std::unique_lock lock(index_mutex_);
+    reexpand_paths_.insert(path);
   } else if (type == "MEMBER_LEAVE") {
     // Valid only from the device itself (DESIGN › Conflict table).
     const std::string device_id =
@@ -1133,6 +1172,31 @@ bool StateWriter::member_slot_collides(std::int64_t slot,
   std::string step_error;
   if (statement->step_row(&step_error)) return statement->integer(0) > 0;
   return true;
+}
+
+std::string StateWriter::claim_holder(std::string_view path,
+                                      std::string_view my_device,
+                                      std::int64_t now_ms) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = claims_.find(std::string(path));
+  if (found == claims_.end()) return {};
+  const ClaimEntry& entry = found->second;
+  if (entry.claimer == my_device) return {};  // our own claim
+  if (now_ms >= entry.received_ms + entry.lease_s * 1000) return {};  // expired
+  return entry.claimer;
+}
+
+bool StateWriter::reexpand_open(std::string_view path) const {
+  std::shared_lock lock(index_mutex_);
+  std::string prefix;
+  for (const char c : path) {
+    prefix.push_back(c);
+    if (c == '-') {
+      if (reexpand_paths_.count(prefix.substr(0, prefix.size() - 1)))
+        return true;
+    }
+  }
+  return reexpand_paths_.count(std::string(path)) != 0;
 }
 
 std::int64_t StateWriter::reserved_total(std::string_view campaign) const {

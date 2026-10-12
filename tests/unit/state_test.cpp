@@ -1233,3 +1233,85 @@ TEST_F(StateWriterTest, MemberLeaveIsValidOnlyFromTheDeviceItself) {
   ASSERT_TRUE(statement->step_row(&step_error));
   EXPECT_EQ(statement->text(0), "LEFT");
 }
+
+namespace {
+
+std::int64_t wall_ms_for_test() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+onion::log::Record claim_record(const std::string& path,
+                                const std::string& origin_note = "") {
+  onion::log::Record record;
+  record.type = "CLAIM";
+  record.payload = {{"campaign", "mp1"}, {"path", path}, {"lease_s", 600}};
+  return record;
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, ClaimsExpireFromTheReceiversClock) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  // A foreign claim from origin aa on P01-IN01.
+  onion::log::Record claim = claim_record("P01-IN01");
+  claim.seq = 1;
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000aa", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{claim}, signer)});
+  writer_->sync();
+
+  const std::int64_t now = wall_ms_for_test();
+  // Un-expired: the claimer is visible.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001", now),
+            "dev00000000000000aa");
+  // Our own device's view: a claim by someone else holds; our own claims
+  // don't block us.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev00000000000000aa", now),
+            "");
+  // The lease is timed from OUR receipt: +10 minutes (600 s) it expires.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001",
+                                  now + 600 * 1000),
+            "");
+  // A settle ends the claim outright.
+  writer_->submit(CommitTerminal{{make_record(
+      "SETTLE", {{"path", "P01-IN01"}, {"kept", 0}, {"atomic", 0},
+                 {"attempts", 1}, {"score", "0"}, {"end", "cannot split"},
+                 {"campaign", "mp1"}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001", now),
+            "");
+}
+
+TEST_F(StateWriterTest, ReexpandPausesTheSubtreeUntilTheSettle) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  onion::log::Record lock;
+  lock.type = "REEXPAND";
+  lock.payload = {{"path", "P01"}, {"reason", "retry"}};
+  lock.seq = 1;
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000aa", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{lock}, signer)});
+  writer_->sync();
+
+  EXPECT_TRUE(writer_->reexpand_open("P01"));
+  EXPECT_TRUE(writer_->reexpand_open("P01-IN01"));
+  EXPECT_TRUE(writer_->reexpand_open("P01-IN01-T01-TK00001"));
+  EXPECT_FALSE(writer_->reexpand_open("P02"));
+
+  // The settle clears the lock for the whole subtree.
+  writer_->submit(CommitTerminal{{make_record(
+      "SETTLE", {{"path", "P01"}, {"kept", 0}, {"atomic", 0},
+                 {"attempts", 1}, {"score", "0"}, {"end", "children"},
+                 {"campaign", "mp1"}})}});
+  writer_->sync();
+  EXPECT_FALSE(writer_->reexpand_open("P01"));
+  EXPECT_FALSE(writer_->reexpand_open("P01-IN01"));
+}

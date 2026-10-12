@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <deque>
 #include <limits>
+#include <random>
 #include <set>
 
 #include "core/depot_core.hpp"
@@ -55,6 +56,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.chunk = value.value("chunk", std::int64_t{50});
   spec.light_funnel_from = value.value("light_funnel_from", 8);
   spec.structure = value.value("structure", false);
+  spec.spillover = value.value("spillover", true);
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
@@ -160,6 +162,21 @@ std::int64_t NodeIdAllocator::counter_from_code(std::string_view code) {
 
 // ----------------------------------------------------------------- engine
 
+namespace {
+std::int64_t wall_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+log::Record make_record(std::string type, nlohmann::json payload) {
+  log::Record record;
+  record.type = std::move(type);
+  record.payload = std::move(payload);
+  return record;
+}
+}  // namespace
+
 struct Engine::Impl {
   Options options;
   std::vector<LaneMember> lane_members;  // the live list (M7)
@@ -173,6 +190,10 @@ struct Engine::Impl {
     std::int64_t last_window_attempts{0};
   };
   std::map<std::string, RoundState> round_states;
+  // M7 stealing: paths we claimed — campaign plus the claim's local
+  // receipt time (renewed every 3 minutes while the ticket is open).
+  std::map<std::string, std::pair<std::string, std::int64_t>> stolen_claims;
+  std::mt19937 rng_{std::random_device{}()};
   std::map<std::string, std::vector<log::Hlc>> own_reserve_hlcs;
   log::HlcClock hlc;
 };
@@ -198,16 +219,32 @@ void Engine::note_sync_round() {
     state.attempts_in_window = 0;
     state.sync_round_complete = true;
   }
+  // M7 stealing: renew every claim older than 3 minutes whose ticket is
+  // still open (a settle ends the claim in the fold).
+  const std::int64_t now_ms = wall_ms();
+  for (auto it = impl_->stolen_claims.begin();
+       it != impl_->stolen_claims.end();) {
+    const std::string path = it->first;
+    const auto campaign_state =
+        impl_->options.writer.campaign(it->second.first);
+    const bool campaign_over =
+        !campaign_state || campaign_state->state != "running";
+    if (impl_->options.writer.settled(path) || campaign_over) {
+      it = impl_->stolen_claims.erase(it);
+      continue;
+    }
+    if (now_ms - it->second.second >= 3 * 60 * 1000) {
+      impl_->options.writer.submit(state::CommitTerminal{{make_record(
+          "CLAIM", {{"campaign", it->second.first},
+                    {"path", path},
+                    {"lease_s", 600}})}});
+      it->second.second = now_ms;
+    }
+    ++it;
+  }
 }
 
 namespace {
-
-log::Record make_record(std::string type, nlohmann::json payload) {
-  log::Record record;
-  record.type = std::move(type);
-  record.payload = std::move(payload);
-  return record;
-}
 
 // Walks the node's ancestor chain by path prefix and collects the context
 // the gate checks need.
@@ -278,6 +315,8 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                              {"floor", std::to_string(spec.floor)},
                              {"chunk", spec.chunk},
                              {"structure", spec.structure},
+                             {"spillover", spec.spillover},
+                             {"light_funnel_from", spec.light_funnel_from},
                              {"model", spec.model}}},
                    {"state", "running"}})}});
   }
@@ -350,7 +389,72 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                          review_cache, spec);
   };
 
+  std::int64_t now_ms = wall_ms();
+  // M7 stealing: choose one ticket from the far end of the top-5
+  // busiest eligible lanes. Eligibility: the lane's owner must be in the
+  // live member list (dead lanes are already re-hashed or untouched by a
+  // split), the ticket unclaimed, no open re-expansion, and — when the
+  // campaign disallows spillover — the owner's budget must not be
+  // exhausted.
+  const auto pick_stolen_ticket = [&](const CampaignSpec& spec,
+                                      const std::vector<LaneMember>& members)
+      -> std::optional<Ticket> {
+    std::string error;
+    std::vector<store::Node> nodes;
+    if (spec.scope.empty())
+      nodes = writer.db().all_nodes(&error);
+    else
+      for (const std::string& prefix : spec.scope)
+        for (const store::Node& node :
+             writer.db().nodes_with_path_prefix(prefix, &error))
+          nodes.push_back(node);
+    const auto all_tickets = order_tickets(
+        nodes,
+        [&](std::string_view path) { return writer.settled(path); },
+        [&](std::string_view path) { return writer.leaf(path); },
+        review_cache, spec);
+    // Group open tickets by lane owner; skip claims, locks and our own
+    // lanes.
+    const auto owner_reserved = writer.reserved_by_origin(spec.id);
+    std::map<std::string, std::vector<Ticket>> lanes;
+    for (const Ticket& ticket : all_tickets) {
+      const auto owner = lane_owner(ticket.path, members);
+      if (!owner || *owner == impl_->options.self) continue;
+      if (impl_->stolen_claims.count(ticket.path)) continue;  // ours
+      if (!writer.claim_holder(ticket.path, impl_->options.self, now_ms)
+               .empty())
+        continue;
+      if (writer.reexpand_open(ticket.path)) continue;
+      if (!spec.spillover) {
+        const auto reserved = owner_reserved.find(*owner);
+        if (reserved != owner_reserved.end() &&
+            reserved->second >= spec.loop_budget)
+          continue;  // budget-empty lane: spillover disallowed
+      }
+      lanes[*owner].push_back(ticket);
+    }
+    // The top 5 busiest lanes by open-ticket count.
+    std::vector<std::pair<std::string, std::vector<Ticket>>> ranked;
+    for (auto& [owner, lane] : lanes)
+      ranked.push_back({owner, std::move(lane)});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) {
+                return a.second.size() > b.second.size();
+              });
+    if (ranked.size() > 5) ranked.resize(5);
+    // From each ranked lane take the far end (breadth-first order ends
+    // with the tickets the owner would reach last), and pick one of the
+    // candidates at random so stealers do not collide.
+    std::vector<Ticket> candidates;
+    for (const auto& [owner, lane] : ranked)
+      if (!lane.empty()) candidates.push_back(lane.back());
+    if (candidates.empty()) return std::nullopt;
+    std::shuffle(candidates.begin(), candidates.end(), impl_->rng_);
+    return candidates.front();
+  };
+
   for (;;) {
+    now_ms = wall_ms();  // claims expire per iteration, not per entry
     if (stop_requested()) {
       result.end_reason = "stopped";
       break;
@@ -363,7 +467,8 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // M6: only the tickets whose home lane is this device are worked; the
     // rest stay for their owners.
     const auto& live_members = live_lane_members();
-    if (!impl_->options.self.empty() && !live_members.empty()) {
+    const bool fleet = !impl_->options.self.empty() && !live_members.empty();
+    if (fleet) {
       tickets.erase(
           std::remove_if(tickets.begin(), tickets.end(),
                          [&](const Ticket& ticket) {
@@ -373,6 +478,22 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                          }),
           tickets.end());
     }
+    // M7 stealing: skip tickets claimed by another device (the lease is
+    // timed from OUR receipt — never the claimer's clock) and tickets
+    // under an open re-expansion lock.
+    bool stole_this_round = false;
+    tickets.erase(
+        std::remove_if(tickets.begin(), tickets.end(),
+                       [&](const Ticket& ticket) {
+                         if (!writer.claim_holder(ticket.path,
+                                                  impl_->options.self,
+                                                  now_ms)
+                                  .empty())
+                           return true;
+                         if (writer.reexpand_open(ticket.path)) return true;
+                         return false;
+                       }),
+        tickets.end());
     if (tickets.empty() && waiting.empty()) cache_valid = false;
     // Decision 0014: a device whose own reservation folded past the
     // budget cap starts no new attempts for the campaign (in-flight
@@ -384,6 +505,23 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                                   hlcs->second.back())) {
         result.end_reason = "budget";
         break;
+      }
+    }
+    // A lane down to fewer tickets than its workers steals from the far
+    // end of the busiest eligible lanes (DESIGN › Stealing). The void
+    // check runs FIRST: a budget-capped device must not hold stolen
+    // tickets hostage.
+    if (fleet && tickets.empty() && waiting.empty()) {
+      const auto stolen = pick_stolen_ticket(spec, live_members);
+      if (stolen) {
+        writer.submit(state::CommitTerminal{{make_record(
+            "CLAIM", {{"campaign", spec.id},
+                      {"path", stolen->path},
+                      {"lease_s", 600}})}});
+        writer.sync();
+        impl_->stolen_claims[stolen->path] = {spec.id, now_ms};
+        tickets.push_back(*stolen);
+        stole_this_round = true;
       }
     }
     if (tickets.empty() && waiting.empty()) {
@@ -444,6 +582,9 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // A waiting ticket keeps its place in line (G9).
     Ticket ticket;
     bool from_waiting = false;
+    // The speed factor excludes stolen work (decision 0014's measured
+    // chunk counts own-lane attempts only).
+    const bool ticket_stolen = stole_this_round;
     if (!waiting.empty()) {
       ticket = waiting.front();
       from_waiting = true;
@@ -496,7 +637,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                       {"campaign", spec.id},
                       {"issues", attempt.issues}})});
       result.attempts++;
-      impl_->round_states[spec.id].attempts_in_window++;
+      if (!ticket_stolen) impl_->round_states[spec.id].attempts_in_window++;
     }
 
     used_in_chunk++;

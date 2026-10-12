@@ -1219,6 +1219,37 @@ if (!members_path.empty()) reload_members();
     if (swim && swim_transport) {
       swim->tick();
       swim_transport->poll();
+      // M7: the live lane list follows the membership. DEAD, LEFT and
+      // EVICTED members drop out ONLY once a majority of the membership
+      // is visible — a partitioned device keeps the dead lanes, so a
+      // 2-and-2 split moves nothing (DESIGN › Work scheduling ›
+      // Eligibility), and stealing never touches a dead lane either.
+      std::size_t total = 0, visible = 0;
+      for (const auto& member : swim->membership().list())
+        if (member.state != onion::swim::MemberState::INVITED) {
+          total++;
+          if (onion::swim::owns_work(member.state) ||
+              member.state == onion::swim::MemberState::JOINING ||
+              member.state == onion::swim::MemberState::LEAVING)
+            visible++;
+        }
+      const bool majority_visible = visible * 2 > total;
+      std::vector<onion::sched::LaneMember> live;
+      for (const auto& member : swim->membership().list()) {
+        if (member.device_id == device_key->device_id) continue;
+        const bool alive = onion::swim::owns_work(member.state);
+        if (!alive && majority_visible) continue;  // re-hash to survivors
+        if (!alive) continue;  // no majority: keep the dead lanes
+        auto it = std::find_if(
+            lane_members.begin(), lane_members.end(),
+            [&](const onion::sched::LaneMember& entry) {
+              return entry.device_id == member.device_id;
+            });
+        const double weight =
+            it == lane_members.end() ? 1.0 : it->weight;
+        live.push_back({member.device_id, weight});
+      }
+      engine.set_lane_members(std::move(live));
     }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }

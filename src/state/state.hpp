@@ -139,6 +139,14 @@ class StateWriter {
   // M7 joining: a member's public key (32 bytes) from the members table.
   std::optional<std::vector<std::uint8_t>> member_public_key(
       std::string_view device_id) const;
+  // M7 stealing: whether another device holds an unexpired CLAIM on the
+  // path (timed from THIS device's receipt — never the claimer's clock).
+  // Returns the claimer's device id, or empty.
+  std::string claim_holder(std::string_view path, std::string_view my_device,
+                           std::int64_t now_ms) const;
+  // M7 re-expansion lock: whether any ancestor of the path has an open
+  // REEXPAND (its subtree pauses until the re-expansion settles).
+  bool reexpand_open(std::string_view path) const;
   // M7 joining: every member row (device_id, pubkey hex, slot, state).
   struct MemberRow {
     std::string device_id;
@@ -222,6 +230,17 @@ class StateWriter {
     std::int64_t attempts{};
   };
   std::unordered_set<std::string> seen_join_nonces_;  // single-use tokens
+  // M7 stealing: per-path claims (claimer, receipt ms, lease s) and the
+  // re-expansion lock set. Both are replay-owned (no store table).
+  struct ClaimEntry {
+    std::string claimer;
+    log::Hlc hlc{};           // the highest (hlc, origin) claim wins
+    std::string origin;
+    std::int64_t received_ms{};
+    std::int64_t lease_s{600};
+  };
+  std::map<std::string, ClaimEntry> claims_;
+  std::unordered_set<std::string> reexpand_paths_;
   std::map<std::string, std::vector<ReserveEntry>> reserve_entries_;
   std::map<std::string, std::int64_t> campaign_budgets_;  // from CAMPAIGN spec
   std::int64_t campaign_budget(std::string_view campaign) const;

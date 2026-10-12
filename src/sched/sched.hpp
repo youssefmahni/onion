@@ -31,6 +31,7 @@ struct CampaignSpec {
   std::int64_t chunk{50};                 // RESERVE chunk size
   int light_funnel_from{8};
   bool structure{false};                  // L1..L3 expansion allowed (M3: no)
+  bool spillover{true};  // M7: steal from budget-empty lanes when true
   std::string model{"deepseek-flash"};
   std::string critic_model;               // empty = same as model
   bool auto_accept{false};                // M3: parsed, not acted on
