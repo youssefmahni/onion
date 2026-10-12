@@ -1,4 +1,20 @@
 # Worklog (append-only, newest at top)
+## 2026-10-11T22:5xZ · m6 · OA-13 root cause, precisely (owner-requested)
+
+Result: named. The 401 had two layers; for each, the exact string-to-sign input, why only macOS, and the Intel macOS 12 (Mac Pro) assessment.
+
+Layer 1 — the 401 (`replayed nonce`):
+- The signed request bytes were device ‖ method ‖ path ‖ body-hash ‖ timestamp, with NO per-request nonce. The timestamp was computed ONCE per sync round and reused for every request in the round, so any two byte-identical requests in the same second produced byte-identical signed bytes — the "input that differed" is: nothing was there to differ. The anti-replay cache keyed on (device, signature) therefore rejected a legitimate transport retry as a replay.
+- Why only macOS CI: cpp-httplib retries a request when the connection fails mid-flight; the macOS arm64 runner's loopback stack tore the keep-alive connection down between request and response consistently, triggering the retry (same second → identical signature → 401). Linux/Windows runners delivered the first attempt cleanly. The hex dumps proved client and server agreed byte-for-byte; the rejection was always the second arrival.
+- Intel macOS 12 (the Mac Pros): the trigger is a connection-level failure, not CPU architecture — on stable real-machine loopback the retry may never fire, but ANY torn keep-alive connection within the same second of the original request would have hit the same bug there. It was latent on every platform; macOS CI just exercised it reliably. The fix — a fresh random nonce per request attempt, part of the signed bytes (device ‖ method ‖ path ‖ body-hash ‖ nonce ‖ ts), replay cache keyed on (device, nonce) — removes the failure class on all of them, Mac Pros included.
+
+Layer 2 — BadSig after the 401 was fixed:
+- KeyStore::get on macOS read the shared login keychain FIRST. The string-to-sign inputs agreed; what differed was the KEY MATERIAL: the shared keychain persists across CI jobs, and three parallel nodes on one runner share the same service/account item, so a node could load a key that did not match the public key in members.json — its batch signatures then failed verification (BadSig) on every peer.
+- Why only macOS: the keychain backend is macOS-only (Windows uses DPAPI over a per-directory file; Linux uses the plain file).
+- Intel macOS 12: the same hazard exists on real Macs whenever several data directories share one login keychain (and stale items accumulate). The fix — the 0600 file is the source of truth, the keychain only a migration fallback that can never bypass the file's permission gate — is deterministic on every macOS, Intel included.
+
+Guards: SyncGolden pins the exact signature bytes on every CI OS; the keystore round trip runs on macOS without a skip; sync.multi_process_convergence PASSES on macOS arm64 CI (126 s).
+
 ## 2026-10-11T19:4xZ · m7 · macOS sync 401 (OA-13) root cause and fix
 
 Result: FIXED and verified — `sync.multi_process_convergence` PASSES on macOS arm64 CI (126 s), all 8 CI jobs green (run 38167851946). OA-13 closed; the skip and the ONION_MP_ALLOW_MACOS override are removed; the keystore round trip no longer skips on macOS.
