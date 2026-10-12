@@ -89,6 +89,24 @@ std::shared_ptr<onion::log::DeviceKey> load_device_key(
   return key;
 }
 
+
+namespace {
+// Chaos tool (M7): ONION_CLOCK_JUMP_MS adds a fixed offset to the swim
+// engine's clock readings (a wall-clock jump on one device).
+class JumpClock final : public onion::swim::Clock {
+ public:
+  explicit JumpClock(std::int64_t jump_ms) : jump_ms_(jump_ms) {}
+  std::int64_t now_ms() const override {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count() +
+           jump_ms_;
+  }
+
+ private:
+  std::int64_t jump_ms_;
+};
+}  // namespace
 std::unique_ptr<onion::state::StateWriter> open_writer(
     const std::filesystem::path& dir, std::string* error) {
   onion::platform::KeyStore store(dir / "keys");
@@ -99,6 +117,14 @@ std::unique_ptr<onion::state::StateWriter> open_writer(
   options.origin = key->device_id;
   options.device_key = key;
   options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
+  // Chaos tool (M7): ONION_KILL_AT_COMMIT=1 dies after the batch is
+  // durable but before the fold (a power cut); =2 dies after the fold.
+  if (std::getenv("ONION_KILL_AT_COMMIT")) {
+    const int step = std::atoi(std::getenv("ONION_KILL_AT_COMMIT"));
+    options.crash_hook = [step](int hook_step) {
+      if (hook_step == step) std::_Exit(137);
+    };
+  }
   auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
   if (!writer->start(error)) return nullptr;
   return writer;
@@ -824,6 +850,11 @@ int node_cmd(int argc, char** argv) {
     swim_options.self_address =
         self_host + ":" + std::to_string(bound_swim_port);
     swim = std::make_unique<onion::swim::Swim>(std::move(swim_options));
+    if (std::getenv("ONION_CLOCK_JUMP_MS")) {
+      static JumpClock jump_clock(
+          std::atoll(std::getenv("ONION_CLOCK_JUMP_MS")));
+      swim->set_clock(&jump_clock);
+    }
     {
       swim->set_transport(swim_transport.get());
       swim_transport->set_receiver(
@@ -1099,8 +1130,18 @@ int node_cmd(int argc, char** argv) {
                        lane_members.size());
                 last_sync = std::chrono::steady_clock::now();
         bool any_peer_answered = false;
+        // Chaos tool (M7): ONION_PARTITION_FROM=id1,id2 makes this
+        // device refuse to talk to the listed peers (a network split).
+        std::set<std::string> partitioned;
+        if (std::getenv("ONION_PARTITION_FROM")) {
+          std::stringstream split(std::getenv("ONION_PARTITION_FROM"));
+          std::string id;
+          while (std::getline(split, id, ','))
+            if (!id.empty()) partitioned.insert(id);
+        }
         for (const auto& member : lane_members) {
           if (member.device_id == device_key->device_id) continue;
+          if (partitioned.count(member.device_id)) continue;
           const auto peer_entry = member_urls.find(member.device_id);
           if (peer_entry == member_urls.end()) continue;
           const std::string peer = peer_entry->second;

@@ -172,6 +172,9 @@ bool AppendFile::open(const std::filesystem::path& path) {
 #endif
 }
 bool AppendFile::append(std::string_view bytes) {
+  // Chaos tool (M7): ONION_SIM_DISK_FULL makes every append fail, so the
+  // node behaves exactly as on a full disk.
+  if (std::getenv("ONION_SIM_DISK_FULL")) return false;
 #ifdef _WIN32
   if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE) return false;
   std::size_t done = 0;
