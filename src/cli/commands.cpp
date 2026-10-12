@@ -1163,6 +1163,58 @@ int node_cmd(int argc, char** argv) {
       }
     }
 if (!members_path.empty()) reload_members();
+    // M7: the automatic retirement proposal (DESIGN › Eviction and
+    // retirement) — a member whose origin has written nothing for the
+    // absence window (30 days; ONION_EVICT_ABSENT_S shortens it for
+    // tests) gets a DRAFT MEMBER_EVICT written to
+    // <data-dir>/eviction-proposals/<id>.json. The draft takes effect
+    // only once a majority signs it (node evict --sigs-file ...).
+    if (swim && swim_transport) {
+      static auto last_proposal_check = std::chrono::steady_clock::now();
+      const char* absence_env = std::getenv("ONION_EVICT_ABSENT_S");
+      const std::int64_t absence_s =
+          absence_env ? std::atoll(absence_env)
+                      : static_cast<std::int64_t>(30LL * 86400);
+      if (std::chrono::steady_clock::now() - last_proposal_check >=
+          std::chrono::hours(1)) {
+        last_proposal_check = std::chrono::steady_clock::now();
+        for (const auto& row : writer->members_table()) {
+          if (row.device_id == device_key->device_id) continue;
+          if (row.state != "JOINING" && row.state != "ACTIVE" &&
+              row.state != "SUSPECT")
+            continue;
+          const auto origin_dir = dir / "oplog" / row.device_id;
+          std::error_code ec;
+          if (!std::filesystem::exists(origin_dir)) continue;
+          auto latest = std::filesystem::file_time_type::min();
+          for (const auto& entry :
+               std::filesystem::directory_iterator(origin_dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            latest = std::max(latest, entry.last_write_time());
+          }
+          const auto age = std::filesystem::file_time_type::clock::now() -
+                           latest;
+          if (age < std::chrono::seconds(absence_s)) continue;
+          const auto proposals = dir / "eviction-proposals";
+          std::filesystem::create_directories(proposals);
+          std::ofstream draft(proposals / (row.device_id + ".json"));
+          if (draft) {
+            draft << nlohmann::json{{"type", "MEMBER_EVICT"},
+                                    {"payload",
+                                     {{"device_id", row.device_id},
+                                      {"accept_until_seq", 0},
+                                      {"sigs", nlohmann::json::array()},
+                                      {"kind", "majority"}}}}
+                         .dump()
+                  << "\n";
+            std::fprintf(stderr,
+                         "auto-proposal: MEMBER_EVICT drafted for %s "
+                         "(absent)\n",
+                         row.device_id.c_str());
+          }
+        }
+      }
+    }
     // SWIM: one protocol step plus a drain of the UDP socket each loop.
     if (swim && swim_transport) {
       swim->tick();
