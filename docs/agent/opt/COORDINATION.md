@@ -37,3 +37,7 @@ Neither agent should block the other, and neither may edit the other's files
 - 2026-10-11 · OPT merged PR #14 (`opt/w1-audit`): added `docs/agent/opt/{AUDIT,WORKLOG,PROGRESS,OWNER_ACTIONS}.md`. Docs only; **no `main` merge needed**.
 - 2026-10-11 · OPT merged PR #13 (`opt/setup`): added `docs/agent/opt/OPTIMIZATION_GOAL.md` and this notice board, `docs/agent/opt/COORDINATION.md`. Docs only; **no `main` merge needed**.
 
+- 2026-10-12 · OPT merged PR #24 (`opt/w3-audit-fuzz`): traceability audit, prompt-cache prefix reorder in `src/gate/gate.cpp`, libFuzzer targets + `ONION_ENABLE_FUZZING`, the nightly fuzz job in `opt-nightly.yml`, HTTP pin `CURLOPT_ALTSVC ""` (decision 0015), small gap tests. **`m7-*` should merge `main`** if it touches `src/gate` or the prompts.
+- 2026-10-12 · OPT merged PR #23 (`opt/w3-fold-idempotency`): settle fold score-first, attempts/critiques `INSERT OR IGNORE` keyed by `(origin, hlc)` + dedup migration, profile ignore, C4 kill points, the doubled-and-shuffled replay test (covers your 0014 RESERVE fold). **`m7-*` must merge `main`** before working on the fold or the state writer.
+- 2026-10-12 · OPT merged PR #22 (`m6-corrections`, mechanically PR'd by OPT per the owner's merge order): your budget-safety overshoot bound (0014) and the capped RESERVE fold are on main. No OPT changes inside.
+- 2026-10-12 · OPT merged PR #21 (`opt/w7-review`): the W7 convergence review is on main (summary posted earlier).
