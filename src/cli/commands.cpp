@@ -353,6 +353,24 @@ int node_cmd(int argc, char** argv) {
                         "run)\n");
     return 0;
   }
+  if (argc >= 3 && std::string(argv[2]) == "stop") {
+    // Graceful stop of a running node; --leave drains and records
+    // MEMBER_LEAVE (DESIGN › Joining › Graceful leave).
+    const int port = parse_port(flag(argc, argv, "--api-port", "8080"), 8080);
+    const bool leave = has_flag(argc, argv, "--leave");
+    httplib::Client client(("http://127.0.0.1:" + std::to_string(port)).c_str());
+    client.set_connection_timeout(3, 0);
+    client.set_read_timeout(5, 0);
+    const auto response = client.Post(
+        "/api/stop",
+        nlohmann::json{{"leave", leave}}.dump(), "application/json");
+    if (!response || response->status != 200) {
+      std::cerr << "no running node answered on port " << port << "\n";
+      return 1;
+    }
+    std::cout << (leave ? "leaving" : "stopping") << "\n";
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[2]) == "invite") {
     // M7 joining: print a signed, single-use invitation token
     // (DESIGN › Joining): the invited public key, the inviter, an expiry
@@ -644,6 +662,7 @@ int node_cmd(int argc, char** argv) {
   }
 
   std::atomic<bool> stop_flag{false};
+  std::atomic<bool> leave_requested{false};
 
   // M6: the static member list and the sync server (members.json).
   std::vector<onion::sched::LaneMember> lane_members;
@@ -895,7 +914,10 @@ int node_cmd(int argc, char** argv) {
        [&](std::string path, std::string) {
          return review_action(std::move(path), "reject");
        },
-       [&]() { stop_flag.store(true); }});
+       [&](bool leave) {
+         leave_requested.store(leave);
+         stop_flag.store(true);
+       }});
   if (!server.start(&error)) {
     std::cerr << error << "\n";
     return 1;
@@ -1071,6 +1093,21 @@ if (!members_path.empty()) reload_members();
       swim_transport->poll();
     }
     if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  // Graceful leave (DESIGN › Joining › Graceful leave): LEAVING was
+  // announced when the stop arrived; the in-flight work drained in this
+  // loop, so the device now pushes its tail (MEMBER_LEAVE) and goes LEFT.
+  if (leave_requested.load() && swim) {
+    swim->start_leaving();
+    swim->tick();
+    if (swim_transport) swim_transport->poll();
+  }
+  if (leave_requested.load()) {
+    writer->submit(onion::state::CommitTerminal{{make_record(
+        "MEMBER_LEAVE", {{"device_id", device_key->device_id}})}});
+    writer->sync();
+    if (swim) swim->confirm_left();
+    std::cout << "left: MEMBER_LEAVE written\n";
   }
   if (sync_server) sync_server->stop();
   server.stop();

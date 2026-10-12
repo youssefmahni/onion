@@ -75,6 +75,10 @@ class StateWriter {
     std::shared_ptr<const log::DeviceKey> device_key;
     // Segment seal threshold (tests use small values to force rotation).
     std::uint64_t seal_bytes{64u * 1024u * 1024u};
+    // The offline admin key's public key (hex), learned at genesis. When
+    // set, a MEMBER_EVICT record signed by it is valid without a
+    // majority (DESIGN › Eviction and retirement).
+    std::string admin_public_key_hex;
     // Test-only crash injection, called at the commit steps:
     // 1 = terminal batch durable, before the fold; 2 = after the fold.
     // Throwing (or terminating) from it simulates a power cut.

@@ -571,6 +571,62 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       reserve_entries_[campaign].push_back(
           ReserveEntry{record.hlc, origin, attempts});
     }
+  } else if (type == "MEMBER_EVICT") {
+    // M7 eviction (DESIGN › Eviction and retirement): valid when signed
+    // by a majority of the members-table keys, or by the offline admin
+    // key. EVICTED is terminal; the evicted origin's records past
+    // accept_until_seq stop verifying (the per-origin cutoff).
+    if (!record.payload.contains("device_id") ||
+        !record.payload["device_id"].is_string())
+      return;
+    std::vector<std::string> member_keys;
+    {
+      auto statement = db_.prepare(
+          "SELECT pubkey FROM members WHERE state != 'EVICTED';", error);
+      if (!statement) return;
+      std::string step_error;
+      while (statement->step_row(&step_error)) {
+        const std::string pubkey = statement->blob(0);
+        static const char* digits = "0123456789abcdef";
+        std::string hex;
+        for (const unsigned char byte : pubkey) {
+          hex.push_back(digits[byte >> 4]);
+          hex.push_back(digits[byte & 0xf]);
+        }
+        member_keys.push_back(std::move(hex));
+      }
+    }
+    if (!log::eviction_valid(record, member_keys,
+                             options_.admin_public_key_hex))
+      return;  // not a majority, not the admin key: the draft is dropped
+    const std::string device_id =
+        record.payload["device_id"].get<std::string>();
+    const std::int64_t cutoff =
+        record.payload.value("accept_until_seq", std::int64_t{0});
+    auto statement = db_.prepare(
+        "UPDATE members SET state='EVICTED', evict_cutoff=?2 "
+        "WHERE device_id=?1;",
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      statement->bind(2, cutoff, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
+  } else if (type == "MEMBER_LEAVE") {
+    // Valid only from the device itself (DESIGN › Conflict table).
+    const std::string device_id =
+        record.payload.value("device_id", std::string{});
+    if (device_id.empty() || device_id != origin) return;
+    auto statement = db_.prepare(
+        "UPDATE members SET state='LEFT' WHERE device_id=?1;", error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
   } else if (type == "MEMBER_ADD") {
     // M7 joining (DESIGN › Joining): the inviter's admission record. The
     // identity is DERIVED from the public key (never trusted from the
