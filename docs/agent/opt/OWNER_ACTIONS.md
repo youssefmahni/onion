@@ -26,7 +26,7 @@ If it fails: record the M6 agent's response in `docs/agent/opt/COORDINATION.md`.
 
 Cost / duration: no API calls; under 5 minutes.
 
-### OA-2 · Fix GitHub Actions billing (CI blocked) · all workstreams · status: open
+### OA-2 · Fix GitHub Actions billing (CI blocked) · all workstreams · status: done (2026-10-11: the repo was made public, which restored free Actions minutes; CI green since)
 
 Why: Every CI job now fails before starting: "The job was not started because
 recent account payments have failed or your spending limit needs to be

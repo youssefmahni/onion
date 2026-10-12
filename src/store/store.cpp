@@ -111,6 +111,10 @@ void Statement::reset(std::string* error) {
     *error = std::string("sqlite reset failed: ") + sqlite3_errstr(rc);
 }
 
+int Statement::column_count() const {
+  return stmt_ ? sqlite3_column_count(stmt_) : 0;
+}
+
 std::string Statement::text(int column) const {
   const auto* value = sqlite3_column_text(stmt_, column);
   if (!value) return {};
@@ -169,6 +173,48 @@ bool Db::open(std::string* error) {
   sqlite3_free(errmsg);
   if (sqlite3_exec(handle_, kSchema, nullptr, nullptr, &errmsg) != SQLITE_OK) {
     set_error(error, handle_, "cannot create schema");
+    sqlite3_free(errmsg);
+    return false;
+  }
+  sqlite3_free(errmsg);
+
+  // Migration (C4): the attempts fold is idempotent, keyed by the record's
+  // own identity (origin, hlc) — never (path, attempt number), so two
+  // devices colliding on one ticket both count their spend.  Older builds
+  // could double-fold a replayed durable attempt batch; remove those
+  // duplicates before the unique index exists, on every open (idempotent).
+  if (sqlite3_exec(handle_,
+                   "DELETE FROM attempts WHERE rowid NOT IN "
+                   "(SELECT MIN(rowid) FROM attempts GROUP BY origin, hlc);",
+                   nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    set_error(error, handle_, "cannot dedup attempts");
+    sqlite3_free(errmsg);
+    return false;
+  }
+  sqlite3_free(errmsg);
+  if (sqlite3_exec(handle_,
+                   "CREATE UNIQUE INDEX IF NOT EXISTS attempts_once "
+                   "ON attempts(origin, hlc);",
+                   nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    set_error(error, handle_, "cannot create attempts index");
+    sqlite3_free(errmsg);
+    return false;
+  }
+  sqlite3_free(errmsg);
+  if (sqlite3_exec(handle_,
+                   "DELETE FROM critiques WHERE rowid NOT IN "
+                   "(SELECT MIN(rowid) FROM critiques GROUP BY origin, hlc);",
+                   nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    set_error(error, handle_, "cannot dedup critiques");
+    sqlite3_free(errmsg);
+    return false;
+  }
+  sqlite3_free(errmsg);
+  if (sqlite3_exec(handle_,
+                   "CREATE UNIQUE INDEX IF NOT EXISTS critiques_once "
+                   "ON critiques(origin, hlc);",
+                   nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    set_error(error, handle_, "cannot create critiques index");
     sqlite3_free(errmsg);
     return false;
   }
