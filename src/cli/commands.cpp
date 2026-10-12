@@ -1177,7 +1177,11 @@ int dev_import_cmd(int argc, char** argv) {
                "unsigned)\n";
   writer->submit(std::move(import));
   writer->sync();
+  const std::size_t skipped = writer->last_import_skipped();
   std::cout << "imported\n";
+  if (skipped > 0)
+    std::cout << "skipped " << skipped
+              << " duplicate-path rows (kept the first row)\n";
   return 0;
 }
 
