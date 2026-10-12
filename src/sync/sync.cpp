@@ -1,5 +1,7 @@
 #include "sync.hpp"
 
+#include "log/invite.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -149,6 +151,9 @@ const MemberKey* find_member(const std::vector<MemberKey>& members,
 
 bool SyncServer::start(std::string* error) {
   impl_->server = std::make_unique<httplib::Server>();
+  // The join endpoint is unauthenticated (the token IS the credential):
+  // cap request bodies so it cannot be used as a cheap amplifier.
+  impl_->server->set_payload_max_length(1 << 16);
 
   // Authentication for every endpoint. The handler lambdas must capture
   // `this` (not stack locals of start(), which dangle once start returns).
@@ -195,6 +200,58 @@ bool SyncServer::start(std::string* error) {
       return reject("replayed nonce");
     return member;
   };
+
+  // M7 joining: the invitation token is the credential (it is signed by a
+  // member); a valid, unused token with a free slot admits the device via
+  // a MEMBER_ADD record in the server's own log.
+  impl_->server->Post("/sync/v1/join", [this](const httplib::Request& request,
+                                               httplib::Response& response) {
+    const nlohmann::json token_json =
+        nlohmann::json::parse(request.body, nullptr, false);
+    const auto reject = [&](int status, std::string reason) {
+      response.status = status;
+      response.set_content(
+          nlohmann::json{{"error", std::move(reason)}}.dump(),
+          "application/json");
+    };
+    if (token_json.is_discarded() || !token_json.contains("inviter") ||
+        !token_json["inviter"].is_string())
+      return reject(400, "malformed token");
+    const std::string inviter = token_json["inviter"].get<std::string>();
+    const MemberKey* inviter_key = find_member(impl_->options.members, inviter);
+    if (!inviter_key) return reject(401, "unknown inviter");
+    std::string token_error;
+    const auto parsed = log::parse_invite(
+        request.body, now_s(), inviter_key->public_key, &token_error);
+    if (!parsed) return reject(401, token_error);
+    if (impl_->options.writer->join_nonce_seen(parsed->nonce))
+      return reject(409, "token already used");
+    const auto identity = log::derive_identity(parsed->pubkey_hex);
+    if (!identity) return reject(400, "bad public key");
+    if (impl_->options.writer->member_slot_collides(identity->slot,
+                                                    identity->device_id))
+      return reject(409, "slot collision");
+    log::Record admission;
+    admission.type = "MEMBER_ADD";
+    admission.payload = {{"pubkey", parsed->pubkey_hex},
+                         {"nonce", parsed->nonce},
+                         {"invited_by", inviter}};
+    impl_->options.writer->submit(
+        state::CommitTerminal{{std::move(admission)}});
+    impl_->options.writer->sync();
+    // The fold is the authority: sync() drained it. Presence in the
+    // members table means OUR add (or an earlier add of the same device)
+    // won; absence means a concurrent same-slot admission beat us.
+    if (!impl_->options.writer->member_exists(identity->device_id))
+      return reject(409, "slot collision");
+    response.status = 200;
+    response.set_content(
+        nlohmann::json{{"ok", true},
+                       {"device_id", identity->device_id},
+                       {"slot", identity->slot}}
+            .dump(),
+        "application/json");
+  });
 
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,
                                                 httplib::Response& response) {

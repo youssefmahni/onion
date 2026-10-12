@@ -33,6 +33,7 @@
 #include "swim/beacon.hpp"
 #include "swim/swim.hpp"
 #include "swim/udp_transport.hpp"
+#include <httplib.h>
 #include "log/invite.hpp"
 #include "state/state.hpp"
 #include "store/store.hpp"
@@ -258,6 +259,39 @@ int node_cmd(int argc, char** argv) {
               << "public_key=" << public_key_hex << "\n"
               << "slot=" << key->slot << "\n";
     return 0;
+  }
+  if (argc >= 3 && std::string(argv[2]) == "join") {
+    // M7 joining: present the invitation token to a seed member. The
+    // token IS the credential (signed by the inviter); a valid, unused
+    // token with a free slot admits the device on the seed, and the
+    // MEMBER_ADD record syncs to the rest of the fleet.
+    std::string token = flag(argc, argv, "--token", "");
+    if (token.empty() && argc >= 4 && argv[3][0] != '-') token = argv[3];
+    if (token.size() > 1 && token[0] == '@') {
+      std::ifstream file(token.substr(1));
+      if (!file) {
+        std::cerr << "cannot read the token file\n";
+        return 2;
+      }
+      token = std::string((std::istreambuf_iterator<char>(file)), {});
+    }
+    const std::string seed = flag(argc, argv, "--seed", "");
+    if (token.empty() || seed.empty()) {
+      std::cerr << "usage: data_depot node join --token <token|@file> "
+                   "--seed <host:port>\n";
+      return 2;
+    }
+    httplib::Client client(("http://" + seed).c_str());
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(10, 0);
+    const auto response =
+        client.Post("/sync/v1/join", token, "application/json");
+    if (!response) {
+      std::cerr << "cannot reach the seed at " << seed << "\n";
+      return 1;
+    }
+    std::cout << response->body << "\n";
+    return response->status == 200 ? 0 : 1;
   }
   if (argc >= 3 && std::string(argv[2]) == "invite") {
     // M7 joining: print a signed, single-use invitation token

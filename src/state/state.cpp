@@ -502,7 +502,8 @@ void StateWriter::rebuild_index() {
   // The RESERVE fold is replayed from the log before this point (replay()
   // folds every record); RESERVE has no store table, so these maps must
   // survive the rebuild — clearing them here erased the fleet budget
-  // accounting on every restart (decision 0014).
+  // accounting on every restart (decision 0014). The same holds for the
+  // join-nonce set (single-use tokens survive restarts).
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -569,6 +570,59 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
       reserve_entries_[campaign].push_back(
           ReserveEntry{record.hlc, origin, attempts});
+    }
+  } else if (type == "MEMBER_ADD") {
+    // M7 joining (DESIGN › Joining): the inviter's admission record. The
+    // identity is DERIVED from the public key (never trusted from the
+    // payload); the token nonce is single-use; add-wins; a slot that
+    // already belongs to another device is refused deterministically.
+    const auto& payload = record.payload;
+    if (!payload.contains("pubkey") || !payload["pubkey"].is_string() ||
+        !payload.contains("nonce") || !payload["nonce"].is_string())
+      return;
+    const auto identity = log::derive_identity(payload["pubkey"].get<std::string>());
+    if (!identity) return;
+    const std::string nonce = payload["nonce"].get<std::string>();
+    {
+      std::unique_lock lock(index_mutex_);
+      // Deliberately burn BEFORE the slot check: the refusal is
+      // deterministic across replicas, and the slot is fixed by the
+      // pubkey, so retrying the same token could never help.
+      if (!seen_join_nonces_.insert(nonce).second) return;  // replayed token
+    }
+    const std::vector<std::uint8_t> pubkey =
+        log::unhex_bytes(payload["pubkey"].get<std::string>());
+    if (pubkey.size() != 32) return;
+    // Slot collision: first claim wins, the late add is dropped.
+    {
+      auto statement = db_.prepare(
+          "SELECT COUNT(*) FROM members WHERE slot = ?1 AND device_id != ?2;",
+          error);
+      if (statement) {
+        std::string bind_error;
+        statement->bind(1, identity->slot, &bind_error);
+        statement->bind(2, identity->device_id, &bind_error);
+        std::string step_error;
+        if (statement->step_row(&step_error) && statement->integer(0) > 0)
+          return;
+      }
+    }
+    auto statement = db_.prepare(
+        "INSERT INTO members(device_id, pubkey, slot, state, incarnation) "
+        "VALUES (?1, ?2, ?3, 'JOINING', 1) "
+        "ON CONFLICT(device_id) DO NOTHING;",  // add-wins
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, identity->device_id, &bind_error);
+      statement->bind(2,
+                      std::string_view(
+                          reinterpret_cast<const char*>(pubkey.data()),
+                          pubkey.size()),
+                      &bind_error);
+      statement->bind(3, identity->slot, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
     }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
@@ -954,6 +1008,39 @@ std::vector<StateWriter::ReserveEntry> StateWriter::reserve_entries_sorted(
               return a.origin < b.origin;
             });
   return sorted;
+}
+
+bool StateWriter::join_nonce_seen(std::string_view nonce) const {
+  std::shared_lock lock(index_mutex_);
+  return seen_join_nonces_.count(std::string(nonce)) != 0;
+}
+
+bool StateWriter::member_exists(std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT COUNT(*) FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (statement->step_row(&step_error)) return statement->integer(0) > 0;
+  return false;
+}
+
+bool StateWriter::member_slot_collides(std::int64_t slot,
+                                       std::string_view device_id) const {
+  // Fail CLOSED: a database error must not disable the slot protection.
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT COUNT(*) FROM members WHERE slot = ?1 AND device_id != ?2;",
+      &error);
+  if (!statement) return true;
+  std::string bind_error;
+  statement->bind(1, slot, &bind_error);
+  statement->bind(2, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (statement->step_row(&step_error)) return statement->integer(0) > 0;
+  return true;
 }
 
 std::int64_t StateWriter::reserved_total(std::string_view campaign) const {

@@ -10,6 +10,8 @@
 #include "sync/sync.hpp"
 #include <httplib.h>
 
+#include "log/invite.hpp"
+
 namespace {
 
 using onion::log::DeviceKey;
@@ -247,6 +249,114 @@ TEST_F(SyncTest, VerificationFailureQuarantinesAndDoesNotApply) {
   EXPECT_FALSE(writer_b_->settled("P01-IN01-T01"));
 }
 
+
+TEST_F(SyncTest, JoinEndpointAdmitsAValidToken) {
+  // A third device joins through an invitation signed by device B.
+  const auto key_c = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  std::string pubkey_c_hex;
+  for (const std::uint8_t byte : key_c.public_key) {
+    pubkey_c_hex += "0123456789abcdef"[byte >> 4];
+    pubkey_c_hex += "0123456789abcdef"[byte & 0x0f];
+  }
+  onion::log::Ed25519Signer inviter_signer(*key_b_);
+  const std::int64_t now_s = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  const auto token = onion::log::issue_invite(
+      pubkey_c_hex, key_b_->device_id, 3600,
+      "0f1e2d3c4b5a69788796a5b4c3d2e1f0", now_s, inviter_signer);
+
+  start_server_a();
+  httplib::Client client(
+      ("http://127.0.0.1:" + std::to_string(server_->bound_port())).c_str());
+  const auto response =
+      client.Post("/sync/v1/join", onion::log::invite_to_string(token),
+                  "application/json");
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, 200);
+  const auto body = nlohmann::json::parse(response->body, nullptr, false);
+  EXPECT_TRUE(body.contains("device_id"));
+  EXPECT_EQ(body["device_id"], key_c.device_id);
+
+  // The admission record folded: the member row exists (JOINING) and the
+  // nonce is burned.
+  std::string error;
+  auto statement = writer_a_->db().prepare(
+      "SELECT COUNT(*) FROM members WHERE device_id = ?1;", &error);
+  ASSERT_TRUE(statement);
+  std::string bind_error;
+  statement->bind(1, key_c.device_id, &bind_error);
+  std::string step_error;
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->integer(0), 1);
+  EXPECT_TRUE(writer_a_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+
+  // Replay: the single-use nonce refuses a second admission.
+  const auto replay = client.Post("/sync/v1/join",
+                                  onion::log::invite_to_string(token),
+                                  "application/json");
+  ASSERT_NE(replay, nullptr);
+  EXPECT_EQ(replay->status, 409);
+}
+
+TEST_F(SyncTest, JoinEndpointRejectsTamperedAndExpiredTokens) {
+  const auto key_c = onion::log::DeviceKey::from_seed_hex(
+      "505152535455565758595a5b5c5d5e5f"
+      "606162636465666768696a6b6c6d6e6f");
+  std::string pubkey_c_hex;
+  for (const std::uint8_t byte : key_c.public_key) {
+    pubkey_c_hex += "0123456789abcdef"[byte >> 4];
+    pubkey_c_hex += "0123456789abcdef"[byte & 0x0f];
+  }
+  onion::log::Ed25519Signer inviter_signer(*key_b_);
+  const std::int64_t now_s = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+
+  start_server_a();
+  httplib::Client client(
+      ("http://127.0.0.1:" + std::to_string(server_->bound_port())).c_str());
+
+  // Expired.
+  const auto expired = onion::log::issue_invite(
+      pubkey_c_hex, key_b_->device_id, 3600,
+      "1f2e3d4c5b6a7988a9bacbdcedfe0f10", now_s - 7200, inviter_signer);
+  const auto expired_response =
+      client.Post("/sync/v1/join", onion::log::invite_to_string(expired),
+                  "application/json");
+  ASSERT_NE(expired_response, nullptr);
+  EXPECT_EQ(expired_response->status, 401);
+
+  // Tampered nonce (the signature covers it).
+  const auto valid = onion::log::issue_invite(
+      pubkey_c_hex, key_b_->device_id, 3600,
+      "2f3e4d5c6b7a8998a9bacbdcedfe0f11", now_s, inviter_signer);
+  nlohmann::json tampered =
+      nlohmann::json::parse(onion::log::invite_to_string(valid));
+  tampered["nonce"] = "deadbeefdeadbeefdeadbeefdeadbeef";
+  const auto tampered_response = client.Post("/sync/v1/join", tampered.dump(),
+                                             "application/json");
+  ASSERT_NE(tampered_response, nullptr);
+  EXPECT_EQ(tampered_response->status, 401);
+
+  // Unknown inviter (signed by a device that is not a member).
+  const auto stranger = onion::log::DeviceKey::from_seed_hex(
+      "707172737475767778797a7b7c7d7e7f"
+      "808182838485868788898a8b8c8d8e8f");
+  onion::log::Ed25519Signer stranger_signer(stranger);
+  const auto stranger_token = onion::log::issue_invite(
+      pubkey_c_hex, stranger.device_id, 3600,
+      "3f4e5d6c7b8a8998a9bacbdcedfe0f12", now_s, stranger_signer);
+  const auto stranger_response = client.Post(
+      "/sync/v1/join", onion::log::invite_to_string(stranger_token),
+      "application/json");
+  ASSERT_NE(stranger_response, nullptr);
+  EXPECT_EQ(stranger_response->status, 401);
+}
 }  // namespace
 
 TEST_F(SyncTest, RepeatedRoundsAreIdempotent) {

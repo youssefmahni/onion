@@ -980,3 +980,133 @@ TEST_F(StateWriterTest, StaleCampaignRecordDoesNotMoveTheBudget) {
   EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
   EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
 }
+
+namespace {
+
+// A MEMBER_ADD fold helper: the admission record the join endpoint
+// appends. The identity is DERIVED from the public key at fold time.
+onion::log::Record member_add(const std::string& pubkey_hex,
+                              const std::string& nonce) {
+  onion::log::Record record;
+  record.type = "MEMBER_ADD";
+  record.payload = {{"pubkey", pubkey_hex},
+                    {"nonce", nonce},
+                    {"invited_by", "dev0000000000000001"}};
+  return record;
+}
+
+std::string pubkey_hex_of(const onion::log::DeviceKey& key) {
+  std::string hex;
+  for (const std::uint8_t byte : key.public_key) {
+    hex += "0123456789abcdef"[byte >> 4];
+    hex += "0123456789abcdef"[byte & 0x0f];
+  }
+  return hex;
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, MemberAddDerivesIdentityAndBurnsTheNonce) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+
+  // The row exists with the DERIVED device id and slot, state JOINING.
+  auto statement = writer_->db().prepare(
+      "SELECT device_id, slot, state FROM members WHERE device_id = ?1;",
+      &error);
+  ASSERT_TRUE(statement);
+  std::string bind_error;
+  statement->bind(1, key.device_id, &bind_error);
+  std::string step_error;
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->text(0), key.device_id);
+  EXPECT_EQ(statement->integer(1), key.slot);
+  EXPECT_EQ(statement->text(2), "JOINING");
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+
+  // Add-wins: a second add with a DIFFERENT nonce changes nothing.
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "1f2e3d4c5b6a7988a9bacbdcedfe0f10")}});
+  writer_->sync();
+  statement = writer_->db().prepare(
+      "SELECT COUNT(*) FROM members WHERE device_id = ?1;", &error);
+  ASSERT_TRUE(statement);
+  statement->bind(1, key.device_id, &bind_error);
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->integer(0), 1);
+
+  // A replayed nonce adds nothing.
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+  statement = writer_->db().prepare(
+      "SELECT COUNT(*) FROM members;", &error);
+  ASSERT_TRUE(statement);
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->integer(0), 1);
+}
+
+TEST_F(StateWriterTest, JoinNonceSurvivesRestart) {
+  // A burned token nonce must stay burned across a restart (the nonce set
+  // is replay-owned, exactly like the RESERVE fold).
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+  EXPECT_FALSE(writer_->join_nonce_seen("deadbeefdeadbeefdeadbeefdeadbeef"));
+}
+
+TEST_F(StateWriterTest, MemberAddRefusesACollidingSlot) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto first = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(first),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+
+  // A DIFFERENT device that shares the second key's slot: seed a member
+  // row under an unrelated device id carrying that slot, then try to
+  // admit the second key through the fold — the collision branch must
+  // drop the add entirely (no row for the second device at all).
+  const auto second = onion::log::DeviceKey::from_seed_hex(
+      "505152535455565758595a5b5c5d5e5f"
+      "606162636465666768696a6b6c6d6e6f");
+  {
+    auto statement = writer_->db().prepare(
+        "INSERT INTO members(device_id, pubkey, slot, state, incarnation) "
+        "VALUES (?1, x'', ?2, 'JOINING', 1);",
+        &error);
+    ASSERT_TRUE(statement);
+    std::string bind_error;
+    statement->bind(1, "dev0000000000000bad", &bind_error);
+    statement->bind(2, second.slot, &bind_error);  // the colliding slot
+    std::string step_error;
+    statement->step(&step_error);
+  }
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(second),
+                                             "2f3e4d5c6b7a8998a9bacbdcedfe0f11")}});
+  writer_->sync();
+  // No member row for the second device: the collision branch fired.
+  EXPECT_FALSE(writer_->member_exists(second.device_id));
+}

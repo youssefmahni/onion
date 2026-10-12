@@ -152,7 +152,6 @@ nlohmann::json Batch::to_json() const {
                         {"recs", records}};
 }
 
-namespace {
 std::vector<std::uint8_t> unhex_bytes(std::string_view hex) {
   std::vector<std::uint8_t> raw;
   raw.reserve(hex.size() / 2);
@@ -181,7 +180,7 @@ std::string hex_bytes(const std::uint8_t* bytes, std::size_t size) {
   }
   return hex;
 }
-}  // namespace
+
 
 Batch make_batch(std::string origin, std::uint64_t number,
                  std::string prev_hex, std::vector<Record> records,
@@ -510,6 +509,18 @@ DeviceKey DeviceKey::from_seed(const std::vector<std::uint8_t>& seed) {
   key.slot = static_cast<std::int64_t>(
       std::stoul(digest.substr(0, 5), nullptr, 16));
   return key;
+}
+
+std::optional<DerivedIdentity> derive_identity(std::string_view pubkey_hex) {
+  const std::vector<std::uint8_t> raw = unhex_bytes(pubkey_hex);
+  if (raw.size() != kPublicKeySize) return std::nullopt;
+  const std::string digest = blake2b_hex(std::string_view(
+      reinterpret_cast<const char*>(raw.data()), raw.size()));
+  DerivedIdentity identity;
+  identity.device_id = digest.substr(0, 16);
+  identity.slot =
+      static_cast<std::int64_t>(std::stoul(digest.substr(0, 5), nullptr, 16));
+  return identity;
 }
 
 DeviceKey DeviceKey::from_seed_hex(std::string_view seed_hex) {

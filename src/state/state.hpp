@@ -122,6 +122,14 @@ class StateWriter {
   // Per-origin RESERVE totals for one campaign, for diagnostics.
   std::map<std::string, std::int64_t> reserved_by_origin(
       std::string_view campaign) const;
+  // M7 joining: whether an invitation nonce was already used (single-use
+  // tokens — the MEMBER_ADD fold records each nonce).
+  bool join_nonce_seen(std::string_view nonce) const;
+  // M7 joining: whether the slot already belongs to another device.
+  bool member_slot_collides(std::int64_t slot,
+                            std::string_view device_id) const;
+  // M7 joining: whether the members table holds this device.
+  bool member_exists(std::string_view device_id) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
@@ -196,6 +204,7 @@ class StateWriter {
     std::string origin;
     std::int64_t attempts{};
   };
+  std::unordered_set<std::string> seen_join_nonces_;  // single-use tokens
   std::map<std::string, std::vector<ReserveEntry>> reserve_entries_;
   std::map<std::string, std::int64_t> campaign_budgets_;  // from CAMPAIGN spec
   std::int64_t campaign_budget(std::string_view campaign) const;
