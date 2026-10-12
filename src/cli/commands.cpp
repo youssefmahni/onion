@@ -206,6 +206,13 @@ json state_json(onion::state::StateWriter& writer, int api_port,
     campaigns.push_back(std::move(entry));
   }
   result["campaigns"] = std::move(campaigns);
+  // Membership as the local node sees it (dashboard + M7 scenarios).
+  json members = json::array();
+  for (const auto& row : writer.members_table())
+    members.push_back({{"device_id", row.device_id},
+                       {"state", row.state},
+                       {"slot", row.slot}});
+  result["members"] = std::move(members);
   json reviews = json::array();
   for (const auto& review : writer.db().open_reviews(&error)) {
     json entry;
@@ -445,15 +452,26 @@ int node_cmd(int argc, char** argv) {
       std::cout << record.dump() << "\n";
       return 0;
     }
-    const int port = parse_port(flag(argc, argv, "--api-port", "8080"), 8080);
+    // Submit through the sync server with the signed-request scheme.
+    const int port = parse_port(
+        flag(argc, argv, "--sync-port", "7947"), 7947);
     httplib::Client client(
         ("http://127.0.0.1:" + std::to_string(port)).c_str());
     client.set_connection_timeout(3, 0);
     client.set_read_timeout(5, 0);
+    const std::string body = record.dump();
+    onion::log::Ed25519Signer signer(*key);
+    httplib::Headers headers;
+    for (const auto& [name, value] : onion::sync::signed_post_headers(
+             key->device_id, "/sync/v1/evict", body, signer))
+      headers.emplace(name, value);
     const auto response =
-        client.Post("/api/evict", record.dump(), "application/json");
+        client.Post("/sync/v1/evict", headers, body, "application/json");
     if (!response || response->status != 200) {
-      std::cerr << "no running node answered on port " << port << "\n";
+      std::cerr << "no running node answered on sync port " << port
+                << " (" << (response ? std::to_string(response->status)
+                                     : "unreachable")
+                << ")\n";
       return 1;
     }
     std::cout << response->body << "\n";
@@ -808,7 +826,8 @@ int node_cmd(int argc, char** argv) {
     sync_options.key = device_key;
     sync_options.members = sync_members;
     sync_options.member_urls = member_urls;
-    sync_options.self_url = self_host + ":" + std::to_string(self_sync_port);
+    // self_url stays empty: the server derives its own address from the
+    // REAL bound port (the requested port may be 0 = ephemeral).
     sync_server = std::make_unique<onion::sync::SyncServer>(std::move(sync_options));
     std::string sync_error;
     if (!sync_server->start(&sync_error)) {
@@ -1010,20 +1029,6 @@ int node_cmd(int argc, char** argv) {
        [&](bool leave) {
          leave_requested.store(leave);
          stop_flag.store(true);
-       },
-       [&](std::string record_json, std::string) {
-         // M7 eviction: submit a collected MEMBER_EVICT record; the
-         // fold validates the majority (or the admin key).
-         const auto record = json::parse(record_json, nullptr, false);
-         if (record.is_discarded() || !record.contains("type") ||
-             record["type"] != "MEMBER_EVICT")
-           return false;
-         onion::log::Record parsed;
-         parsed.type = "MEMBER_EVICT";
-         parsed.payload = record.value("payload", json::object());
-         writer->submit(onion::state::CommitTerminal{{std::move(parsed)}});
-         writer->sync();
-         return true;
        }});
   if (!server.start(&error)) {
     std::cerr << error << "\n";

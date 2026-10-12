@@ -169,6 +169,25 @@ struct SyncServer::Impl {
 };
 
 
+std::map<std::string, std::string> signed_post_headers(
+    std::string_view device_id, std::string_view path,
+    std::string_view body, log::Signer& signer) {
+  std::random_device entropy;
+  std::mt19937_64 generator(entropy());
+  std::uniform_int_distribution<std::uint64_t> distribution;
+  std::ostringstream nonce_stream;
+  nonce_stream << std::hex << distribution(generator)
+               << distribution(generator);
+  const std::string nonce = nonce_stream.str();
+  const std::int64_t ts = now_s();
+  const std::string signature =
+      sign_request(device_id, "POST", path, body, nonce, ts, signer);
+  return {{"X-Onion-Device", std::string(device_id)},
+          {"X-Onion-Time", std::to_string(ts)},
+          {"X-Onion-Nonce", nonce},
+          {"X-Onion-Sig", signature}};
+}
+
 std::string clone_checkpoint(std::string_view peer_base_url,
                              const CloneOptions& options) {
   httplib::Client client(std::string(peer_base_url).c_str());
@@ -336,9 +355,12 @@ bool SyncServer::start(std::string* error) {
     }
     const std::int64_t ts = std::atoll(timestamp.c_str());
     // The signature covers the full target (path + query); httplib keeps
-    // the query only in request.target.
-    if (!request_signature_valid(device_id, "GET", request.target, request.body,
-                                 nonce, signature, public_key, ts, now_s()))
+    // the query only in request.target. GETs and the evict POST sign the
+    // same canonical bytes with their own method.
+    const std::string method = request.method == "POST" ? "POST" : "GET";
+    if (!request_signature_valid(device_id, method, request.target,
+                                 request.body, nonce, signature, public_key,
+                                 ts, now_s()))
       return reject("bad signature");
     if (impl_->nonces.seen_and_add(device_id, nonce, now_s()))
       return reject("replayed nonce");
@@ -397,6 +419,14 @@ bool SyncServer::start(std::string* error) {
                  ? std::string{}
                  : found->second;
     };
+    // The server's own address: the configured self_url when set, else
+    // the bind address plus the REAL bound port (the requested port may
+    // have been 0 = ephemeral).
+    const auto my_url = [&]() {
+      if (!impl_->options.self_url.empty()) return impl_->options.self_url;
+      return impl_->options.bind_address + ":" +
+             std::to_string(impl_->port.load());
+    };
     for (const auto& entry : impl_->options.members) {
       std::string hex;
       static const char* digits = "0123456789abcdef";
@@ -406,7 +436,7 @@ bool SyncServer::start(std::string* error) {
       }
       const std::string url =
           entry.device_id == impl_->options.key->device_id
-              ? impl_->options.self_url
+              ? my_url()
               : url_of(entry.device_id);
       members.push_back({{"device_id", entry.device_id},
                          {"public_key", hex},
@@ -415,7 +445,7 @@ bool SyncServer::start(std::string* error) {
     for (const auto& row : impl_->options.writer->members_table()) {
       const std::string url =
           row.device_id == impl_->options.key->device_id
-              ? impl_->options.self_url
+              ? my_url()
               : url_of(row.device_id);
       members.push_back({{"device_id", row.device_id},
                          {"public_key", row.pubkey_hex},
@@ -479,6 +509,31 @@ bool SyncServer::start(std::string* error) {
     }
     std::string bytes((std::istreambuf_iterator<char>(in)), {});
     response.set_content(bytes, "application/octet-stream");
+  });
+
+  // M7 eviction: a collected MEMBER_EVICT record, authenticated like
+  // every sync request (the submitter is a member). The fold validates
+  // the majority or the admin key.
+  impl_->server->Post("/sync/v1/evict", [this](const httplib::Request& request,
+                                                httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const nlohmann::json record =
+        nlohmann::json::parse(request.body, nullptr, false);
+    if (record.is_discarded() || !record.contains("type") ||
+        record["type"] != "MEMBER_EVICT") {
+      response.status = 400;
+      response.set_content("{\"error\":\"not a MEMBER_EVICT record\"}",
+                           "application/json");
+      return;
+    }
+    log::Record parsed;
+    parsed.type = "MEMBER_EVICT";
+    parsed.payload = record.value("payload", nlohmann::json::object());
+    impl_->options.writer->submit(
+        state::CommitTerminal{{std::move(parsed)}});
+    impl_->options.writer->sync();
+    response.status = 200;
+    response.set_content("{\"ok\":true}", "application/json");
   });
 
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,

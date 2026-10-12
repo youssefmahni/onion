@@ -38,6 +38,13 @@ bool request_signature_valid(
     std::string_view signature, const std::vector<std::uint8_t>& public_key,
     std::int64_t timestamp_s, std::int64_t now_s);
 
+// Signed POST headers (M7 evict submission): the same scheme with a
+// fresh random nonce per attempt, covering the request body. Returned as
+// a plain map so this header needs no httplib include.
+std::map<std::string, std::string> signed_post_headers(
+    std::string_view device_id, std::string_view path,
+    std::string_view body, log::Signer& signer);
+
 // Sliding nonce cache: a (device_id, nonce) pair is accepted once per
 // 60-second window; older entries are pruned.
 class NonceCache {
