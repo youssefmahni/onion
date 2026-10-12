@@ -46,38 +46,38 @@ std::string system_prompt() {
 
 std::string precheck_prompt(const NodeContext& ctx) {
   std::ostringstream out;
+  // Fixed text first, node-specific text last (prompt-cache prefix).
   out << "This knowledge node must be decomposed into child items for an "
          "AI-agent knowledge base.\n"
-      << node_line(ctx) << "\n"
       << "Can this node be split into at least 3 distinct parts, each part a "
          "meaningful direct component of the node itself? Answer ONLY with "
-         "JSON {\"splits\": true} or {\"splits\": false}.";
+         "JSON {\"splits\": true} or {\"splits\": false}.\n"
+      << node_line(ctx);
   return out.str();
 }
 
 std::string planner_prompt(const NodeContext& ctx,
                            const std::string& injected_issues, bool light) {
   std::ostringstream out;
+  // Fixed text first, node-specific text last (prompt-cache prefix).
+  out << "Plan the knowledge coverage for this node: list "
+      << (light ? "2-3" : "4-8")
+      << " aspects. Every aspect must be a dimension OF THE NODE ITSELF "
+         "(things it directly contains or decomposes into) — never related "
+         "topics from other domains. Return JSON {\"items\": [ aspects ]}.\n";
   if (!injected_issues.empty())
     out << "Previous critique issues you MUST address: " << injected_issues
         << "\n";
   const std::string existing = existing_line(ctx);
   if (!existing.empty()) out << existing << "\n";
-  out << "Plan the knowledge coverage for this node: list "
-      << (light ? "2-3" : "4-8")
-      << " aspects. Every aspect must be a dimension OF THE NODE ITSELF "
-         "(things it directly contains or decomposes into) — never related "
-         "topics from other domains. Return JSON {\"items\": [ aspects ]}.\n"
-      << node_line(ctx);
+  out << node_line(ctx);
   return out.str();
 }
 
 std::string worker_prompt(const NodeContext& ctx, const std::string& aspect,
                           const std::string& existing_joined) {
   std::ostringstream out;
-  out << "Aspect: " << aspect << "\n";
-  if (!existing_joined.empty())
-    out << "Existing children (do NOT repeat): " << existing_joined << "\n";
+  // Fixed text first, node-specific text last (prompt-cache prefix).
   out << "List the top 100 child items of this node for this aspect in an "
          "AI-agent knowledge base. Every item MUST be a direct child of \""
       << ctx.title
@@ -85,7 +85,10 @@ std::string worker_prompt(const NodeContext& ctx, const std::string& aspect,
          "classifications, or the node itself. Title Case noun phrases, 2-5 "
          "words, no duplicates, no questions, no emoji. Return JSON "
          "{\"items\": [ ... up to 100 ... ]}.\n"
-      << node_line(ctx);
+      << "Aspect: " << aspect << "\n";
+  if (!existing_joined.empty())
+    out << "Existing children (do NOT repeat): " << existing_joined << "\n";
+  out << node_line(ctx);
   return out.str();
 }
 

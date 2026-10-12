@@ -175,4 +175,8 @@ std::string curl_version();
 // Blocking GET used by the developer CLI (free /models check).
 std::string http_get(const std::string& url, const std::string& api_key,
                     long& http_status, long& http_version);
+// Parses a completed transfer into a Result.  Used by the client's finish
+// path; exposed for unit tests and the libFuzzer target.
+Result parse_response(long curl_code, long status, long retry_after,
+                      std::string body, double latency_s);
 }

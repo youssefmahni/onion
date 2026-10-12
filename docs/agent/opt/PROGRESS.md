@@ -20,6 +20,7 @@ M1–M5 merged and tagged `m1`…`m5-rc`; PR #12 `m6-sync` is open (Agent M).
 | Date | Purpose | Calls | Input (hit/miss) | Output | Cost USD | Running calls | Running USD |
 |---|---|---|---|---|---|---|---|
 | — | none yet | 0 | — | — | 0 | 0 / 1,500 | 0 / 5.00 |
+| 2026-10-11 | W3 C5 real smoke: GET /models (free) + minimal completion + truncation (max_tokens=1) + invalid-key 401 (unbilled) | 2 billed | 0 hit / 32 miss | 2 | ~$0.0000066 | 2 / 1,500 | ~0.000007 / 5.00 |
 
 Allocation (OPTIMIZATION_GOAL.md §9.3): W2 real check 300 · W3 smoke 10 · W5 1,000 · reserve 190.
 
