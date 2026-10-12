@@ -469,11 +469,19 @@ void StateWriter::rebuild_index() {
     if (review.state == "open" || review.state.empty())
       review_paths_.insert(review.path);
   }
-  for (const store::Campaign& campaign : db_.campaigns(&error))
-    campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec, campaign.state});
-  reserved_by_campaign_.clear();
-  reserved_by_origin_campaign_.clear();
-  seen_reserve_keys_.clear();
+  for (const store::Campaign& campaign : db_.campaigns(&error)) {
+    campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec,
+                                      campaign.state, campaign.hlc,
+                                      campaign.origin});
+    const auto spec = nlohmann::json::parse(campaign.spec, nullptr, false);
+    if (spec.is_object() && spec.contains("loop_budget") &&
+        spec["loop_budget"].is_number_integer())
+      campaign_budgets_[campaign.id] = spec["loop_budget"].get<std::int64_t>();
+  }
+  // The RESERVE fold is replayed from the log before this point (replay()
+  // folds every record); RESERVE has no store table, so these maps must
+  // survive the rebuild — clearing them here erased the fleet budget
+  // accounting on every restart (decision 0014).
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -538,6 +546,8 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     if (seen_reserve_keys_.insert(key).second) {
       reserved_by_campaign_[campaign] += attempts;
       reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
+      reserve_entries_[campaign].push_back(
+          ReserveEntry{record.hlc, origin, attempts});
     }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
@@ -591,14 +601,27 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     const auto& payload = record.payload;
     const std::string id = payload.at("id").get<std::string>();
     std::string state = payload.at("state").get<std::string>();
-    // stop is final, in the index as in the store.
     auto it = std::find_if(campaigns_.begin(), campaigns_.end(),
                            [&](const CampaignInfo& c) { return c.id == id; });
+    // Latest (hlc, origin) wins, in the index exactly as in the store
+    // (upsert_campaign's WHERE): a stale record delivered late must not
+    // move the campaign back (decision 0014's capped fold reads this).
+    const bool newer =
+        it == campaigns_.end() || record.hlc > it->hlc ||
+        (record.hlc == it->hlc && origin > it->origin);
+    if (!newer) return;
+    // stop is final, in the index as in the store.
     if (it != campaigns_.end() && it->state == "stopped") state = "stopped";
     campaigns_.erase(std::remove_if(campaigns_.begin(), campaigns_.end(),
                                     [&](const CampaignInfo& c) { return c.id == id; }),
                      campaigns_.end());
-    campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state});
+    campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state,
+                                      record.hlc, origin});
+    // Decision 0014: the capped fold uses the LATEST spec's loop budget.
+    const auto spec = payload.at("spec");
+    if (spec.is_object() && spec.contains("loop_budget") &&
+        spec["loop_budget"].is_number_integer())
+      campaign_budgets_[id] = spec["loop_budget"].get<std::int64_t>();
   }
 }
 
@@ -887,10 +910,50 @@ std::vector<CampaignInfo> StateWriter::campaigns() const {
   return campaigns_;
 }
 
-std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+std::int64_t StateWriter::campaign_budget(std::string_view campaign) const {
+  const auto found = campaign_budgets_.find(std::string(campaign));
+  return found == campaign_budgets_.end()
+             ? std::numeric_limits<std::int64_t>::max()
+             : found->second;
+}
+
+std::vector<StateWriter::ReserveEntry> StateWriter::reserve_entries_sorted(
+    std::string_view campaign) const {
   std::shared_lock lock(index_mutex_);
-  const auto found = reserved_by_campaign_.find(std::string(campaign));
-  return found == reserved_by_campaign_.end() ? 0 : found->second;
+  const auto found = reserve_entries_.find(std::string(campaign));
+  if (found == reserve_entries_.end()) return {};
+  std::vector<ReserveEntry> sorted = found->second;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const ReserveEntry& a, const ReserveEntry& b) {
+              if (a.hlc != b.hlc) return a.hlc < b.hlc;
+              return a.origin < b.origin;
+            });
+  return sorted;
+}
+
+std::int64_t StateWriter::reserved_total(std::string_view campaign) const {
+  // Decision 0014: count in (hlc, origin) order, capped at the loop
+  // budget; entries past the budget are void.
+  const std::int64_t budget = campaign_budget(campaign);
+  std::int64_t total = 0;
+  for (const ReserveEntry& entry : reserve_entries_sorted(campaign)) {
+    if (total + entry.attempts > budget) break;
+    total += entry.attempts;
+  }
+  return total;
+}
+
+bool StateWriter::reservation_void(std::string_view campaign,
+                                   std::string_view origin,
+                                   log::Hlc hlc) const {
+  const std::int64_t budget = campaign_budget(campaign);
+  std::int64_t total = 0;
+  for (const ReserveEntry& entry : reserve_entries_sorted(campaign)) {
+    if (total + entry.attempts > budget) return true;  // past the cap: void
+    total += entry.attempts;
+    if (entry.origin == origin && entry.hlc == hlc) return false;
+  }
+  return true;  // not among the counted entries: void or unknown
 }
 
 std::optional<std::string> StateWriter::origin_prev_hash(

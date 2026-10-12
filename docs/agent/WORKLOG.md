@@ -1,4 +1,39 @@
 # Worklog (append-only, newest at top)
+## 2026-10-11T22:5xZ · m6 · OA-13 root cause, precisely (owner-requested)
+
+Result: named. The 401 had two layers; for each, the exact string-to-sign input, why only macOS, and the Intel macOS 12 (Mac Pro) assessment.
+
+Layer 1 — the 401 (`replayed nonce`):
+- The signed request bytes were device ‖ method ‖ path ‖ body-hash ‖ timestamp, with NO per-request nonce. The timestamp was computed ONCE per sync round and reused for every request in the round, so any two byte-identical requests in the same second produced byte-identical signed bytes — the "input that differed" is: nothing was there to differ. The anti-replay cache keyed on (device, signature) therefore rejected a legitimate transport retry as a replay.
+- Why only macOS CI: cpp-httplib retries a request when the connection fails mid-flight; the macOS arm64 runner's loopback stack tore the keep-alive connection down between request and response consistently, triggering the retry (same second → identical signature → 401). Linux/Windows runners delivered the first attempt cleanly. The hex dumps proved client and server agreed byte-for-byte; the rejection was always the second arrival.
+- Intel macOS 12 (the Mac Pros): the trigger is a connection-level failure, not CPU architecture — on stable real-machine loopback the retry may never fire, but ANY torn keep-alive connection within the same second of the original request would have hit the same bug there. It was latent on every platform; macOS CI just exercised it reliably. The fix — a fresh random nonce per request attempt, part of the signed bytes (device ‖ method ‖ path ‖ body-hash ‖ nonce ‖ ts), replay cache keyed on (device, nonce) — removes the failure class on all of them, Mac Pros included.
+
+Layer 2 — BadSig after the 401 was fixed:
+- KeyStore::get on macOS read the shared login keychain FIRST. The string-to-sign inputs agreed; what differed was the KEY MATERIAL: the shared keychain persists across CI jobs, and three parallel nodes on one runner share the same service/account item, so a node could load a key that did not match the public key in members.json — its batch signatures then failed verification (BadSig) on every peer.
+- Why only macOS: the keychain backend is macOS-only (Windows uses DPAPI over a per-directory file; Linux uses the plain file).
+- Intel macOS 12: the same hazard exists on real Macs whenever several data directories share one login keychain (and stale items accumulate). The fix — the 0600 file is the source of truth, the keychain only a migration fallback that can never bypass the file's permission gate — is deterministic on every macOS, Intel included.
+
+Guards: SyncGolden pins the exact signature bytes on every CI OS; the keystore round trip runs on macOS without a skip; sync.multi_process_convergence PASSES on macOS arm64 CI (126 s).
+
+## 2026-10-11T19:4xZ · m7 · macOS sync 401 (OA-13) root cause and fix
+
+Result: FIXED and verified — `sync.multi_process_convergence` PASSES on macOS arm64 CI (126 s), all 8 CI jobs green (run 38167851946). OA-13 closed; the skip and the ONION_MP_ALLOW_MACOS override are removed; the keystore round trip no longer skips on macOS.
+
+Evidence:
+- Hex dumps of the exact string-to-sign on both sides (added for this diagnosis): client and server agreed byte-for-byte on macOS CI, so the canonical bytes, path normalization, header handling and key loading from members.json were all ruled out. The rejections came from the two layers below — in order.
+- Layer 1 (the 401): `replayed nonce`. The signed-request scheme had no per-request nonce — the timestamp was the only varying input, and it is shared across a whole sync round. A legitimate transport retry (common on the macOS runners) resent byte-identical requests; the anti-replay cache rejected the retry as a replay → every round ended 401. Fix: a fresh random nonce per request attempt, part of the signed bytes (device ‖ method ‖ path ‖ body-hash ‖ nonce ‖ ts), replay cache keyed on (device, nonce). A retry now signs a new nonce and passes; a true replay still fails.
+- Layer 2 (after layer 1, sync worked but pulled batches failed `verify 1` = BadSig): KeyStore::get on macOS read the shared login keychain FIRST. Three parallel nodes on one machine plus keychain state persisting across CI jobs made the key material nondeterministic — a node could sign batches with a key that did not match the public key in members.json. Fix: the 0600 file is the source of truth (keychain only as a migration fallback, and a present-but-invalid file fails closed instead of falling through to the keychain).
+- Guards added: `SyncGolden.FixedKeyAndRequestGiveFixedSignatureOnEveryOS` pins the exact signature bytes for a fixed key/request on every CI OS; the keystore round trip test runs on macOS without a skip; the node log now prints per-origin quarantine reasons.
+
+## 2026-10-11T18:0xZ · m6 · convergence flake root cause (retrospective entry)
+
+Result: documented (was only in the commit message until now)
+Evidence:
+- Root cause: mid-chain sync pulls verified against an EMPTY expected_prev. The pull client asked for records from the origin's local chain head, but the state writer's verify() got no previous-hash context for that origin beyond the first batch, so every later batch failed BadPrev and the origin's chain stalled at batch 1. Convergence therefore depended on batch boundaries — sometimes nodes never caught up, sometimes they did: the flake.
+- Fix commit: `22437e2` "m6: fix sync liveness — per-origin chain heads so mid-chain pulls verify (BadPrev root cause); campaign exhaustion does not close (decision 0010); deterministic multi-process test with quiescence assertions and state dumps". The state writer now tracks per-origin chain heads (origin_prev_hashes_) and replays them per origin, so a pull starting mid-chain verifies against the right prev. Follow-ups in the same campaign: RESERVE fold ordering so budget closes only after the work (`01dc367`, `041846c`), macOS keychain identity cloning (`a888807`), stdbuf removal for ASan, ONION_SYNC_DEBUG restore.
+- Verification: 20/20 consecutive local passes of sync.multi_process_convergence on Linux (gates/M6.md); CI green on every platform in four separate green runs on m6-sync (38145570583 push + 38145573883 PR on ab8d0da; 38148393792 push + 38148397179 PR on the final head 7cd14ea) — more than the three required.
+- One test tolerated failure to merge PR #12: sync.multi_process_convergence is recorded SKIPPED (exit 77, never passed) on macOS arm64 CI only, tracked as OA-13 (macOS-specific 401 from the signed-request authenticate()). This REOPENS M6 until OA-13 is fixed and the skip is removed; all other platforms ran the test green on the merged head.
+
 ## 2026-10-11T14:0xZ · m6 · multi-process convergence: macOS 401 diagnosis
 
 Result: in progress (macOS CI part BLOCKED, tracked as OA-13)

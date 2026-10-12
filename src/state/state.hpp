@@ -59,6 +59,8 @@ struct CampaignInfo {
   std::string id;
   std::string spec;    // JSON
   std::string state;   // running | paused | stopped
+  log::Hlc hlc{};      // latest (hlc, origin) wins
+  std::string origin;
 };
 
 class StateWriter {
@@ -109,9 +111,14 @@ class StateWriter {
   bool leaf(std::string_view path) const;         // settled, cannot split
   bool needs_review(std::string_view path) const;
   std::optional<CampaignInfo> campaign(std::string_view id) const;
-  // Fleet-wide RESERVE totals per campaign (folded from every synced log,
-  // replay-safe and deduplicated by origin + hlc).
+  // Fleet-wide RESERVE totals per campaign, folded in (hlc, origin) order
+  // and CAPPED at the campaign's loop budget (decision 0014): entries past
+  // the budget are void, so overshoot is at most one chunk per device.
   std::int64_t reserved_total(std::string_view campaign) const;
+  // Whether one specific RESERVE record (origin, hlc) falls past the cap:
+  // its device must stop starting new attempts for the campaign.
+  bool reservation_void(std::string_view campaign, std::string_view origin,
+                        log::Hlc hlc) const;
   // Per-origin RESERVE totals for one campaign, for diagnostics.
   std::map<std::string, std::int64_t> reserved_by_origin(
       std::string_view campaign) const;
@@ -176,6 +183,19 @@ class StateWriter {
   std::map<std::string, std::int64_t> reserved_by_campaign_;
   std::map<std::string, std::int64_t> reserved_by_origin_campaign_;  // origin|campaign
   std::unordered_set<std::string> seen_reserve_keys_;  // origin:hlc
+
+  // Decision 0014: the per-campaign RESERVE entry list for the capped,
+  // order-independent fold.
+  struct ReserveEntry {
+    log::Hlc hlc{};
+    std::string origin;
+    std::int64_t attempts{};
+  };
+  std::map<std::string, std::vector<ReserveEntry>> reserve_entries_;
+  std::map<std::string, std::int64_t> campaign_budgets_;  // from CAMPAIGN spec
+  std::int64_t campaign_budget(std::string_view campaign) const;
+  std::vector<ReserveEntry> reserve_entries_sorted(
+      std::string_view campaign) const;  // sorted by (hlc, origin)
 };
 
 }  // namespace onion::state

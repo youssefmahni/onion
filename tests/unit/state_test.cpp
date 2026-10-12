@@ -531,3 +531,166 @@ TEST_F(StateWriterTest, CampaignStopFinalInEitherOrder) {
   writer_->sync();
   EXPECT_EQ(writer_->campaign("c2")->state, "stopped");
 }
+
+namespace {
+
+onion::log::Batch reserve_batch(
+    const std::string& origin, std::uint64_t number,
+    std::vector<std::pair<std::int64_t, std::int64_t>> reserves) {
+  std::vector<Record> records;
+  std::int64_t seq = 1;  // the replay's contiguity check expects 1..n
+  for (const auto& [hlc, attempts] : reserves) {
+    Record record = make_record(
+        "RESERVE", {{"campaign", "mp1"}, {"attempts", attempts}});
+    record.hlc = hlc;
+    record.seq = seq++;
+    records.push_back(std::move(record));
+  }
+  onion::log::NullSigner signer;
+  return onion::log::make_batch(origin, number, std::string(64, '0'),
+                                std::move(records), signer);
+}
+
+void submit_campaign(StateWriter& writer) {
+  writer.submit(CommitTerminal{{make_record(
+      "CAMPAIGN", {{"id", "mp1"},
+                   {"spec", {{"loop_budget", 1000}, {"chunk", 50}}},
+                   {"state", "running"}})}});
+  writer.sync();
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, CappedFoldVoidsPastBudgetInEveryDeliveryOrder) {
+  // Three origins reserve 500 attempts each (10 chunks of 50) into a
+  // budget of 1000: the fold counts in (hlc, origin) order, caps at the
+  // budget and voids the rest — identically in EVERY delivery order
+  // (decision 0014).
+  const std::string origin_a = "dev00000000000000aa";
+  const std::string origin_b = "dev00000000000000bb";
+  const std::string origin_c = "dev00000000000000cc";
+  const auto reserves_for = [](std::int64_t base_hlc) {
+    std::vector<std::pair<std::int64_t, std::int64_t>> out;
+    for (int i = 0; i < 10; i++) out.emplace_back(base_hlc + i, 50);
+    return out;
+  };
+  const onion::log::Batch batch_a =
+      reserve_batch(origin_a, 1, reserves_for(1000));
+  const onion::log::Batch batch_b =
+      reserve_batch(origin_b, 1, reserves_for(2000));
+  const onion::log::Batch batch_c =
+      reserve_batch(origin_c, 1, reserves_for(3000));
+
+  const std::vector<std::vector<const onion::log::Batch*>> orders = {
+      {&batch_a, &batch_b, &batch_c},
+      {&batch_a, &batch_c, &batch_b},
+      {&batch_b, &batch_a, &batch_c},
+      {&batch_b, &batch_c, &batch_a},
+      {&batch_c, &batch_a, &batch_b},
+      {&batch_c, &batch_b, &batch_a},
+  };
+
+  int order_index = 0;
+  for (const auto& order : orders) {
+    const std::filesystem::path fresh =
+        dir_ / ("order_" + std::to_string(order_index++));
+    StateWriter::Options options;
+    options.data_dir = fresh;
+    options.origin = "dev0000000000000001";
+    StateWriter writer(std::move(options));
+    std::string error;
+    ASSERT_TRUE(writer.start(&error)) << error;
+    submit_campaign(writer);
+    for (const auto* batch : order) {
+      writer.submit(onion::state::AppendForeign{*batch});
+      writer.sync();
+    }
+
+    // Capped at the budget regardless of the delivery order.
+    EXPECT_EQ(writer.reserved_total("mp1"), 1000);
+
+    // The hlc ranges do not overlap, so the (hlc, origin) order groups
+    // them: A's 10 (500) + B's 10 (500) exactly reach the cap; every C
+    // entry is void.
+    EXPECT_FALSE(writer.reservation_void("mp1", origin_a, 1000));
+    EXPECT_FALSE(writer.reservation_void("mp1", origin_a, 1009));
+    EXPECT_FALSE(writer.reservation_void("mp1", origin_b, 2000));
+    EXPECT_FALSE(writer.reservation_void("mp1", origin_b, 2009));
+    EXPECT_TRUE(writer.reservation_void("mp1", origin_c, 3000));
+    EXPECT_TRUE(writer.reservation_void("mp1", origin_c, 3009));
+    writer.stop();
+  }
+}
+
+TEST_F(StateWriterTest, ReservationThatExactlyFitsIsNotVoid) {
+  const std::string origin_a = "dev00000000000000aa";
+  const std::string origin_b = "dev00000000000000bb";
+  std::string start_error;
+  ASSERT_TRUE(writer_->start(&start_error)) << start_error;
+  submit_campaign(*writer_);
+  writer_->submit(onion::state::AppendForeign{reserve_batch(origin_a, 1,
+                                              {{100, 500}, {200, 500}})});
+  writer_->sync();
+  // Exactly 1000 of 1000: the second entry fits precisely.
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_FALSE(writer_->reservation_void("mp1", origin_a, 200));
+
+  // One attempt over: the crossing entry is void and nothing beyond it
+  // counts.
+  writer_->submit(onion::state::AppendForeign{reserve_batch(origin_b, 1, {{300, 50}})});
+  writer_->sync();
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_TRUE(writer_->reservation_void("mp1", origin_b, 300));
+}
+
+TEST_F(StateWriterTest, ReserveFoldSurvivesRestart) {
+  // Decision 0014: the RESERVE fold is log-only (no store table) — after
+  // a restart the replay must restore the capped total and the void set,
+  // or a rebooted device forgets the fleet's budget accounting.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  writer_->submit(onion::state::AppendForeign{reserve_batch(
+      "dev00000000000000aa", 1, {{100, 500}, {200, 500}})});
+  writer_->sync();
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+
+  // Restart on the same directory.
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 100));
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
+}
+
+TEST_F(StateWriterTest, StaleCampaignRecordDoesNotMoveTheBudget) {
+  // Latest (hlc, origin) wins for the budget too: a stale CAMPAIGN record
+  // delivered late must not shrink the cap on any replica.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);  // budget 1000, folded with a real hlc
+
+  // A stale record with a LOWER hlc claims budget 10.
+  onion::log::Record stale;
+  stale.type = "CAMPAIGN";
+  stale.payload = {{"id", "mp1"},
+                   {"spec", {{"loop_budget", 10}, {"chunk", 50}}},
+                   {"state", "running"}};
+  stale.hlc = 1;  // far below the first record's hlc
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000bb", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{stale}, signer)});
+  writer_->sync();
+
+  writer_->submit(onion::state::AppendForeign{reserve_batch(
+      "dev00000000000000aa", 1, {{100, 500}, {200, 500}})});
+  writer_->sync();
+  // The cap stayed 1000: both entries count.
+  EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
+  EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
+}

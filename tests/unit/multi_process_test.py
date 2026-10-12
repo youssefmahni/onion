@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import platform
 import urllib.request
 from pathlib import Path
 
@@ -68,19 +67,7 @@ def dump_debug_state(binary, data, members_path):
 
 def main():
     binary = sys.argv[1]
-    # OA-13: on the hosted macOS arm64 CI runners every sync round is
-    # rejected with 401 by the signed-request authenticate() — diagnosed in
-    # WORKLOG.md, revisited in M7. The skip is scoped to those runners only
-    # (real Macs and other platforms keep running the test), is recorded as
-    # SKIPPED (exit 77, not a pass), and can be overridden to reproduce the
-    # failure with ONION_MP_ALLOW_MACOS=1.
-    if (sys.platform == "darwin" and platform.machine() == "arm64"
-            and os.environ.get("GITHUB_ACTIONS")
-            and not os.environ.get("ONION_MP_ALLOW_MACOS")):
-        print("SKIP (OA-13): macOS arm64 CI signed-request auth fails "
-              "(401 on every sync round); tracked in docs/agent/WORKLOG.md "
-              "and OWNER_ACTIONS.md, revisited in M7")
-        sys.exit(77)
+    started = time.time()
     started = time.time()
     deadline = started + HARD_DEADLINE_S
     root = tempfile.mkdtemp(prefix="onion_mp_")
@@ -88,9 +75,10 @@ def main():
     fake = subprocess.Popen(
         [sys.executable, FAKE_SERVER, "--scenario", HEALTHY_SCENARIO,
          "--record", os.path.join(root, "requests.jsonl"),
-         "--port", "18101", "--funnel", "--funnel-max-depth", "3"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.7)
+         "--port", "0", "--funnel", "--funnel-max-depth", "8"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    fake_port = int(fake.stdout.readline().strip())
+    assert fake_port > 0, "fake server did not report its port"
 
     devices = {}
     try:
@@ -99,8 +87,11 @@ def main():
             os.makedirs(os.path.join(data, "keys"))
             corpus = os.path.join(root, f"corpus{index}")
             os.makedirs(corpus)
-            with open(os.path.join(corpus, "Onion - level_00.csv"), "w") as f:
-                f.write(f"code,title\nP0{index},Phase {index}\n")
+            # Seeded at L4 (TDs) so the campaign's structure flag (off)
+            # never gates the work: L1..L3 expansion goes to review, L4+
+            # expands freely.
+            with open(os.path.join(corpus, "Onion - level_04.csv"), "w") as f:
+                f.write(f"code,path,title\nP0{index},P0{index},Phase {index}\n")
             # Fixed seed: the device identity (and so the lanes) are the
             # same on every run.
             run(binary, "node", "key", "set", "device-key",
@@ -119,7 +110,7 @@ def main():
         members = [
             {"device_id": devices[i]["device_id"],
              "public_key": devices[i]["public_key"],
-             "url": "127.0.0.1:%d" % (18201 + i), "weight": 1.0}
+             "weight": 1.0}
             for i in (1, 2, 3)
         ]
         for index in (1, 2, 3):
@@ -139,21 +130,51 @@ def main():
             data = devices[index]["data"]
             nodes.append(subprocess.Popen(
                 [binary, "node", "run",
-                 "--data-dir", data, "--base-url", "http://127.0.0.1:18101",
+                 "--data-dir", data,
+                 "--base-url", "http://127.0.0.1:%d" % fake_port,
                  "--members", os.path.join(data, "members.json"),
-                 "--host", "127.0.0.1", "--sync-port", str(18201 + index),
-                 "--api-port", str(18110 + index)],
+                 "--host", "127.0.0.1", "--sync-port", "0",
+                 "--api-port", "0", "--swim-port", "0",
+                 "--port-file", os.path.join(root, f"port{index}.json")],
                 stdout=open(os.path.join(root, f"node{index}.log"), "w"),
                 stderr=subprocess.STDOUT,
                 env=dict(os.environ, ONION_SYNC_DEBUG="1")))
 
-        # 1. Wait for the campaign to finish on every device (decision
-        #    0010: exhausted, i.e. its RESERVE fold reaches the budget, or
-        #    stopped — never a raw timer).
+        # Read each node's REAL bound ports (bind-0 + port files: no fixed
+        # ports anywhere, so parallel runs never collide), then fill the
+        # peer urls into members.json — the nodes reload it on mtime
+        # change and the sync rounds begin.
+        ports = {}
+        for index in (1, 2, 3):
+            port_file = os.path.join(root, f"port{index}.json")
+            end = time.time() + 30
+            while not os.path.exists(port_file) and time.time() < end:
+                time.sleep(0.2)
+            assert os.path.exists(port_file), \
+                "node %d never wrote its port file" % index
+            with open(port_file) as f:
+                ports[index] = json.load(f)
+            assert ports[index]["sync"] > 0 and ports[index]["api"] > 0
+        for i, index in enumerate((1, 2, 3), start=1):
+            members[i - 1]["url"] = "127.0.0.1:%d" % ports[index]["sync"]
+        for index in (1, 2, 3):
+            with open(os.path.join(devices[index]["data"], "members.json"),
+                      "w") as f:
+                json.dump(members, f)
+
+        # 1. Wait for the campaign to finish on every device, as decision
+        #    0010 defines "finished": exhausted (its capped RESERVE fold
+        #    reaches the budget) or stopped. The wait is progress-based
+        #    (never a raw timer): fail only when the fleet makes no
+        #    progress for N seconds, with a generous total cap. The
+        #    "no attempts in flight" half of the definition is proven by
+        #    the quiescence check in step 2: a funnel mid-flight commits
+        #    within milliseconds on the fake model, so three silent sync
+        #    rounds mean nothing is in flight anywhere.
         def finished_everywhere():
             try:
                 for index in (1, 2, 3):
-                    state = node_state(18110 + index)
+                    state = node_state(ports[index]["api"])
                     campaigns = state.get("campaigns", [])
                     campaign_state = campaigns[0] if campaigns else None
                     if campaign_state is None:
@@ -167,18 +188,35 @@ def main():
                 return True
             except Exception:
                 return False
-        # Leave room for the three quiescence rounds after the work.
-        work_wait = max(60.0, HARD_DEADLINE_S - 90.0)
-        if not wait_for(finished_everywhere, work_wait, deadline,
-                        "campaign never finished"):
-            raise AssertionError("campaign never finished everywhere")
+        NO_PROGRESS_S = 90.0  # fail only when nothing moves for this long
+        last_progress = time.time()
+        last_vector = None
+        while not finished_everywhere():
+            if time.time() > deadline:
+                raise DeadlineExceeded(
+                    "campaign never finished everywhere")
+            time.sleep(2.0)
+            current = None
+            try:
+                current = [node_state(ports[index]["api"]).get("vector", {})
+                           for index in (1, 2, 3)]
+            except Exception:
+                current = None  # a dead node shows as no progress
+            if current is not None and current != last_vector:
+                last_vector = current
+                last_progress = time.time()
+            elif time.time() - last_progress > NO_PROGRESS_S:
+                raise DeadlineExceeded(
+                    "no progress for %.0f s" % NO_PROGRESS_S)
 
         # 2. Quiescence: no node may write a new record for three sync
-        #    rounds, so the last batch has reached every replica.
+        #    rounds, so the last batch has reached every replica. A
+        #    transient HTTP error on a loaded machine must not kill the
+        #    run: this round simply does not count.
         def vector_signature():
             signature = []
             for index in (1, 2, 3):
-                state = node_state(18110 + index)
+                state = node_state(ports[index]["api"])
                 signature.append(tuple(sorted(state.get("vector", {}).items())))
             return signature
 
@@ -188,7 +226,16 @@ def main():
             if time.time() > deadline:
                 raise DeadlineExceeded("quiescence")
             time.sleep(SYNC_ROUND_S)
-            current = vector_signature()
+            try:
+                current = vector_signature()
+            except (urllib.error.URLError, OSError,
+                    json.JSONDecodeError):
+                # A transient HTTP/parse error on a loaded machine: this
+                # round simply does not count. A persistently dead node
+                # keeps resetting until DeadlineExceeded fires.
+                quiescent_rounds = 0
+                previous = None
+                continue
             if current == previous and previous is not None:
                 quiescent_rounds += 1
             else:
@@ -196,7 +243,7 @@ def main():
             previous = current
 
         # 3. Convergence assertions.
-        states = [node_state(18110 + index) for index in (1, 2, 3)]
+        states = [node_state(ports[index]["api"]) for index in (1, 2, 3)]
         for index, state in enumerate(states, start=1):
             campaigns = state.get("campaigns", [])
             campaign_state = campaigns[0] if campaigns else {}
@@ -209,6 +256,21 @@ def main():
         assert settled[0] == settled[1] == settled[2], settled
         merkle = [state["merkle_root"] for state in states]
         assert merkle[0] == merkle[1] == merkle[2], merkle
+
+        # Decision 0014: the fleet-wide budget overshoot is at most one
+        # chunk per device. The uncapped RESERVE sum is identical on every
+        # replica (the merkle roots match, and the fold is order-
+        # independent), so reading it from device 1's state suffices. It
+        # must stay within budget + one chunk per device (the chunk here
+        # is the 50-attempt floor: every device's measured window stays
+        # below it).
+        budget = 100
+        total_reserved = sum(
+            campaign.get("reserved_uncapped", 0)
+            for campaign in states[0].get("campaigns", []))
+        assert total_reserved <= budget + 3 * 50, \
+            "budget overshoot: %d reserved against a budget of %d" % (
+                total_reserved, budget)
         print("multi-process convergence: PASS settled=%s merkle=%s"
               % (settled, merkle[0][:16]))
     except (AssertionError, DeadlineExceeded) as error:

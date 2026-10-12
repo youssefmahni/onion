@@ -147,7 +147,9 @@ TEST_F(EngineTest, RunsAThreeHundredNodeCampaignOffline) {
   seed_root();
   Budget budget("10");
   Engine engine = make_engine(budget);
-  const Engine::RunResult result = engine.run(spec(), nullptr);
+  CampaignSpec campaign = spec();
+  campaign.structure = true;  // L1..L3 expansion on
+  const Engine::RunResult result = engine.run(campaign, nullptr);
   // No atomic children: the stop rule never fires; the tree drains when the
   // pre-check refuses at depth 6. 1+3+...+243 = 364 settled nodes.
   EXPECT_EQ(result.end_reason, "drained");
@@ -198,7 +200,9 @@ TEST_F(EngineTest, StopRuleEndsAnAtomicFrontierCampaign) {
   // with average score ≥ 0.8, the campaign stops by itself.
   Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.9, 4),
                                 budget, 1, "dev0000000000000001", "0.001"});
-  const Engine::RunResult result = engine.run(spec(), nullptr);
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
   EXPECT_EQ(result.end_reason, "stop rule");
   EXPECT_GT(result.settled, 0);
   EXPECT_GT(result.atomic, 0);
@@ -215,7 +219,9 @@ TEST_F(EngineTest, WaitingTicketStartsWhenTheReservationIsReleased) {
   Budget budget("0.001");
   Engine engine(Engine::Options{*writer_, funnel_fake(1), budget, 1,
                                 "dev0000000000000001", "0.001"});
-  const Engine::RunResult result = engine.run(spec(), nullptr);
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
   EXPECT_NE(result.end_reason, "budget");  // the second ticket waited and ran
   EXPECT_TRUE(writer_->settled("P01"));
   EXPECT_TRUE(writer_->settled("P01-IN01"));
@@ -283,7 +289,9 @@ TEST_F(EngineTest, KillAtEveryCommitStepLosesNoCommittedWork) {
   // again after a stop drains nothing new).
   Budget budget("10");
   Engine engine = make_engine(budget);
-  const Engine::RunResult first = engine.run(spec(), nullptr);
+  CampaignSpec kill_spec = spec();
+  kill_spec.structure = true;
+  const Engine::RunResult first = engine.run(kill_spec, nullptr);
   EXPECT_GE(first.settled, 300);
 
   std::string error;
@@ -316,19 +324,65 @@ TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
   tiny.loop_budget = 2;
   tiny.chunk = 1;
   tiny.mode = "breadth-first";
+  tiny.structure = true;  // this test is about the budget, not structure
 
+  // The first (free) reservation takes min(measured chunk, budget) = 2
+  // attempts and settles them; the spent chunk cannot renew until a sync
+  // round, so the run drains (decision 0014) rather than overspending.
   const Engine::RunResult first = engine.run(tiny, nullptr);
-  EXPECT_EQ(first.end_reason, "budget");  // exhausted, not stopped
+  EXPECT_EQ(first.end_reason, "drained");
   // Decision 0010: exhaustion never closes the campaign record.
   ASSERT_TRUE(writer_->campaign("c1").has_value());
   EXPECT_EQ(writer_->campaign("c1")->state, "running");
-  const int settled_after_exhaustion = first.settled;
-  EXPECT_GT(settled_after_exhaustion, 0);
+  EXPECT_GT(first.settled, 0);
 
-  // Raising the loop budget resumes the open tickets.
+  // After a sync round the next reservation attempt finds the budget
+  // exhausted: "budget", still not closed.
+  engine.note_sync_round();
+  const Engine::RunResult exhausted = engine.run(tiny, nullptr);
+  EXPECT_EQ(exhausted.end_reason, "budget");
+  EXPECT_EQ(writer_->campaign("c1")->state, "running");
+
+  // Raising the loop budget resumes the open tickets (decision 0010): the
+  // raise lands as a new CAMPAIGN record — the capped fold reads the
+  // budget from the latest record — then one more sync round before the
+  // engine may reserve again.
   tiny.loop_budget = 1000;
-  tiny.chunk = 50;
+  writer_->submit(CommitTerminal{{
+      [] {
+        onion::log::Record record;
+        record.type = "CAMPAIGN";
+        record.payload = {{"id", "c1"},
+                          {"spec", {{"loop_budget", 1000}, {"chunk", 50}}},
+                          {"state", "running"}};
+        return record;
+      }(),
+  }});
+  writer_->sync();
+  engine.note_sync_round();
   const Engine::RunResult second = engine.run(tiny, nullptr);
   EXPECT_EQ(second.end_reason, "drained");  // the resumed tickets finished
   EXPECT_GT(second.settled, 0);
+}
+
+TEST_F(EngineTest, StructureReviewDoesNotReprocessTheTicket) {
+  seed_root();
+  Budget budget("10");
+  Engine engine = make_engine(budget);
+  CampaignSpec campaign = spec();
+  campaign.structure = false;  // the root is L1: expansion goes to review
+  const Engine::RunResult first = engine.run(campaign, nullptr);
+  EXPECT_EQ(first.reviews, 1);
+  EXPECT_EQ(first.settled, 0);
+
+  // Running again must not re-attempt the reviewed ticket: still exactly
+  // one review, no new children, no spend.
+  const Engine::RunResult second = engine.run(campaign, nullptr);
+  EXPECT_EQ(second.reviews, 0);
+  EXPECT_EQ(second.attempts, 0);
+  std::string error;
+  EXPECT_EQ(writer_->db().open_reviews(&error).size(), 1u);
+  // The root plus the review-stored children (decision 0008) — and the
+  // second run added nothing.
+  EXPECT_EQ(writer_->db().all_nodes(&error).size(), 4u);
 }

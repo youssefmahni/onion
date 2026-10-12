@@ -140,6 +140,12 @@ class Engine {
   // thread (the CLI's stop command).
   RunResult run(const CampaignSpec& spec, std::atomic<bool>* external_stop);
 
+  // Decision 0014: the node loop reports a completed sync round; the
+  // engine measures the window's attempts (the next chunk is
+  // max(50, measured × 1.2)) and re-opens reservations (at most one
+  // RESERVE per sync round per device).
+  void note_sync_round();
+
   // Review decisions as record submissions. `accept` settles the node so its
   // children become tickets; `retry` re-queues it with the note injected;
   // `reject` tombstones the node and its children.
