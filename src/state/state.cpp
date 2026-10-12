@@ -1,5 +1,7 @@
 #include "state.hpp"
 
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -784,18 +786,40 @@ void StateWriter::run() {
         break;
       }
       case Command::Kind::Import: {
+        // INSERT OR IGNORE: a duplicate path keeps the first row and is
+        // counted (reported by the CLI), never aborting the import — the
+        // corpus carries known duplicates (DESIGN P3).  sqlite3_changes is
+        // unreliable across statement resets, so the skip count comes from
+        // an existence check per row.
         auto statement = db_.prepare(
-            "INSERT INTO nodes(code, path, parent_id, layer, title, origin, "
-            "hlc) VALUES (?1, ?2, (SELECT n2.id FROM nodes n2 WHERE n2.path = "
-            "?3), ?4, ?5, 'dev-import', ?6);",
+            "INSERT OR IGNORE INTO nodes(code, path, parent_id, layer, "
+            "title, origin, hlc) VALUES (?1, ?2, (SELECT n2.id FROM nodes n2 "
+            "WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6);",
             &error);
-        if (!statement) break;
+        auto exists = db_.prepare(
+            "SELECT 1 FROM nodes WHERE path = ?1;", &error);
+        if (!statement || !exists) break;
+        std::size_t skipped = 0;
         for (const DevImportedNode& node : command.nodes) {
           std::string bind_error;
           const std::size_t dash = node.path.rfind('-');
           const std::string parent = dash == std::string::npos
                                          ? std::string{}
                                          : node.path.substr(0, dash);
+          if (!exists->bind(1, node.path, &bind_error)) {
+            error = "import exists bind failed: " + bind_error;
+            break;
+          }
+          const bool duplicate = exists->step_row(&bind_error);
+          exists->reset(&bind_error);
+          if (!bind_error.empty()) {
+            error = "import exists step failed: " + bind_error;
+            break;
+          }
+          if (duplicate) {
+            ++skipped;
+            continue;
+          }
           if (!statement->bind(1, node.code, &bind_error) ||
               !statement->bind(2, node.path, &bind_error) ||
               !statement->bind(3, parent, &bind_error) ||
@@ -811,6 +835,7 @@ void StateWriter::run() {
           }
           statement->reset(&bind_error);
         }
+        import_skipped_.store(skipped);
         break;
       }
       case Command::Kind::Sync:

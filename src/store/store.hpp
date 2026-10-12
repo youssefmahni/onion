@@ -128,6 +128,9 @@ class Db {
   // Closes the handle so the file can be deleted (needed on Windows, where
   // an open database keeps its files locked).
   void close();
+  // The raw handle, for callers that need sqlite3 functions directly
+  // (e.g. sqlite3_changes).
+  sqlite3* handle() const { return handle_; }
 
   // Plain SQL with no results.
   bool exec(std::string_view sql, std::string* error);
