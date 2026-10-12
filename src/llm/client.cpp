@@ -196,14 +196,16 @@ class CpuPool {
   std::vector<std::thread> workers_;
 };
 
-Result parse_result(CURLcode code, long status, long retry_after,
-                    std::string body, double latency_s) {
+}  // namespace
+
+Result parse_response(long curl_code, long status, long retry_after,
+                      std::string body, double latency_s) {
   Result result;
   result.http_status = static_cast<int>(status);
   result.retry_after_s = retry_after;
   result.latency_s = latency_s;
-  if (code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
-  else if (code != CURLE_OK) result.kind = Kind::Transport;
+  if (curl_code == CURLE_OPERATION_TIMEDOUT) result.kind = Kind::Timeout;
+  else if (curl_code != CURLE_OK) result.kind = Kind::Transport;
   else if (status == 429) result.kind = Kind::RateLimited;
   else if (status == 401) result.kind = Kind::AuthError;
   else if (status == 402) result.kind = Kind::BalanceError;
@@ -241,7 +243,6 @@ Result parse_result(CURLcode code, long status, long retry_after,
   }
   return result;
 }
-}  // namespace
 
 std::string meter_cost(std::uint64_t cache_hit, std::uint64_t cache_miss,
                        std::uint64_t output, const PriceSchedule& schedule,
@@ -437,7 +438,11 @@ struct Client::Impl {
     if (options.connect_timeout_s > 0)
       curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, options.connect_timeout_s);
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+    // HTTP/2 with HTTP/1.1 fallback, per DESIGN › Concurrency and decision
+    // 0015.  The Alt-Svc cache stays off so no silent HTTP/3 upgrade can
+    // change the transport behind the limiter's back.
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(easy, CURLOPT_ALTSVC, "");
     curl_easy_setopt(easy, CURLOPT_SHARE, share);
     curl_easy_setopt(easy, CURLOPT_DNS_CACHE_TIMEOUT, options.dns_cache_ttl_s);
     if (!resolved.empty()) {
@@ -467,7 +472,7 @@ struct Client::Impl {
     parser_pool.submit([promise = std::move(parsed), code, status, retry_after = item.retry_after,
                         body = std::move(item.body),
                         latency = std::chrono::duration<double>(Clock::now() - item.started).count()]() mutable {
-      promise->set_value(parse_result(code, status, retry_after, std::move(body), latency));
+      promise->set_value(parse_response(code, status, retry_after, std::move(body), latency));
     });
     Result result = future.get();
     if ((result.kind == Kind::RateLimited || result.kind == Kind::ServerError) && item.task.attempts < 3) {
@@ -531,7 +536,9 @@ std::string http_get(const std::string& url, const std::string& api_key,
   curl_easy_setopt(easy, CURLOPT_WRITEDATA, &body);
   curl_easy_setopt(easy, CURLOPT_TIMEOUT, 30L);
   curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 10L);
+  // See the client: HTTP/2 pinned with HTTP/1.1 fallback (decision 0015).
   curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+  curl_easy_setopt(easy, CURLOPT_ALTSVC, "");
   curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
   curl_easy_perform(easy);
   curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_status);

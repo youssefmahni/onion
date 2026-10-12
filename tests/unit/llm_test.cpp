@@ -46,6 +46,16 @@ TEST(Metering, UsesOffpeakOnlyForCallsInsideOneWindow) {
   EXPECT_EQ(onion::llm::meter_cost(1000000, 1000000, 1000000, prices, false, true), "3.5");
 }
 
+TEST(Metering, SpanningCallBillsTheHigherTriplet) {
+  // A call spanning a price-window boundary bills at the higher triplet
+  // (decision 0004): the flag pair means "started in off-peak" but
+  // "request did not stay in one window".
+  onion::llm::PriceSchedule prices{{"1", "0.5", "2"}, {"0.1", "0.05", "0.2"}};
+  EXPECT_EQ(onion::llm::meter_cost(1000000, 1000000, 1000000, prices, false, true), "3.5");
+  EXPECT_EQ(onion::llm::meter_cost(1000000, 1000000, 1000000, prices, false, false), "3.5");
+  EXPECT_EQ(onion::llm::meter_cost(1000000, 1000000, 1000000, prices, true, true), "0.35");
+}
+
 TEST(CircuitBreaker, OpensAfterTwentyConsecutiveTransportFailures) {
   onion::llm::CircuitBreaker breaker;
   for (int index = 0; index < 19; ++index) breaker.on_result(onion::llm::Kind::Transport);

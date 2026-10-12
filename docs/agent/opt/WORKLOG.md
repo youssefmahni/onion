@@ -10,6 +10,15 @@ Attempts: <only for problems: n. hypothesis → change → evidence>
 Next step: <one precise action>
 ```
 
+## 2026-10-11 · W3 · local pass while CI was billing-blocked: traceability audit, fuzzers, C4, C5, fold idempotency
+
+Result: done (CI was blocked; now public-repo CI is green and the branch awaits merge)
+Evidence: TRACEABILITY_AUDIT.md; tests/fuzz/ (5 targets, clean); C4 kill points 1-4 in
+tests/unit/state_test.cpp; the doubled-and-shuffled replay test (StateWriterFoldIdempotency.*);
+attempts/critiques keyed by (origin, hlc); settle fold score-first; decision 0015; C5 smoke
+(2 billed calls, HTTP/2). Full suite green locally.
+Next step: merge in the owner's order (#21 done, m6-corrections done) and land this branch.
+
 ## 2026-10-11 · W1 · setup: worktree, corpus copy, probe tool, audit (3 PRs)
 
 Result: done

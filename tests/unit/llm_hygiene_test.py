@@ -33,7 +33,7 @@ def summary(output, key):
 def dns_one_lookup_per_host(binary):
     """The shared DNS cache plus the test resolver memo: one lookup for 100
     requests to the same host."""
-    with fake_server("healthy.json") as (url, _):
+    with fake_server("healthy.json") as (url, _, _record):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://localhost:{port}",
                               "--test-resolver", "--requests", "100")
@@ -44,7 +44,7 @@ def dns_one_lookup_per_host(binary):
 
 def resolver_failures_are_transport(binary):
     """A failing resolution is a Transport outcome and does not hit the wire."""
-    with fake_server("healthy.json") as (url, _):
+    with fake_server("healthy.json") as (url, _, _record):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://localhost:{port}",
                               "--test-resolver", "--resolver-fail-first", "3", "--requests", "50")
@@ -57,13 +57,34 @@ def resolver_failures_are_transport(binary):
 
 def connection_reuse(binary):
     """Keep-alive responses reuse connections: 100 requests open a handful."""
-    with fake_server("healthy.json") as (url, _):
+    with fake_server("healthy.json") as (url, _, _record):
         port = int(url.rsplit(":", 1)[1])
         completed = run_probe(binary, f"http://127.0.0.1:{port}", "--requests", "100")
         assert completed.returncode == 0, completed.stderr
         assert completion_ok(completed.stdout, 100), completed.stdout
         opened = summary(completed.stdout, "connections_opened")
         assert opened <= 10, f"expected reuse, opened {opened} connections"
+
+
+def request_shape_and_key_privacy(binary):
+    """The wire request carries the Onion shape (reasoning_effort: none,
+    stream: false) and the record never contains the Authorization header
+    (decision 0004 / DESIGN: keys never enter logs or sync traffic)."""
+    import json
+    with fake_server("healthy.json") as (url, _, record):
+        port = int(url.rsplit(":", 1)[1])
+        completed = run_probe(binary, f"http://127.0.0.1:{port}", "--requests", "30")
+        assert completed.returncode == 0, completed.stderr
+        assert completion_ok(completed.stdout, 30), completed.stdout
+        rows = [json.loads(line) for line in record.read_text().splitlines()]
+        assert len(rows) == 30, f"expected 30 records, got {len(rows)}"
+        for row in rows:
+            body = row["body"]
+            assert body.get("stream") is False, body
+            assert body.get("reasoning_effort") == "none", body
+            assert "max_tokens" in body, body
+            for header in row.get("headers", {}):
+                assert header.lower() != "authorization", row
 
 
 def main():
@@ -73,6 +94,7 @@ def main():
     dns_one_lookup_per_host(args.binary)
     resolver_failures_are_transport(args.binary)
     connection_reuse(args.binary)
+    request_shape_and_key_privacy(args.binary)
     print("hygiene-ok")
 
 

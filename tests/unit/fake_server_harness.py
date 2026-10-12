@@ -34,7 +34,7 @@ def fake_server(scenario_name, scenario_dir=None):
         drainer.start()
         try:
             port = int(server.stdout.readline().strip())
-            yield f"http://127.0.0.1:{port}", stderr_lines
+            yield f"http://127.0.0.1:{port}", stderr_lines, record
         finally:
             server.terminate()
             server.wait(timeout=10)
@@ -43,7 +43,7 @@ def fake_server(scenario_name, scenario_dir=None):
 def run_adaptive(binary, scenario_name, requests, start, ceiling, window_s=1):
     """Runs `llm bench --adaptive` against the scenario and returns stdout
     (with the server's stderr appended, for failure diagnosis)."""
-    with fake_server(scenario_name) as (url, server_stderr):
+    with fake_server(scenario_name) as (url, server_stderr, _record):
         completed = subprocess.run(
             [str(binary), "llm", "bench", "--adaptive",
              "--url", url, "--window-s", str(window_s),

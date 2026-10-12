@@ -38,3 +38,28 @@ jobs:
           -R '^llm\.(scenarios|capacity_shift|threads|ramp)$'
         env:
           ONION_NIGHTLY: '1'
+
+  fuzz:
+    name: libFuzzer targets (Linux, clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libcurl4-openssl-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Release
+          -DONION_ENABLE_FUZZING=ON -DONION_ENABLE_OPENCL=OFF
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+      - name: Build the fuzz targets
+        run: >-
+          cmake --build build/fuzz --target llm_response_fuzzer
+          canonical_json_fuzzer batch_record_fuzzer csv_import_fuzzer
+          api_http_fuzzer
+      - name: Fuzz each target (10 min; a crash fails the job)
+        run: |
+          for fuzzer in llm_response canonical_json batch_record csv_import api_http; do
+            echo "== $fuzzer =="
+            ./build/fuzz/${fuzzer}_fuzzer -max_total_time=600 -timeout=10 \
+              -print_final_stats=1
+          done

@@ -252,6 +252,29 @@ TEST(GatePrompts, PrecheckPromptIsAtMostFourHundredTokensApprox) {
   EXPECT_LT(precheck_prompt(ctx()).size(), 900u);
 }
 
+TEST(GatePrompts, FixedTextPrecedesNodeText) {
+  // DESIGN › LLM provider › Prompt caching: fixed instructions come first
+  // in every prompt and node-specific text last, so DeepSeek's cache can
+  // bill the shared prefix at the cheaper cache-hit rate.  Every funnel
+  // prompt therefore ends with the node line.
+  using onion::gate::critique_prompt;
+  using onion::gate::planner_prompt;
+  using onion::gate::synthesizer_prompt;
+  using onion::gate::trimmer_prompt;
+  using onion::gate::worker_prompt;
+  const std::string line = "Node: L2 P01-IN01-T01\nTitle: Order Capture";
+  const auto ends_with_node = [&](const std::string& prompt) {
+    return prompt.size() >= line.size() &&
+           prompt.substr(prompt.size() - line.size()) == line;
+  };
+  EXPECT_TRUE(ends_with_node(precheck_prompt(ctx())));
+  EXPECT_TRUE(ends_with_node(planner_prompt(ctx(), "", false)));
+  EXPECT_TRUE(ends_with_node(worker_prompt(ctx(), "Aspect X", "")));
+  EXPECT_TRUE(ends_with_node(trimmer_prompt(ctx(), {"A", "B"}, 1)));
+  EXPECT_TRUE(ends_with_node(critique_prompt(ctx(), {"A", "B"})));
+  EXPECT_TRUE(ends_with_node(synthesizer_prompt(ctx(), {"A", "B"}, "crit")));
+}
+
 // ---------------- funnel behaviours ----------------
 
 Result ok(const std::string& content) {
