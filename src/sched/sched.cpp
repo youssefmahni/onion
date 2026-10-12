@@ -796,7 +796,7 @@ CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
         money(row.tokens_in_hit, params.price_offpeak_cache);
     row.cost_peak = cost_in_peak + money(row.tokens_out, params.price_peak_out);
     row.cost_offpeak = cost_in_off + money(row.tokens_out, params.price_offpeak_out);
-    row.hours = static_cast<double>(row.calls) / params.answers_per_s / 3600.0;
+    row.hours = static_cast<double>(row.tokens_out) / params.output_tokens_per_s / 3600.0;
     plan.levels.push_back(row);
 
     plan.total_new_nodes += row.new_nodes;
@@ -875,8 +875,8 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   out << std::fixed << std::setprecision(2)
       << "cost peak=" << plan.cost_peak << " offpeak=" << plan.cost_offpeak
       << " USD\n";
-  out << "time at " << std::setprecision(0) << params.answers_per_s
-      << " answers/s: " << std::setprecision(2) << plan.hours << " hours\n";
+  out << "time at " << std::setprecision(0) << params.output_tokens_per_s
+      << " output tokens/s: " << std::setprecision(2) << plan.hours << " hours\n";
   out << "spend/hour peak=" << plan.spend_per_hour_peak
       << " offpeak=" << plan.spend_per_hour_offpeak << " USD\n";
   return out.str();
