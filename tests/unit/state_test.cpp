@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <fstream>
+#include <sstream>
+#include <system_error>
 #include <string>
 #include <thread>
 #ifndef _WIN32
@@ -10,6 +12,7 @@
 #endif
 
 #include "state/state.hpp"
+#include "store/checkpoint.hpp"
 
 namespace {
 
@@ -213,7 +216,10 @@ TEST_F(StateWriterTest, DevImportWritesStoreWithoutLog) {
 
 // Crash injection at each commit step: the hook is armed inside a forked
 // child, which dies at the step with _exit — a real power cut. The parent
-// then reopens the data directory and checks the replay.
+// then reopens the data directory and checks the replay.  The child submits
+// one ATTEMPT (group-committed) and one terminal batch, so the hook steps
+// cover the commit order (C4): 1 = terminal batch durable, store stale;
+// 2 = fold done; 3 = attempt record durable; 4 = attempt folded.
 #ifndef _WIN32
 namespace {
 int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
@@ -232,6 +238,13 @@ int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
   auto writer = std::make_unique<StateWriter>(std::move(options));
   std::string error;
   if (!writer->start(&error)) _exit(4);
+  writer->submit(AppendAttempt{{
+      Record{0, 0, "ATTEMPT",
+             {{"path", "P01-IN01-T01"}, {"n", 1}, {"score", "0.8"},
+              {"passed", 1}, {"tokens_in", 10}, {"tokens_cached", 2},
+              {"tokens_out", 5}, {"cost", "0.001"}, {"campaign", "c1"},
+              {"issues", ""}}},
+  }});
   writer->submit(CommitTerminal{{
       Record{0, 0, "ADD_NODE",
              {{"path", "P01-IN01-T01-TK00001"}, {"layer", 4},
@@ -250,38 +263,40 @@ int run_writer_until_crash(const std::filesystem::path& dir, int crash_step) {
 }
 }  // namespace
 
-TEST_F(StateWriterTest, CrashBetweenDurableWriteAndFoldLosesNothing) {
-  writer_.reset();  // release the fixture writer before the fork
-  const int status = run_writer_until_crash(dir_, 1);
+// Reopens the crashed data directory and returns the freshly started
+// writer (asserts the crash was taken at the armed step).
+std::unique_ptr<StateWriter> reopen_after_crash(
+    const std::filesystem::path& dir, int crash_step) {
+  const int status = run_writer_until_crash(dir, crash_step);
   EXPECT_EQ(WEXITSTATUS(status), 3);
-
   StateWriter::Options options;
-  options.data_dir = dir_;
+  options.data_dir = dir;
   options.origin = "dev0000000000000001";
   auto writer = std::make_unique<StateWriter>(std::move(options));
   std::string error;
-  ASSERT_TRUE(writer->start(&error)) << error;
-  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
+  EXPECT_TRUE(writer->start(&error)) << error;
+  return writer;
+}
+
+TEST_F(StateWriterTest, CrashBetweenDurableWriteAndFoldLosesNothing) {
+  writer_.reset();  // release the fixture writer before the fork
+  auto writer = reopen_after_crash(dir_, 1);
   std::string query_error;
+  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
   const auto node = writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error);
   ASSERT_TRUE(node.has_value()) << query_error;
   EXPECT_EQ(node->title, "Committed");
+  // The group-committed attempt was durable before the terminal batch, so
+  // its audit row and spend survive the crash at step 1.
+  EXPECT_EQ(writer->db().spend_usd(&query_error), "0.001");
   writer->stop();
 }
 
 TEST_F(StateWriterTest, CrashAfterFoldKeepsStoreAndLogConsistent) {
   writer_.reset();
-  const int status = run_writer_until_crash(dir_, 2);
-  EXPECT_EQ(WEXITSTATUS(status), 3);
-
-  StateWriter::Options options;
-  options.data_dir = dir_;
-  options.origin = "dev0000000000000001";
-  auto writer = std::make_unique<StateWriter>(std::move(options));
-  std::string error;
-  ASSERT_TRUE(writer->start(&error)) << error;
-  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
+  auto writer = reopen_after_crash(dir_, 2);
   std::string query_error;
+  EXPECT_TRUE(writer->settled("P01-IN01-T01"));
   const auto node = writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error);
   ASSERT_TRUE(node.has_value()) << query_error;
   EXPECT_EQ(node->title, "Committed");
@@ -289,6 +304,33 @@ TEST_F(StateWriterTest, CrashAfterFoldKeepsStoreAndLogConsistent) {
   // exactly the one committed child (the parent itself has no node row).
   const auto subtree = writer->db().nodes_in_subtree("P01-IN01-T01", &query_error);
   EXPECT_EQ(subtree.size(), 1u);
+  // Exactly one attempt survives the replay (its cost is counted once).
+  EXPECT_EQ(writer->db().spend_usd(&query_error), "0.001");
+  writer->stop();
+}
+
+TEST_F(StateWriterTest, CrashAfterAttemptDurableCommitsNothing) {
+  // Step 3: the ATTEMPT audit record is durable but the terminal batch has
+  // not been written.  C4: no children or settle before the gate decision;
+  // the attempt (and its spend) survives the restart.
+  writer_.reset();
+  auto writer = reopen_after_crash(dir_, 3);
+  std::string query_error;
+  EXPECT_FALSE(writer->settled("P01-IN01-T01"));
+  EXPECT_FALSE(writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error).has_value());
+  EXPECT_EQ(writer->db().spend_usd(&query_error), "0.001");
+  writer->stop();
+}
+
+TEST_F(StateWriterTest, CrashAfterAttemptFoldCommitsNothing) {
+  // Step 4: the attempt is folded, the terminal batch still absent — the
+  // replay keeps the single attempt row and commits no children.
+  writer_.reset();
+  auto writer = reopen_after_crash(dir_, 4);
+  std::string query_error;
+  EXPECT_FALSE(writer->settled("P01-IN01-T01"));
+  EXPECT_FALSE(writer->db().node_by_path("P01-IN01-T01-TK00001", &query_error).has_value());
+  EXPECT_EQ(writer->db().spend_usd(&query_error), "0.001");
   writer->stop();
 }
 #endif  // !_WIN32
@@ -497,21 +539,42 @@ TEST_F(StateWriterTest, ConflictHigherScoreWinsInReverseOrder) {
 TEST_F(StateWriterTest, ConflictTieBreaksOnHighestHlcThenOrigin) {
   std::string error;
   ASSERT_TRUE(writer_->start(&error)) << error;
-  // Same hlc: the higher origin wins.
+  // Equal scores, same hlc: the higher origin wins (DESIGN: the higher
+  // score wins; a tie goes to the higher (hlc, origin)).
   writer_->submit(CommitTerminal{{settle_record("P03", 0.8, 10, "aaaaaaaaaaaaaaaa")}});
-  writer_->submit(CommitTerminal{{settle_record("P03", 0.7, 10, "bbbbbbbbbbbbbbbb")}});
+  writer_->submit(CommitTerminal{{settle_record("P03", 0.8, 10, "bbbbbbbbbbbbbbbb")}});
   writer_->sync();
   auto settles = writer_->db().settles(&error);
   ASSERT_EQ(settles.size(), 1u);
   EXPECT_EQ(settles[0].origin, "bbbbbbbbbbbbbbbb");
   // Reverse order: the same state.
-  writer_->submit(CommitTerminal{{settle_record("P04", 0.7, 10, "bbbbbbbbbbbbbbbb")}});
+  writer_->submit(CommitTerminal{{settle_record("P04", 0.8, 10, "bbbbbbbbbbbbbbbb")}});
   writer_->submit(CommitTerminal{{settle_record("P04", 0.8, 10, "aaaaaaaaaaaaaaaa")}});
   writer_->sync();
   settles = writer_->db().settles(&error);
   ASSERT_EQ(settles.size(), 2u);
   const auto p04 = writer_->db().node_by_path("P04", &error);
   (void)p04;
+}
+
+TEST_F(StateWriterTest, ConflictHigherScoreWinsRegardlessOfHlc) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  // A lower-scoring settle with a HIGHER hlc must not displace the better
+  // attempt (the previous fold compared (hlc, origin) first and got this
+  // wrong; the fixture in ConflictTieBreaksOnHighestHlcThenOrigin relied on
+  // that).
+  writer_->submit(CommitTerminal{{settle_record("P05", 0.9, 5, "dev0000000000000001")}});
+  writer_->submit(CommitTerminal{{settle_record("P05", 0.6, 9, "dev0000000000000002")}});
+  writer_->sync();
+  auto settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 1u);
+  EXPECT_EQ(settles[0].score, "0.900000");
+  writer_->submit(CommitTerminal{{settle_record("P06", 0.6, 9, "dev0000000000000002")}});
+  writer_->submit(CommitTerminal{{settle_record("P06", 0.9, 5, "dev0000000000000001")}});
+  writer_->sync();
+  settles = writer_->db().settles(&error);
+  ASSERT_EQ(settles.size(), 2u);
 }
 
 TEST_F(StateWriterTest, CampaignStopFinalInEitherOrder) {
@@ -530,6 +593,229 @@ TEST_F(StateWriterTest, CampaignStopFinalInEitherOrder) {
       "CAMPAIGN", {{"id", "c2"}, {"spec", json::object()}, {"state", "stopped"}})}});
   writer_->sync();
   EXPECT_EQ(writer_->campaign("c2")->state, "stopped");
+}
+
+// ------------------------------------------------ OPT W3: fold idempotency
+
+namespace {
+
+// A realistic two-origin log: one campaign, one ticket attempted by BOTH
+// devices (the collision case), a terminal batch, a tombstone, and a
+// reservation.  Records carry explicit seq/hlc so the folds are
+// deterministic.
+std::vector<onion::log::Batch> realistic_log() {
+  using onion::log::Batch;
+  using onion::log::NullSigner;
+  using onion::log::make_batch;
+  NullSigner signer;
+
+  auto record = [](std::string type, nlohmann::json payload, int seq,
+                   std::uint64_t hlc) {
+    Record result = make_record(std::move(type), std::move(payload));
+    result.seq = seq;
+    result.hlc = hlc;
+    return result;
+  };
+
+  const std::string a = "aaaaaaaaaaaaaaaa";
+  const std::string b = "bbbbbbbbbbbbbbbb";
+  std::vector<Batch> log;
+
+  // A1: attempt 1 on ticket T by device A.
+  log.push_back(make_batch(a, 1, "", {record("ATTEMPT",
+      {{"path", "P01-IN01-T01"}, {"n", 1}, {"score", "0.8"}, {"passed", 1},
+       {"tokens_in", 10}, {"tokens_cached", 2}, {"tokens_out", 5},
+       {"cost", "0.001"}, {"campaign", "c1"}, {"issues", ""}}, 1, 10)}, signer));
+  // A2: the terminal batch for T: child, critique, atomic, settle.
+  log.push_back(make_batch(a, 2, log[0].hash,
+      {record("ADD_NODE", {{"path", "P01-IN01-T01-TK00001"}, {"layer", 4},
+                            {"title", "Child One"}}, 2, 11),
+       record("CRITIQUE", {{"path", "P01-IN01-T01"}, {"score", "0.8"},
+                           {"issues", "none"}, {"remove", nlohmann::json::array()},
+                           {"add", nlohmann::json::array()}}, 3, 12),
+       record("ATOMIC", {{"path", "P01-IN01-T01-TK00001"}, {"verified", true}}, 4, 13),
+       record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 1}, {"atomic", 1},
+                         {"attempts", 1}, {"score", "0.8"}, {"end", "children"},
+                         {"campaign", "c1"}}, 5, 14)}, signer));
+  // A3: campaign (with a loop budget so the RESERVE cap binds) + reserves
+  // emitted out of hlc order relative to other origins: the fold must
+  // count them in (hlc, origin) order, capped at the budget, and void the
+  // rest — identically in every delivery order (decision 0014).
+  log.push_back(make_batch(a, 3, log[1].hash,
+      {record("CAMPAIGN", {{"id", "c1"},
+                           {"spec", {{"loop_budget", 120}}},
+                           {"state", "running"}}, 6, 15),
+       record("RESERVE", {{"campaign", "c1"}, {"attempts", 50}}, 7, 16),
+       record("RESERVE", {{"campaign", "c1"}, {"attempts", 40}}, 8, 19)}, signer));
+  // A4: tombstone the child (a revert).
+  log.push_back(make_batch(a, 4, log[2].hash,
+      {record("TOMBSTONE", {{"path", "P01-IN01-T01-TK00001"},
+                            {"reason", "revert"}}, 8, 17)}, signer));
+  // A5: a member profile (append-only, keyed by device+version).
+  log.push_back(make_batch(a, 5, log[3].hash,
+      {record("MEMBER_PROFILE",
+              {{"device_id", "aaaaaaaaaaaaaaaa"}, {"version", 1},
+               {"prev", "genesis"}, {"reason", "join"}, {"spec", nlohmann::json::object()},
+               {"rules_version", 1}, {"schema", 1}}, 9, 18)}, signer));
+  // B1: device B collided on the same ticket: its own attempt (lower score)
+  // and its own settle of T — the fold must keep the higher score and count
+  // BOTH attempts' spend.
+  log.push_back(make_batch(b, 1, "",
+      {record("ATTEMPT", {{"path", "P01-IN01-T01"}, {"n", 1}, {"score", "0.6"},
+                          {"passed", 1}, {"tokens_in", 8}, {"tokens_cached", 0},
+                          {"tokens_out", 4}, {"cost", "0.001"},
+                          {"campaign", "c1"}, {"issues", ""}}, 1, 100),
+       record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 1}, {"atomic", 0},
+                         {"attempts", 1}, {"score", "0.6"}, {"end", "children"},
+                         {"campaign", "c1"}}, 2, 101)}, signer));
+  // B2: a review flow plus two more RESERVE records.  Sorted with A3's:
+  // (16,a,50) (19,a,40) (103,b,20) (104,b,60) -> 50+40+20=110 within the
+  // 120 budget; the 60 is void.
+  log.push_back(make_batch(b, 2, log[4].hash,
+      {record("NEEDS_REVIEW", {{"path", "P01-IN01-T02"}, {"reason", "below floor"},
+                               {"attempts", 3}, {"score", "0.4"}}, 3, 102),
+       record("REVIEW", {{"path", "P01-IN01-T02"}, {"decision", "accept"},
+                         {"note", "keep it"}}, 4, 103),
+       record("RESERVE", {{"campaign", "c1"}, {"attempts", 20}}, 5, 103),
+       record("RESERVE", {{"campaign", "c1"}, {"attempts", 60}}, 6, 104)}, signer));
+  return log;
+}
+
+// Dumps every table in a normalized form (surrogate ids excluded: parent
+// links are resolved by path) plus the Merkle root and the RESERVE fold
+// (decision 0014: the sorted, capped total and the void set).
+std::string normalized_dump(const StateWriter& writer, const onion::store::Db& db,
+                            std::string* error) {
+  std::ostringstream out;
+  const auto dump = [&](std::string_view sql, const char* label) {
+    auto statement = db.prepare(sql, error);
+    if (!statement) return;
+    out << label << ":\n";
+    std::string row_error;
+    while (statement->step_row(&row_error)) {
+      for (int column = 0; column < statement->column_count(); ++column)
+        out << statement->text(column) << "|";
+      out << "\n";
+    }
+  };
+  dump("SELECT code, path, "
+       "(SELECT p.path FROM nodes p WHERE p.id = nodes.parent_id), "
+       "layer, title, origin, hlc, tombstone FROM nodes ORDER BY path;",
+       "nodes");
+  dump("SELECT path, kept, atomic, attempts, score, campaign, hlc, origin "
+       "FROM settles ORDER BY path;", "settles");
+  dump("SELECT path, n, score, passed, tokens_in, tokens_cached, tokens_out, "
+       "cost, campaign, hlc, origin FROM attempts ORDER BY origin, hlc;",
+       "attempts");
+  dump("SELECT path, score, issues, remove, add_, hlc, origin "
+       "FROM critiques ORDER BY origin, hlc;", "critiques");
+  dump("SELECT id, spec, state, hlc, origin FROM campaigns ORDER BY id;",
+       "campaigns");
+  dump("SELECT origin, seq FROM applied ORDER BY origin;", "applied");
+  dump("SELECT path, reason, state, note, hlc, origin FROM reviews "
+       "ORDER BY path;", "reviews");
+  dump("SELECT device_id, version, prev, reason, changed, spec, rules_version, "
+       "schema, hlc FROM profiles ORDER BY device_id, version;", "profiles");
+  const auto nodes = db.all_nodes(error);
+  out << "merkle: " << onion::store::merkle_root(nodes) << "\n";
+  out << "spend: " << db.spend_usd(error) << "\n";
+  out << "reserved_total(c1): " << writer.reserved_total("c1") << "\n";
+  for (const auto& [origin, total] : writer.reserved_by_origin("c1"))
+    out << "reserved_by_origin: " << origin << " " << total << "\n";
+  for (const auto& [origin, hlc] :
+       {std::pair<std::string, std::int64_t>{"aaaaaaaaaaaaaaaa", 16},
+        {"aaaaaaaaaaaaaaaa", 19},
+        {"bbbbbbbbbbbbbbbb", 103},
+        {"bbbbbbbbbbbbbbbb", 104}})
+    out << "void " << origin << " " << hlc << " = "
+        << (writer.reservation_void("c1", origin, hlc) ? "1" : "0") << "\n";
+  return out.str();
+}
+}  // namespace
+
+TEST(StateWriterFoldIdempotency, BothOriginsAttemptOneCountBothSpends) {
+  namespace fs = std::filesystem;
+  using onion::log::NullSigner;
+  const fs::path dir = fs::temp_directory_path() /
+      ("onion_fold_two_origins_" + std::to_string(::getpid()) + "_" +
+       std::to_string(reinterpret_cast<std::uintptr_t>(&dir)));
+  const fs::path base = dir / "base";
+  fs::remove_all(dir);
+
+  const auto log = realistic_log();
+  // Fold A1 (origin A attempt) and B1 (origin B attempt on the same path,
+  // attempt 1): both devices spent money and both rows must count.
+  StateWriter::Options options;
+  options.data_dir = base;
+  options.origin = "cccccccccccccccc";
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+  for (const auto& batch : log) {
+    if (batch.origin == "aaaaaaaaaaaaaaaa" && batch.number == 1)
+      writer->submit(onion::state::AppendForeign{batch});
+    if (batch.origin == "bbbbbbbbbbbbbbbb" && batch.number == 1)
+      writer->submit(onion::state::AppendForeign{batch});
+  }
+  writer->sync();
+  EXPECT_EQ(writer->db().spend_usd(&error), "0.002");
+  auto statement = writer->db().prepare(
+      "SELECT COUNT(*) FROM attempts;", &error);
+  ASSERT_TRUE(statement);
+  ASSERT_TRUE(statement->step_row(&error));
+  EXPECT_EQ(statement->integer_int(0), 2);
+  writer->stop();
+  // The remove can fail on Windows while the SQLite handles drain; the
+  // runner's temp cleanup reclaims the directory, so the failure is ignored.
+  std::error_code ignored;
+  fs::remove_all(dir, ignored);
+}
+
+TEST(StateWriterFoldIdempotency, DoubleAndShuffledReplayGivesIdenticalState) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+      ("onion_fold_idem_" + std::to_string(::getpid()) + "_" +
+       std::to_string(reinterpret_cast<std::uintptr_t>(&dir)));
+  const fs::path first_dir = dir / "first";
+  const fs::path second_dir = dir / "second";
+  fs::remove_all(dir);
+
+  const auto log = realistic_log();
+
+  const auto fold_all = [](const fs::path& data_dir,
+                           const std::vector<onion::log::Batch>& batches) {
+    StateWriter::Options options;
+    options.data_dir = data_dir;
+    options.origin = "cccccccccccccccc";
+    auto writer = std::make_unique<StateWriter>(std::move(options));
+    std::string error;
+    EXPECT_TRUE(writer->start(&error)) << error;
+    for (const auto& batch : batches)
+      writer->submit(onion::state::AppendForeign{batch});
+    writer->sync();
+    std::string dump_error;
+    const std::string dump = normalized_dump(*writer, writer->db(), &dump_error);
+    writer->stop();
+    return dump;
+  };
+
+  // Canonical order vs a doubled, shuffled order (every batch twice).
+  const std::string canonical = fold_all(first_dir, log);
+  std::vector<onion::log::Batch> shuffled = {log[4], log[6], log[2], log[0],
+                                             log[1], log[5], log[3], log[6],
+                                             log[4], log[1], log[0], log[5],
+                                             log[2], log[3]};
+  const std::string shuffled_state = fold_all(second_dir, shuffled);
+
+  EXPECT_EQ(shuffled_state, canonical);
+  // The fold semantics are also pinned: the sorted, capped total is 110
+  // (50+40+20; the 60 at hlc 104 is void) and only that entry is void.
+  EXPECT_NE(canonical.find("reserved_total(c1): 110\n"), std::string::npos);
+  EXPECT_NE(canonical.find("void bbbbbbbbbbbbbbbb 104 = 1\n"), std::string::npos);
+  EXPECT_NE(canonical.find("void aaaaaaaaaaaaaaaa 16 = 0\n"), std::string::npos);
+  EXPECT_NE(canonical.find("void bbbbbbbbbbbbbbbb 103 = 0\n"), std::string::npos);
+  std::error_code ignored;
+  fs::remove_all(dir, ignored);
 }
 
 namespace {

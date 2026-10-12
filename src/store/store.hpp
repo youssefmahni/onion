@@ -101,6 +101,7 @@ class Statement {
   void reset(std::string* error);
 
   std::string text(int column) const;
+  int column_count() const;
   std::int64_t integer(int column) const;
   int integer_int(int column) const;
 

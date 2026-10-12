@@ -64,8 +64,11 @@ void upsert_settle(store::Db& db, const log::Record& record,
       "ON CONFLICT(path) DO UPDATE SET kept=excluded.kept, "
       "atomic=excluded.atomic, attempts=excluded.attempts, "
       "score=excluded.score, campaign=excluded.campaign, hlc=excluded.hlc, "
-      "origin=excluded.origin WHERE excluded.hlc > settles.hlc OR "
-      "(excluded.hlc = settles.hlc AND excluded.origin > settles.origin);",
+      "origin=excluded.origin "
+      "WHERE CAST(excluded.score AS REAL) > CAST(settles.score AS REAL) OR "
+      "(CAST(excluded.score AS REAL) = CAST(settles.score AS REAL) AND "
+      "(excluded.hlc > settles.hlc OR (excluded.hlc = settles.hlc AND "
+      "excluded.origin > settles.origin)));",
       error);
   if (!statement) return;
   std::string bind_error;
@@ -89,7 +92,7 @@ void upsert_attempt(store::Db& db, const log::Record& record,
                     std::string_view writer_origin, std::string* error) {
   const auto& payload = record.payload;
   auto statement = db.prepare(
-      "INSERT INTO attempts(path, n, score, passed, tokens_in, tokens_cached, "
+      "INSERT OR IGNORE INTO attempts(path, n, score, passed, tokens_in, tokens_cached, "
       "tokens_out, cost, campaign, hlc, origin) "
       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
       error);
@@ -120,17 +123,35 @@ void upsert_attempt(store::Db& db, const log::Record& record,
 void upsert_critique(store::Db& db, const log::Record& record,
                      std::string_view writer_origin, std::string* error) {
   const auto& payload = record.payload;
+  // remove/add may be a string or an array of strings; normalize both to a
+  // comma-joined string, and never throw on a malformed type (the fold must
+  // survive arbitrary records — found by the shuffled-replay test).
+  const auto joined = [&](const char* key) {
+    if (!payload.contains(key)) return std::string{};
+    if (payload[key].is_string()) return payload[key].get<std::string>();
+    std::string out;
+    if (payload[key].is_array())
+      for (const auto& item : payload[key])
+        if (item.is_string()) {
+          if (!out.empty()) out += ",";
+          out += item.get<std::string>();
+        }
+    return out;
+  };
   auto statement = db.prepare(
-      "INSERT INTO critiques(path, score, issues, remove, add_, hlc, origin) "
-      "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+      // INSERT OR IGNORE keyed on (origin, hlc): the fold must be
+      // idempotent — a replayed durable batch must not duplicate the
+      // critique (C4).
+      "INSERT OR IGNORE INTO critiques(path, score, issues, remove, add_, "
+      "hlc, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
       error);
   if (!statement) return;
   std::string bind_error;
   if (!statement->bind(1, payload.at("path").get<std::string>(), &bind_error) ||
       !statement->bind(2, payload.value("score", std::string{"0"}), &bind_error) ||
       !statement->bind(3, payload.value("issues", std::string{}), &bind_error) ||
-      !statement->bind(4, payload.value("remove", std::string{}), &bind_error) ||
-      !statement->bind(5, payload.value("add", std::string{}), &bind_error) ||
+      !statement->bind(4, joined("remove"), &bind_error) ||
+      !statement->bind(5, joined("add"), &bind_error) ||
       !statement->bind(6, static_cast<std::int64_t>(record.hlc), &bind_error) ||
       !statement->bind(7, payload.value("origin", std::string(writer_origin)), &bind_error)) {
     if (error) *error = "fold critique bind failed: " + bind_error;
@@ -552,7 +573,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
     auto statement = db_.prepare(
-        "INSERT INTO profiles(device_id, version, prev, reason, changed, "
+        "INSERT OR IGNORE INTO profiles(device_id, version, prev, reason, changed, "
         "spec, rules_version, schema, hlc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, "
         "?7, ?8, ?9);",
         error);
@@ -626,7 +647,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
 }
 
 bool StateWriter::append_batch(std::vector<log::Record> records,
-                               std::string* error) {
+                               std::string* error, int hook_step_base) {
   if (records.empty()) return true;
   for (log::Record& record : records) {
     if (record.seq == 0) record.seq = static_cast<std::int64_t>(next_seq_.load());
@@ -642,11 +663,13 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   ++next_batch_;
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;
-  if (options_.crash_hook) options_.crash_hook(1);  // batch durable, store stale
+  if (options_.crash_hook)
+    options_.crash_hook(hook_step_base);  // batch durable, store stale
   for (const log::Record& record : records) fold(record, options_.origin, error);
   update_applied(options_.origin, records);
   if (error && !error->empty()) return false;
-  if (options_.crash_hook) options_.crash_hook(2);  // fold done
+  if (options_.crash_hook)
+    options_.crash_hook(hook_step_base + 1);  // fold done
   return true;
 }
 
@@ -685,7 +708,9 @@ bool StateWriter::flush_pending_attempts(std::string* error) {
   std::vector<log::Record> records;
   records.swap(pending_attempts_);
   last_flush_ = std::chrono::steady_clock::now();
-  return append_batch(std::move(records), error);
+  // Step base 3: the attempt-durable and attempt-folded kill points, kept
+  // distinct from the terminal batch's 1/2 (C4 commit-order coverage).
+  return append_batch(std::move(records), error, 3);
 }
 
 void StateWriter::run() {
