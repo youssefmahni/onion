@@ -546,4 +546,38 @@ TEST(SyncGolden, FixedKeyAndRequestGiveFixedSignatureOnEveryOS) {
   // The exact pinned bytes:
   EXPECT_EQ(signature, "e6b2f03b22e37545bad7b7399c3a70d9125357b473bb5e81564bc685f7c7a16650a77d36ad123e2acda972ac5cdf8fdd3de616b35987201360e62fa85cd9e00c");
 }
+
+TEST_F(SyncTest, PeerLagMeasuresTheGapToThePeer) {
+  // A writes two batches; B lags by two records.
+  writer_a_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01-T01"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_a_->sync();
+  writer_a_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01-IN01-T02"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_a_->sync();
+
+  start_server_a();
+  SyncClient client = make_client_b();
+  std::string error;
+  const std::int64_t lag = client.peer_lag(
+      "127.0.0.1:" + std::to_string(server_->bound_port()), &error);
+  ASSERT_GE(lag, 0) << error;
+  EXPECT_EQ(lag, 2);  // B applied nothing; A is two records ahead
+
+  // After a round the lag collapses to zero.
+  std::map<std::string, std::string> quarantined;
+  const int applied = client.run_round(
+      "127.0.0.1:" + std::to_string(server_->bound_port()), &quarantined,
+      &error);
+  ASSERT_TRUE(error.empty()) << error;
+  EXPECT_EQ(applied, 2);
+  EXPECT_EQ(client.peer_lag(
+                "127.0.0.1:" + std::to_string(server_->bound_port()),
+                &error),
+            0);
+}
 }  // namespace

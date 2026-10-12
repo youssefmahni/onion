@@ -628,6 +628,38 @@ SyncClient::SyncClient(Options options)
     : impl_(new Impl{std::move(options)}) {}
 SyncClient::~SyncClient() = default;
 
+std::int64_t SyncClient::peer_lag(std::string_view peer_base_url,
+                                  std::string* error) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  const std::string self = impl_->options.key->device_id;
+  log::Ed25519Signer signer(*impl_->options.key);
+  auto response = client.Get("/sync/v1/vector",
+                             signed_headers(self, "/sync/v1/vector",
+                                            now_s(), signer));
+  if (!response || response->status != 200) {
+    if (error) *error = "vector request failed";
+    return -1;
+  }
+  auto peer_vector_json = nlohmann::json::parse(response->body, nullptr, false);
+  if (peer_vector_json.is_discarded() || !peer_vector_json.contains("vector")) {
+    if (error) *error = "malformed vector response";
+    return -1;
+  }
+  const auto local = impl_->options.writer.vector();
+  std::int64_t lag = 0;
+  for (const auto& [origin, peer_seq] :
+       peer_vector_json["vector"].items()) {
+    const std::int64_t peer_last = peer_seq.get<std::int64_t>();
+    const auto it = local.find(origin);
+    const std::int64_t local_last = it == local.end() ? 0 : it->second;
+    lag = std::max(lag, peer_last - local_last);
+  }
+  return lag;
+}
+
 int SyncClient::run_round(std::string_view peer_base_url,
                           std::map<std::string, std::string>* quarantined,
                           std::string* error) {

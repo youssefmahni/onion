@@ -116,6 +116,9 @@ class SyncClient {
   int run_round(std::string_view peer_base_url,
                 std::map<std::string, std::string>* quarantined,
                 std::string* error);
+  // M7 joining: how far this device lags the peer — the maximum over all
+  // origins of (peer's last seq - our applied seq). -1 on any error.
+  std::int64_t peer_lag(std::string_view peer_base_url, std::string* error);
 
  private:
   struct Impl;

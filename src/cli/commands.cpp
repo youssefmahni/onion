@@ -307,7 +307,12 @@ int node_cmd(int argc, char** argv) {
           std::cerr << "cannot write members.json\n";
           return 1;
         }
-        members_file << body["members"].dump() << "\n";
+        // The joined marker: node run starts this device JOINING and
+        // turns it ACTIVE once its lag is under 100 ops (DESIGN ›
+        // Joining).
+        nlohmann::json members_json = {{"members", body["members"]},
+                                       {"joined", true}};
+        members_file << members_json.dump() << "\n";
       }
       onion::platform::atomic_replace(tmp_members, join_dir / "members.json");
     }
@@ -648,14 +653,31 @@ int node_cmd(int argc, char** argv) {
   const std::string members_path = flag(argc, argv, "--members", "");
   const std::string self_host = flag(argc, argv, "--host", "127.0.0.1");
   const int self_sync_port = std::atoi(flag(argc, argv, "--sync-port", "7947").c_str());
+  // node join wraps the member list with a "joined" marker: the device
+  // starts JOINING and turns ACTIVE once its lag is under 100 ops.
+  bool joined_device = false;
   if (!members_path.empty()) {
     std::ifstream members_file(members_path);
     auto members_json = json::parse(members_file, nullptr, false);
-    if (members_json.is_discarded() || !members_json.is_array()) {
+    // Two shapes: a bare member array (the static list) or the object
+    // node join writes ({"members": [...], "joined": true}).
+    json member_entries = members_json;
+    if (members_json.is_discarded() || (!members_json.is_array() &&
+                                        !members_json.is_object())) {
       std::cerr << "--members must point at a JSON array\n";
       return 2;
     }
-    for (const auto& member : members_json) {
+    if (members_json.is_object()) {
+      joined_device = members_json.value("joined", false);
+      member_entries = members_json.contains("members")
+                           ? members_json["members"]
+                           : json::array();
+    }
+    if (!member_entries.is_array()) {
+      std::cerr << "--members must point at a JSON array\n";
+      return 2;
+    }
+    for (const auto& member : member_entries) {
       if (!member.contains("device_id") || !member.contains("public_key")) {
         std::cerr << "members.json entries need device_id and public_key\n";
         return 2;
@@ -763,10 +785,13 @@ int node_cmd(int argc, char** argv) {
     swim->beacon_hook = [&](std::string payload) {
       swim_transport->send_beacon(payload);
     };
-    // Seed the static member list as ACTIVE and the device itself as
-    // ACTIVE; addresses arrive through beacons and gossip.
+    // Seed the static member list as ACTIVE; the device itself starts
+    // JOINING when it joined through an invitation (ACTIVE once the lag
+    // drops below 100 ops), ACTIVE otherwise.
     swim->mutable_membership().set_self_state(
-        onion::swim::MemberState::ACTIVE, 1);
+        joined_device ? onion::swim::MemberState::JOINING
+                      : onion::swim::MemberState::ACTIVE,
+        1);
     for (const auto& member : sync_members) {
       if (member.device_id == device_key->device_id) continue;
       onion::swim::Member seed;
