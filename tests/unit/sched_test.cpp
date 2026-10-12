@@ -244,3 +244,86 @@ TEST(HrwLanes, WeightShiftMovesALargeShare) {
   }
   EXPECT_GT(heavier, 100);
 }
+
+// ------------------------------------------------- OPT W4: campaign plan
+
+TEST(PlanCampaign, GrowsByChildrenTimesNonAtomicShare) {
+  onion::sched::PlanParams params;
+  params.children_kept = 3.0;
+  params.atomic_share = 0.0;
+  params.attempts_avg = 1.0;
+  const auto plan = onion::sched::plan_campaign({1}, 2, params);
+  ASSERT_EQ(plan.levels.size(), 3u);
+  EXPECT_EQ(plan.levels[0].expandable, 1);
+  EXPECT_EQ(plan.levels[0].new_nodes, 3);
+  EXPECT_EQ(plan.levels[1].expandable, 3);
+  EXPECT_EQ(plan.levels[1].new_nodes, 9);
+  // Levels 0, 1 and 2 each generate children: 3 + 9 + 27.
+  EXPECT_EQ(plan.total_new_nodes, 39);
+}
+
+TEST(PlanCampaign, AtomicShareStopsTheTree) {
+  onion::sched::PlanParams params;
+  params.children_kept = 40.0;
+  params.atomic_share = 1.0;  // every child atomic: nothing expands further
+  params.attempts_avg = 1.0;
+  const auto plan = onion::sched::plan_campaign({10}, 3, params);
+  EXPECT_EQ(plan.levels[0].new_nodes, 0);
+  for (std::size_t i = 1; i < plan.levels.size(); ++i)
+    EXPECT_EQ(plan.levels[i].expandable, 0);
+  EXPECT_EQ(plan.total_new_nodes, 0);
+}
+
+TEST(PlanCampaign, CacheSplitAndCosts) {
+  onion::sched::PlanParams params;
+  params.children_kept = 0.0;   // no growth: single-level arithmetic
+  params.atomic_share = 0.0;
+  params.attempts_avg = 1.0;
+  params.calls_per_attempt = 1.0;
+  params.precheck_calls = 0.0;
+  params.tokens_in_per_call = 1000000.0;  // 1M input tokens
+  params.tokens_out_per_call = 1000000.0; // 1M output tokens
+  params.cache_hit_ratio = 0.25;
+  params.price_peak_in = 0.30;
+  params.price_peak_cache = 0.006;
+  params.price_peak_out = 1.20;
+  params.price_offpeak_in = 0.15;
+  params.price_offpeak_cache = 0.003;
+  params.price_offpeak_out = 0.60;
+  const auto plan = onion::sched::plan_campaign({1}, 0, params);
+  ASSERT_EQ(plan.levels.size(), 1u);
+  EXPECT_EQ(plan.tokens_in_hit, 250000);
+  EXPECT_EQ(plan.tokens_in_miss, 750000);
+  EXPECT_EQ(plan.tokens_out, 1000000);
+  // Peak: 0.75M x 0.30 + 0.25M x 0.006 + 1M x 1.20 per 1M.
+  EXPECT_NEAR(plan.cost_peak, 0.225 + 0.0015 + 1.20, 1e-9);
+  EXPECT_NEAR(plan.cost_offpeak, 0.1125 + 0.00075 + 0.60, 1e-9);
+}
+
+TEST(PlanCampaign, TimeAndSpendPerHour) {
+  onion::sched::PlanParams params;
+  params.children_kept = 0.0;
+  params.atomic_share = 0.0;
+  params.attempts_avg = 1.0;
+  params.calls_per_attempt = 1.0;
+  params.precheck_calls = 0.0;
+  params.answers_per_s = 3600.0;
+  const auto plan = onion::sched::plan_campaign({3600}, 0, params);
+  // 3600 calls at 3600 answers/s = 1 second = 1/3600 hours.
+  EXPECT_NEAR(plan.hours, 1.0 / 3600.0, 1e-12);
+  EXPECT_NEAR(plan.spend_per_hour_peak, plan.cost_peak * 3600.0, 1e-6);
+  EXPECT_NEAR(plan.spend_per_hour_offpeak, plan.cost_offpeak * 3600.0, 1e-6);
+}
+
+TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
+  onion::sched::PlanParams params;
+  params.children_kept = 2.0;
+  params.atomic_share = 0.0;
+  params.attempts_avg = 1.0;
+  const auto plan = onion::sched::plan_campaign({1}, 1, params);
+  const std::string report = onion::sched::plan_report(plan, params);
+  EXPECT_NE(report.find("level expandable"), std::string::npos);
+  EXPECT_NE(report.find("total new_nodes=6"), std::string::npos);
+  EXPECT_NE(report.find("cost peak="), std::string::npos);
+  EXPECT_NE(report.find("spend/hour peak="), std::string::npos);
+}

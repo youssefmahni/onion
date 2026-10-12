@@ -922,7 +922,7 @@ int node_cmd(int argc, char** argv) {
 
 int campaign_cmd(int argc, char** argv) {
   if (argc < 3) {
-    std::cerr << "usage: data_depot campaign start <file> | pause <id> | "
+    std::cerr << "usage: data_depot campaign start <file> | plan <file> | pause <id> | "
                  "resume <id> | stop <id> [--data-dir <dir>] [--yes]\n";
     return 2;
   }
@@ -933,6 +933,56 @@ int campaign_cmd(int argc, char** argv) {
   if (!writer) {
     std::cerr << error << "\n";
     return 1;
+  }
+
+  if (action == "plan") {
+    if (argc < 4) {
+      std::cerr << "campaign plan needs a campaign file\n";
+      return 2;
+    }
+    const json file = json::parse(load_file(argv[3]), nullptr, false);
+    if (file.is_discarded()) {
+      std::cerr << "campaign file is not valid JSON\n";
+      return 2;
+    }
+    std::string parse_error;
+    const auto spec = onion::sched::parse_campaign(file, &parse_error);
+    if (!spec) {
+      std::cerr << parse_error << "\n";
+      return 2;
+    }
+    const int plan_depth = std::atoi(flag(argc, argv, "--depth-to", "8").c_str());
+    const bool one_level = has_flag(argc, argv, "--one-level");
+    onion::sched::PlanParams params =
+        onion::sched::measure_params(writer->db(), &error);
+    std::vector<std::int64_t> level_nodes;
+    const std::string counts = flag(argc, argv, "--from-counts", "");
+    if (!counts.empty()) {
+      // Explicit per-level starting counts (L0,L1,...): a reproducible
+      // corpus projection without a store (the dev import stops at the
+      // first duplicate path, so the store may be truncated).
+      std::stringstream count_stream(counts);
+      std::string item;
+      while (std::getline(count_stream, item, ',')) {
+        const auto value = std::atoll(item.c_str());
+        if (value > 0) level_nodes.push_back(value);
+      }
+    } else {
+      std::string count_error;
+      for (const auto& prefix : spec->scope)
+        for (const auto& node :
+             writer->db().nodes_with_path_prefix(prefix, &count_error)) {
+          if (static_cast<std::size_t>(node.layer) >= level_nodes.size())
+            level_nodes.resize(node.layer + 1, 0);
+          ++level_nodes[node.layer];
+        }
+      if (level_nodes.empty()) level_nodes.push_back(1);  // a fresh root
+    }
+    std::cout << onion::sched::plan_report(
+        onion::sched::plan_campaign(level_nodes, plan_depth, params,
+                                    !one_level),
+        params);
+    return 0;
   }
 
   if (action == "start") {
@@ -956,15 +1006,27 @@ int campaign_cmd(int argc, char** argv) {
       std::cerr << "campaign " << spec->id << " was stopped; stop is final\n";
       return 1;
     }
-    // Cost projection: the measured average attempt cost from the store,
-    // or "uncalibrated" until a calibration run exists.
-    json projection;
-    projection["loop_budget"] = spec->loop_budget;
-    projection["average_attempt_cost_usd"] = writer->db().spend_usd(&error);
-    projection["note"] =
-        "projection uses the device's average attempt cost so far; prices "
-        "come from node.conf in M5";
-    std::cout << "cost projection: " << projection.dump() << "\n";
+    // Cost projection (decision 0016): expansions per level, tokens with the
+    // cache split, peak/off-peak cost, time and spend per hour, computed
+    // from the store's measured records (defaults where unmeasured).
+    const int plan_depth = std::atoi(flag(argc, argv, "--depth-to", "8").c_str());
+    onion::sched::PlanParams params =
+        onion::sched::measure_params(writer->db(), &error);
+    std::vector<std::int64_t> level_nodes;
+    {
+      std::string count_error;
+      for (const auto& prefix : spec->scope)
+        for (const auto& node :
+             writer->db().nodes_with_path_prefix(prefix, &count_error)) {
+          if (static_cast<std::size_t>(node.layer) >= level_nodes.size())
+            level_nodes.resize(node.layer + 1, 0);
+          ++level_nodes[node.layer];
+        }
+      if (level_nodes.empty()) level_nodes.push_back(1);  // a fresh root
+    }
+    std::cout << onion::sched::plan_report(
+                     onion::sched::plan_campaign(level_nodes, plan_depth, params),
+                     params);
     if (!has_flag(argc, argv, "--yes")) {
       std::cerr << "run with --yes to confirm the projection\n";
       return 3;
