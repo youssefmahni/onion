@@ -110,7 +110,11 @@ struct PlanParams {
   double price_offpeak_in{0.15};
   double price_offpeak_cache{0.003};
   double price_offpeak_out{0.60};
-  double answers_per_s{160.0};     // the measured stable plateau (F1)
+  // Output tokens per second at the measured stable plateau: 58-65k at
+  // 700-800 in flight, about 77k peak at 1,000 (F1).  Time is computed
+  // from this rate, not from answers/s, because the funnel's calls average
+  // about 1,400 output tokens while the probe's tiny answers were about 365.
+  double output_tokens_per_s{60000.0};
 };
 
 struct LevelPlan {

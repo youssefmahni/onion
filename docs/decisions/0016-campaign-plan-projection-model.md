@@ -43,3 +43,14 @@ and off-peak totals.
   corpus projection tables, refreshed after W5's measurements.
 - The old `loop_budget × average cost` line is replaced; the store fallback
   keeps it working on an empty store.
+
+## Update 2026-10-12 — time from the output-token rate
+
+The owner's correction: time is computed from the projected output tokens
+divided by the measured stable **output-token rate** — about 58–65k tokens/s
+at 700–800 in flight, about 77k peak at 1,000 (finding F1) — not from
+answers/s. The probe's answers were about 365 tokens, while the funnel's
+calls average about 1,400, so an answers/s rate understates the funnel's
+time by roughly the same factor. `PlanParams.answers_per_s` is replaced by
+`output_tokens_per_s` (default 60,000); the growth and cost formulas are
+unchanged.

@@ -17,15 +17,29 @@ are listed; the binary is `build/<preset>/data_depot`).
 | pre-check | 1 call, 200 in / 50 out tokens | brief |
 | cache-hit ratio | 0.00 | measured (baseline: 0 hits; V6 targets) |
 | prices peak / off-peak per 1M | 0.30/0.006/1.20 · 0.15/0.003/0.60 | decision 0004 |
-| answers/s | 160 | measured stable plateau (F1, 700–800 in flight) |
+| output tokens/s | 60,000 | measured stable plateau: 58–65k at 700–800 in flight, ~77k peak at 1,000 (F1) |
 
 **Growth rule.** `new_nodes(L+1) = expandable(L) × children_kept ×
 (1 − atomic_share)`. With the defaults the per-level factor is 40 × 0.7 =
-**28**. The projection uses the integer-decimal metering of the engine
-(money = tokens × price / 1M); time = total calls ÷ answers/s; spend per
+**28**.
+
+**Where ×28 comes from.** `children_kept = 40` is the legacy-funnel estimate
+(the legacy synthesizer pads to 100 children; 40 is the W5 V4 target, not
+yet measured) × `(1 − atomic_share)` with `atomic_share = 0.30` (a
+placeholder). Projections built from these defaults are therefore labelled
+**legacy funnel (pads to 100)**. Once the W5 baseline finishes, these
+parameters come from the new engine's measured settle records (children
+kept, atomic share, attempts) and this file is regenerated.
+
+**Time.** `time = projected output tokens ÷ output_tokens_per_s` — the
+token rate, not answers/s, because the funnel's calls average about 1,400
+output tokens (the probe's tiny answers were about 365). Money =
+tokens × price / 1M (the engine's integer-decimal metering); spend per
 hour = cost ÷ hours.
 
-## Projection tables (2026-10-12, current defaults)
+## Projection tables (2026-10-12, current defaults — labelled
+## **legacy funnel (pads to 100)**: children_kept 40 and atomic_share 0.30
+## are estimates, not measurements)
 
 ### A. P01+P06, one more level (existing corpus processed once; the new
 ### children are not re-expanded)
@@ -41,8 +55,8 @@ campaign plan t1.json --depth-to 6 --one-level --from-counts 9,17,95,818,15779,9
 | attempts / calls | 411,144 / 3,605,411 |
 | input (miss/hit) · output tokens | 7.30B / 0 · 5.61B |
 | cost peak / off-peak | $8,918.64 / $4,459.32 |
-| time at 160 answers/s | 6.26 hours |
-| spend per hour peak / off-peak | $1,424.84 / $712.42 |
+| time at 60k output tokens/s | 25.96 hours |
+| spend per hour peak / off-peak | $343.55 / $171.78 |
 
 ### B. The 7 empty phases, grown to today's depth (L6)
 
@@ -56,8 +70,8 @@ campaign plan t2.json --depth-to 5 --from-counts 7
 | attempts / calls | 162.4M / 1.42B |
 | input · output tokens | 2.88T · 2.22T |
 | cost peak / off-peak | $3,523,153.55 / $1,761,576.77 |
-| time at 160 answers/s | 2,472.66 hours (~103 days) |
-| spend per hour peak / off-peak | $1,424.84 / $712.42 |
+| time at 60k output tokens/s | 10,255.04 hours (~427 days) |
+| spend per hour peak / off-peak | $343.55 / $171.78 |
 
 ### C. The full tree to L9 (everything expanded)
 
@@ -70,7 +84,7 @@ campaign plan t3.json --depth-to 9 --from-counts 9,17,95,818,15779,91047,208499
 | new nodes | 3.01 × 10^15 |
 | attempts / calls | 1.40 × 10^14 / 1.23 × 10^15 |
 | cost peak / off-peak | $3.03T / $1.52T |
-| time at 160 answers/s | 2.13 × 10^9 hours |
+| time at 60k output tokens/s | 8.82 × 10^9 hours |
 
 **Conclusion at the current defaults:** the full tree to L9 is infeasible by
 about six orders of magnitude. The lever is the per-level growth factor 28:

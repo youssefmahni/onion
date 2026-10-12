@@ -307,12 +307,37 @@ TEST(PlanCampaign, TimeAndSpendPerHour) {
   params.attempts_avg = 1.0;
   params.calls_per_attempt = 1.0;
   params.precheck_calls = 0.0;
-  params.answers_per_s = 3600.0;
-  const auto plan = onion::sched::plan_campaign({3600}, 0, params);
-  // 3600 calls at 3600 answers/s = 1 second = 1/3600 hours.
+  // One node, one attempt, one call: out tokens = tokens_out_per_call.
+  params.tokens_out_per_call = 60000.0;  // 60k tokens
+  params.output_tokens_per_s = 60000.0;  // 60k tokens/s -> 1 second
+  const auto plan = onion::sched::plan_campaign({1}, 0, params);
+  // 60k output tokens at 60k tokens/s = 1 second = 1/3600 hours.
   EXPECT_NEAR(plan.hours, 1.0 / 3600.0, 1e-12);
   EXPECT_NEAR(plan.spend_per_hour_peak, plan.cost_peak * 3600.0, 1e-6);
   EXPECT_NEAR(plan.spend_per_hour_offpeak, plan.cost_offpeak * 3600.0, 1e-6);
+}
+
+TEST(PlanCampaign, TimeScalesWithOutputTokensNotCallCount) {
+  // Long outputs dominate the funnel: 1,400-token calls take longer than
+  // 365-token calls even at the same call count.  Two plans with the same
+  // call count but different output sizes must differ in time.
+  onion::sched::PlanParams long_outputs;
+  long_outputs.children_kept = 0.0;
+  long_outputs.atomic_share = 0.0;
+  long_outputs.attempts_avg = 1.0;
+  long_outputs.calls_per_attempt = 1.0;
+  long_outputs.precheck_calls = 0.0;
+  long_outputs.tokens_out_per_call = 1400.0;  // funnel calls
+  long_outputs.output_tokens_per_s = 60000.0;
+  const auto long_plan = onion::sched::plan_campaign({100}, 0, long_outputs);
+
+  onion::sched::PlanParams short_outputs = long_outputs;
+  short_outputs.tokens_out_per_call = 365.0;  // probe-sized answers
+  const auto short_plan = onion::sched::plan_campaign({100}, 0, short_outputs);
+
+  EXPECT_EQ(long_plan.total_calls, short_plan.total_calls);
+  EXPECT_GT(long_plan.hours, short_plan.hours);
+  EXPECT_NEAR(long_plan.hours, 100.0 * 1400.0 / 60000.0 / 3600.0, 1e-12);
 }
 
 TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
