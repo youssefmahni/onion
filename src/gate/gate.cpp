@@ -57,11 +57,13 @@ std::string precheck_prompt(const NodeContext& ctx) {
 }
 
 std::string planner_prompt(const NodeContext& ctx,
-                           const std::string& injected_issues, bool light) {
+                           const std::string& injected_issues, bool light,
+                           int aspects_min, int aspects_max) {
   std::ostringstream out;
   // Fixed text first, node-specific text last (prompt-cache prefix).
   out << "Plan the knowledge coverage for this node: list "
-      << (light ? "2-3" : "4-8")
+      << (light ? "2-3" : (std::to_string(aspects_min) + "-" +
+                           std::to_string(aspects_max)))
       << " aspects. Every aspect must be a dimension OF THE NODE ITSELF "
          "(things it directly contains or decomposes into) — never related "
          "topics from other domains. Return JSON {\"items\": [ aspects ]}.\n";
@@ -75,16 +77,22 @@ std::string planner_prompt(const NodeContext& ctx,
 }
 
 std::string worker_prompt(const NodeContext& ctx, const std::string& aspect,
-                          const std::string& existing_joined) {
+                          const std::string& existing_joined,
+                          int candidates, bool compact) {
   std::ostringstream out;
   // Fixed text first, node-specific text last (prompt-cache prefix).
-  out << "List the top 100 child items of this node for this aspect in an "
+  out << "List the top " << candidates
+      << " child items of this node for this aspect in an "
          "AI-agent knowledge base. Every item MUST be a direct child of \""
       << ctx.title
       << "\" within its exact scope — do NOT include related topics, industry "
          "classifications, or the node itself. Title Case noun phrases, 2-5 "
          "words, no duplicates, no questions, no emoji. Return JSON "
-         "{\"items\": [ ... up to 100 ... ]}.\n"
+      << (compact ? "{\"titles\": [ ... up to " + std::to_string(candidates) +
+                        " ... ]}"
+                  : "{\"items\": [ ... up to " + std::to_string(candidates) +
+                        " ... ]}")
+      << ".\n"
       << "Aspect: " << aspect << "\n";
   if (!existing_joined.empty())
     out << "Existing children (do NOT repeat): " << existing_joined << "\n";
@@ -126,18 +134,27 @@ std::string critique_prompt(const NodeContext& ctx,
 
 std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
-                               const std::string& critique_text) {
+                               const std::string& critique_text,
+                               int max_children, bool compact) {
   std::ostringstream out;
   out << "From these candidates select the final children set for this node. "
          "Incorporate the critique: drop hallucinated or weak items, include "
          "the missing items you judge valid, resolve any conflicts. You "
-         "decide how many to keep (between 3 and 100). For each kept item "
-         "return {\"title\": \"...\", \"atomic\": true if it cannot be "
-         "decomposed into simpler items, false if it should nest further}. "
-         "Candidates:\n"
-      << join(candidates) << "\nCritique: " << critique_text
-      << "\nReturn JSON {\"items\": [ {\"title\": ..., \"atomic\": ...}, ... "
-         "]}.\n"
+         "decide how many to keep (between 3 and "
+      << max_children << "). ";
+  if (compact) {
+    out << "Return JSON {\"titles\": [ kept titles VERBATIM ], "
+           "\"atomic_indices\": [ 0-based indexes into titles for the items "
+           "that cannot be decomposed into simpler items ]}. ";
+  } else {
+    out << "For each kept item "
+           "return {\"title\": \"...\", \"atomic\": true if it cannot be "
+           "decomposed into simpler items, false if it should nest further}. ";
+  }
+  if (max_children < 100)
+    out << "Do not pad — keep only what the node genuinely contains. ";
+  out << "Candidates:\n"
+      << join(candidates) << "\nCritique: " << critique_text << "\n"
       << node_line(ctx);
   return out.str();
 }
@@ -153,11 +170,13 @@ std::string atomic_verification_prompt(const std::string& node_title,
 
 std::optional<std::vector<std::string>> parse_items(const std::string& body) {
   auto json = nlohmann::json::parse(body, nullptr, false);
-  if (json.is_discarded() || !json.is_object() || !json.contains("items") ||
-      !json["items"].is_array())
-    return std::nullopt;
+  if (json.is_discarded() || !json.is_object()) return std::nullopt;
+  const char* key = json.contains("items") ? "items"
+                    : json.contains("titles") ? "titles"
+                                              : nullptr;
+  if (key == nullptr || !json[key].is_array()) return std::nullopt;
   std::vector<std::string> items;
-  for (const auto& item : json["items"]) {
+  for (const auto& item : json[key]) {
     if (!item.is_string()) return std::nullopt;
     items.push_back(item.get<std::string>());
   }
@@ -166,21 +185,43 @@ std::optional<std::vector<std::string>> parse_items(const std::string& body) {
 
 std::optional<std::vector<Child>> parse_children(const std::string& body) {
   auto json = nlohmann::json::parse(body, nullptr, false);
-  if (json.is_discarded() || !json.is_object() || !json.contains("items") ||
-      !json["items"].is_array())
-    return std::nullopt;
-  std::vector<Child> children;
-  for (const auto& item : json["items"]) {
-    if (!item.is_object() || !item.contains("title") ||
-        !item["title"].is_string())
-      return std::nullopt;
-    Child child;
-    child.title = item["title"].get<std::string>();
-    child.atomic = item.contains("atomic") && item["atomic"].is_boolean() &&
-                   item["atomic"].get<bool>();
-    children.push_back(std::move(child));
+  if (json.is_discarded() || !json.is_object()) return std::nullopt;
+  if (json.contains("items") && json["items"].is_array()) {
+    std::vector<Child> children;
+    for (const auto& item : json["items"]) {
+      if (!item.is_object() || !item.contains("title") ||
+          !item["title"].is_string())
+        return std::nullopt;
+      Child child;
+      child.title = item["title"].get<std::string>();
+      child.atomic = item.contains("atomic") && item["atomic"].is_boolean() &&
+                     item["atomic"].get<bool>();
+      children.push_back(std::move(child));
+    }
+    return children;
   }
-  return children;
+  // Compact (V5): titles array + atomic_indices.
+  if (json.contains("titles") && json["titles"].is_array()) {
+    std::vector<Child> children;
+    for (const auto& title : json["titles"]) {
+      if (!title.is_string()) return std::nullopt;
+      Child child;
+      child.title = title.get<std::string>();
+      children.push_back(std::move(child));
+    }
+    if (json.contains("atomic_indices")) {
+      if (!json["atomic_indices"].is_array()) return std::nullopt;
+      for (const auto& index : json["atomic_indices"]) {
+        if (!index.is_number_integer()) return std::nullopt;
+        const auto i = index.get<std::int64_t>();
+        if (i < 0 || static_cast<std::size_t>(i) >= children.size())
+          return std::nullopt;
+        children[static_cast<std::size_t>(i)].atomic = true;
+      }
+    }
+    return children;
+  }
+  return std::nullopt;
 }
 
 std::optional<Critique> parse_critique(const std::string& body) {
@@ -222,12 +263,14 @@ bool Checks::passed() const {
   return count_ok && no_repeats && style_ok && ancestors_ok;
 }
 
-Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx) {
+Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
+                  int max_children) {
   Checks checks;
-  checks.count_ok = children.size() >= 3 && children.size() <= 100;
+  checks.count_ok = children.size() >= 3 &&
+                    children.size() <= static_cast<std::size_t>(max_children);
   if (!checks.count_ok)
     checks.failures.push_back("child count " + std::to_string(children.size()) +
-                              " outside 3..100");
+                              " outside 3.." + std::to_string(max_children));
 
   std::set<std::string> seen;
   seen.insert(depot::canonical(ctx.title));
@@ -345,7 +388,10 @@ llm::Request make_request(const FunnelOptions& options, const NodeContext&,
   llm::Request request;
   request.model = options.model;
   request.system = system_prompt();
-  request.user = std::move(user);
+  if (!options.cache_prefix.empty())
+    request.user = options.cache_prefix + "\n" + user;
+  else
+    request.user = std::move(user);
   request.max_tokens = max_tokens_override ? max_tokens_override
                                            : options.max_tokens;
   request.temperature = temperature;
@@ -464,7 +510,9 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     {
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          planner_prompt(ctx, injected_issues, impl_->options.light),
+          planner_prompt(ctx, injected_issues, impl_->options.light,
+                         impl_->options.aspects_min,
+                         impl_->options.aspects_max),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -474,7 +522,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         if (!parsed) failed = true;
         else {
           aspects = std::move(*parsed);
-          const std::size_t cap = impl_->options.light ? 3 : 8;
+          const std::size_t cap =
+              impl_->options.light ? 3
+                                   : static_cast<std::size_t>(
+                                         impl_->options.aspects_max);
           if (aspects.size() > cap) aspects.resize(cap);
         }
       }
@@ -489,7 +540,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       for (const std::string& aspect : aspects) {
         const llm::Result reply = counted(make_request(
             impl_->options, ctx,
-            worker_prompt(ctx, aspect, existing_joined), temperature));
+            worker_prompt(ctx, aspect, existing_joined,
+                          impl_->options.worker_candidates,
+                          impl_->options.compact_output),
+            temperature));
         meter.add(reply);
         if (!result_ok(reply)) {
           failed = true;
@@ -531,7 +585,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     auto trim_round = [&](int keep) {
       if (failed || candidates.size() <= static_cast<std::size_t>(keep)) return;
       const llm::Result reply = counted(make_request(
-          impl_->options, ctx, trimmer_prompt(ctx, candidates, keep),
+          impl_->options, ctx,
+          trimmer_prompt(ctx, candidates, keep),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -547,19 +602,23 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       if (candidates.size() > static_cast<std::size_t>(keep))
         candidates.resize(keep);
     };
+    const std::vector<int>& trims = impl_->options.trim_keeps;
+    const int max_trim_failures =
+        static_cast<int>(impl_->options.light ? 1 : trims.size());
     if (impl_->options.light) {
-      trim_round(300);
+      if (!trims.empty()) trim_round(trims.back());
     } else {
-      trim_round(400);
-      trim_round(300);
+      for (const int keep : trims) trim_round(keep);
     }
-    if (trim_failures >= (impl_->options.light ? 1 : 2)) failed = true;
+    if (trim_failures >= max_trim_failures) failed = true;
 
     // Critique.
     Critique critique;
     if (!failed) {
       const llm::Result reply = counted(make_request(
-          impl_->options, ctx, critique_prompt(ctx, candidates), temperature));
+          impl_->options, ctx,
+          critique_prompt(ctx, candidates),
+          temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
         failed = true;
@@ -589,7 +648,9 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
 
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          synthesizer_prompt(ctx, candidates, critique_text.str()),
+          synthesizer_prompt(ctx, candidates, critique_text.str(),
+                             impl_->options.synth_max_children,
+                             impl_->options.compact_output),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -605,7 +666,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     attempt.children = children;
     attempt.issues = critique.issues.substr(0, 1000);
     if (!failed && !children.empty()) {
-      const Checks checks = run_checks(children, ctx);
+      const Checks checks =
+          run_checks(children, ctx, impl_->options.synth_max_children);
       attempt.checks_passed = checks.passed();
       attempt.score = critique.score;
     } else {

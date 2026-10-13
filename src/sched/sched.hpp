@@ -35,6 +35,16 @@ struct CampaignSpec {
   std::string model{"deepseek-flash"};
   std::string critic_model;               // empty = same as model
   bool auto_accept{false};                // M3: parsed, not acted on
+  // W5 funnel variants (absent = the FunnelOptions default): V1 workers'
+  // candidates per aspect, V2 planner aspect range, V3 trim rounds, V4
+  // synthesizer max children, V5 compact output, V6 shared cache prefix.
+  std::optional<int> worker_candidates;
+  std::optional<int> aspects_min;
+  std::optional<int> aspects_max;
+  std::optional<std::vector<int>> trim_keeps;
+  std::optional<int> synth_max_children;
+  bool compact_output{false};
+  bool cache_prefix{false};
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
@@ -143,6 +153,7 @@ struct CampaignPlan {
   double cost_peak{};
   double cost_offpeak{};
   double hours{};
+  bool saturated{false};  // int64 clamped at some level
   double spend_per_hour_peak{};
   double spend_per_hour_offpeak{};
 };
