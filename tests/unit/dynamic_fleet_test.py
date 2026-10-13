@@ -253,6 +253,10 @@ def main():
             except subprocess.TimeoutExpired:
                 node.kill()
         nodes.clear()
+        if platform.system() == "Windows":
+            # Windows releases file handles a beat after process exit;
+            # the next scenario's node needs the files to be free.
+            time.sleep(10.0)
 
         # ---------------------------------------------------------------
         # Scenario B: kill node 2 mid-run; the committed work survives and
@@ -312,6 +316,10 @@ def main():
             except subprocess.TimeoutExpired:
                 node.kill()
         nodes.clear()
+        if platform.system() == "Windows":
+            # Windows releases file handles a beat after process exit;
+            # the next scenario's node needs the files to be free.
+            time.sleep(10.0)
 
         # ---------------------------------------------------------------
         # Scenario D: a 2-and-2 split moves nothing. Nodes 1+2 refuse to
@@ -360,6 +368,10 @@ def main():
             except subprocess.TimeoutExpired:
                 node.kill()
         nodes.clear()
+        if platform.system() == "Windows":
+            # Windows releases file handles a beat after process exit;
+            # the next scenario's node needs the files to be free.
+            time.sleep(10.0)
 
         # ---------------------------------------------------------------
         # Scenario E: a lone eviction signature is rejected by the fold.
