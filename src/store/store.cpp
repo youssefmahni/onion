@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS critiques (path TEXT, score TEXT, issues TEXT, remove
 CREATE TABLE IF NOT EXISTS reviews   (path TEXT PRIMARY KEY, reason TEXT, state TEXT, note TEXT, hlc INT, origin TEXT);
 CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, spec TEXT, state TEXT, hlc INT, origin TEXT);
 CREATE TABLE IF NOT EXISTS members   (device_id TEXT PRIMARY KEY, pubkey BLOB, slot INT, state TEXT, incarnation INT,
+                         sync_url TEXT, swim_url TEXT,
                         profile_version INT, evict_cutoff INT);
 CREATE TABLE IF NOT EXISTS profiles  (device_id TEXT, version INT, prev TEXT, reason TEXT, changed TEXT,
                         spec TEXT, rules_version INT, schema INT, hlc INT,
@@ -247,6 +248,12 @@ bool Db::open(std::string* error) {
       return false;
     }
   }
+  // M7: the members table gains the address columns (ALTER is a no-op
+  // when they already exist; the error is ignorable).
+  sqlite3_exec(handle_,
+               "ALTER TABLE members ADD COLUMN sync_url TEXT; "
+               "ALTER TABLE members ADD COLUMN swim_url TEXT;",
+               nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
         "INSERT INTO schema_version(version) SELECT ? WHERE NOT EXISTS "

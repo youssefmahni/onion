@@ -1078,6 +1078,19 @@ int node_cmd(int argc, char** argv) {
   std::cout << "node listening on 127.0.0.1:" << server.bound_port()
             << " data=" << dir << "\n";
 
+  // M7: the device's reachable addresses, written once per run into the
+  // log (the deterministic discovery channel — gossip refreshes between
+  // runs).
+  if (!lane_members.empty()) {
+    writer->submit(onion::state::CommitTerminal{{make_record(
+        "MEMBER_ADDR",
+        {{"device_id", device_key->device_id},
+         {"sync", self_host + ":" +
+                      std::to_string(sync_server ? sync_server->bound_port()
+                                                 : self_sync_port)},
+         {"swim", self_host + ":" + std::to_string(bound_swim_port)}})}});
+    writer->sync();
+  }
   // --port-file: the real bound ports (port 0 = ephemeral), so tests and
   // orchestration never guess or hard-code ports.
   const std::string port_file = flag(argc, argv, "--port-file", "");
@@ -1342,8 +1355,19 @@ if (!members_path.empty()) reload_members();
         seeded.address = swim_url;
         swim->mutable_membership().upsert(std::move(seeded));
       }
-      // The fleet's sync addresses travel in gossip: member_urls stays
-      // current for every member, joined devices included.
+      // The fleet's sync addresses travel in gossip AND in the durable
+      // members table (MEMBER_ADDR records): the table is the
+      // deterministic fallback, so joined devices are reachable even
+      // when the gossip channel is blocked.
+      for (const auto& row : writer->members_table()) {
+        if (row.device_id == device_key->device_id) continue;
+        if (!row.sync_url.empty() &&
+            member_urls[row.device_id] != row.sync_url)
+          member_urls[row.device_id] = row.sync_url;
+        if (!row.swim_url.empty() &&
+            member_swim_urls[row.device_id] != row.swim_url)
+          member_swim_urls[row.device_id] = row.swim_url;
+      }
       for (const auto& member : swim->membership().list()) {
         if (member.device_id == device_key->device_id) continue;
         if (member.capabilities.is_object() &&

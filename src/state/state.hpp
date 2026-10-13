@@ -153,8 +153,13 @@ class StateWriter {
     std::string pubkey_hex;
     std::int64_t slot{};
     std::string state;
+    std::string sync_url;
+    std::string swim_url;
   };
   std::vector<MemberRow> members_table() const;
+  // M7: a member's sync (TCP) address from the durable table, if known.
+  std::optional<std::string> member_sync_url(std::string_view device_id) const;
+  std::optional<std::string> member_swim_url(std::string_view device_id) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;

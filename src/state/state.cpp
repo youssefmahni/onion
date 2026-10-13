@@ -668,6 +668,27 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       std::string step_error;
       statement->step(&step_error);
     }
+  } else if (type == "MEMBER_ADDR") {
+    // M7: a device's reachable addresses, written once per run. The log
+    // is the deterministic channel (gossip refreshes between runs).
+    const std::string device_id =
+        record.payload.value("device_id", std::string{});
+    if (device_id.empty() || device_id != origin) return;
+    const std::string sync_url =
+        record.payload.value("sync", std::string{});
+    const std::string swim_url =
+        record.payload.value("swim", std::string{});
+    auto statement = db_.prepare(
+        "UPDATE members SET sync_url=?2, swim_url=?3 WHERE device_id=?1;",
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      statement->bind(2, sync_url, &bind_error);
+      statement->bind(3, swim_url, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
   } else if (type == "MEMBER_ADD") {
     // M7 joining (DESIGN › Joining): the inviter's admission record. The
     // identity is DERIVED from the public key (never trusted from the
@@ -1165,7 +1186,8 @@ std::vector<StateWriter::MemberRow> StateWriter::members_table() const {
   std::vector<MemberRow> rows;
   std::string error;
   auto statement = db_.prepare(
-      "SELECT device_id, pubkey, slot, state FROM members ORDER BY device_id;",
+      "SELECT device_id, pubkey, slot, state, sync_url, swim_url "
+      "FROM members ORDER BY device_id;",
       &error);
   if (!statement) return rows;
   std::string step_error;
@@ -1178,9 +1200,40 @@ std::vector<StateWriter::MemberRow> StateWriter::members_table() const {
       hex.push_back(digits[byte & 0xf]);
     }
     rows.push_back(MemberRow{statement->text(0), hex,
-                             statement->integer(2), statement->text(3)});
+                             statement->integer(2), statement->text(3),
+                             statement->text(4), statement->text(5)});
   }
   return rows;
+}
+
+std::optional<std::string> StateWriter::member_sync_url(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT sync_url FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string url = statement->text(0);
+  if (url.empty()) return std::nullopt;
+  return url;
+}
+
+std::optional<std::string> StateWriter::member_swim_url(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT swim_url FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string url = statement->text(0);
+  if (url.empty()) return std::nullopt;
+  return url;
 }
 
 bool StateWriter::member_slot_collides(std::int64_t slot,
