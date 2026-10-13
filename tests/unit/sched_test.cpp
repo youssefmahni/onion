@@ -48,6 +48,62 @@ TEST(ParseCampaign, AcceptsAValidFile) {
   EXPECT_EQ(spec->chunk, 50);
 }
 
+TEST(ParseCampaign, AcceptsTheW5VariantFields) {
+  std::string error;
+  const auto spec = parse_campaign(json{
+      {"id", "v1"},
+      {"worker_candidates", 40},
+      {"aspects_min", 3},
+      {"aspects_max", 5},
+      {"trim_keeps", json::array({300, 150})},
+      {"synth_max_children", 40},
+      {"compact_output", true},
+      {"cache_prefix", true},
+  }, &error);
+  ASSERT_TRUE(spec.has_value()) << error;
+  EXPECT_EQ(*spec->worker_candidates, 40);
+  EXPECT_EQ(*spec->aspects_min, 3);
+  EXPECT_EQ(*spec->aspects_max, 5);
+  ASSERT_TRUE(spec->trim_keeps.has_value());
+  EXPECT_EQ(*spec->trim_keeps, (std::vector<int>{300, 150}));
+  EXPECT_EQ(*spec->synth_max_children, 40);
+  EXPECT_TRUE(spec->compact_output);
+  EXPECT_TRUE(spec->cache_prefix);
+
+  // Absent fields stay absent (the engine keeps the FunnelOptions default).
+  const auto plain = parse_campaign(json{{"id", "p"}}, &error);
+  ASSERT_TRUE(plain.has_value());
+  EXPECT_FALSE(plain->worker_candidates.has_value());
+  EXPECT_FALSE(plain->aspects_min.has_value());
+  EXPECT_FALSE(plain->trim_keeps.has_value());
+  EXPECT_FALSE(plain->compact_output);
+}
+
+TEST(ParseCampaign, RejectsInvalidVariantFields) {
+  std::string error;
+  EXPECT_FALSE(parse_campaign(json{{"id", "c"}, {"worker_candidates", 0}},
+                              &error)
+                   .has_value());
+  EXPECT_FALSE(parse_campaign(json{{"id", "c"}, {"worker_candidates", 501}},
+                              &error)
+                   .has_value());
+  EXPECT_FALSE(parse_campaign(
+                   json{{"id", "c"}, {"aspects_min", 6}, {"aspects_max", 5}},
+                   &error)
+                   .has_value());
+  EXPECT_FALSE(parse_campaign(json{{"id", "c"}, {"trim_keeps", 300}}, &error)
+                   .has_value());
+  EXPECT_FALSE(
+      parse_campaign(json{{"id", "c"}, {"trim_keeps", json::array()}}, &error)
+          .has_value());
+  EXPECT_FALSE(parse_campaign(
+                   json{{"id", "c"}, {"synth_max_children", 101}}, &error)
+                   .has_value());
+  EXPECT_FALSE(parse_campaign(
+                   json{{"id", "c"}, {"synth_max_children", 2}}, &error)
+                   .has_value());
+}
+
 TEST(ParseCampaign, RejectsInvalidFiles) {
   std::string error;
   EXPECT_FALSE(parse_campaign(json{{"no_id", 1}}, &error).has_value());
