@@ -29,7 +29,7 @@ struct CampaignSpec {
   int max_attempts{3};
   double floor{0.5};
   std::int64_t chunk{50};                 // RESERVE chunk size
-  int light_funnel_from{8};
+  int light_funnel_from{6};  // decision 0017: light funnel from L6
   bool structure{false};                  // L1..L3 expansion allowed (M3: no)
   bool spillover{true};  // M7: steal from budget-empty lanes when true
   std::string model{"deepseek-flash"};
@@ -44,7 +44,7 @@ struct CampaignSpec {
   std::optional<std::vector<int>> trim_keeps;
   std::optional<int> synth_max_children;
   bool compact_output{false};
-  bool cache_prefix{false};
+  bool cache_prefix{true};   // decision 0017: shared prompt prefix on by default
   bool verify_atomic{false};              // DESIGN atomic check (M3: opt-in)
 };
 

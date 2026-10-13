@@ -47,10 +47,10 @@ std::string system_prompt();
 // ≤ 400 tokens: does the node split into at least 3 distinct parts?
 std::string precheck_prompt(const NodeContext& ctx);
 std::string planner_prompt(const NodeContext& ctx, const std::string& injected_issues,
-                           bool light, int aspects_min = 4, int aspects_max = 8);
+                           bool light, int aspects_min = 3, int aspects_max = 5);
 std::string worker_prompt(const NodeContext& ctx, const std::string& aspect,
                           const std::string& existing_joined,
-                          int candidates = 100, bool compact = false);
+                          int candidates = 40, bool compact = false);
 std::string trimmer_prompt(const NodeContext& ctx,
                            const std::vector<std::string>& candidates, int keep);
 std::string critique_prompt(const NodeContext& ctx,
@@ -58,7 +58,8 @@ std::string critique_prompt(const NodeContext& ctx,
 std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
                                const std::string& critique_text,
-                               int max_children = 100, bool compact = false);
+                               int target_min = 8, int target_max = 20,
+                               int max_children = 30, bool compact = false);
 // The short separate call that confirms a child labelled atomic is a leaf.
 std::string atomic_verification_prompt(const std::string& node_title,
                                        const std::string& child_title);
@@ -125,13 +126,19 @@ struct FunnelOptions {
   double temperatures[3]{0.0, 0.3, 0.5};
   int max_tokens{6000};
   std::string model{"deepseek-flash"};
-  // W5 variant knobs (FUNNEL_OPT experiments; defaults are the baseline).
-  int worker_candidates{100};        // V1: per-aspect candidates in the worker prompt
-  int aspects_min{4};                // V2: planner aspect range (non-light)
-  int aspects_max{8};
-  std::vector<int> trim_keeps{400, 300};  // V3: full funnel trims in order;
-                                          // light runs the last one once
-  int synth_max_children{100};       // V4: synthesizer's 3..N range, no padding
+  // Funnel configuration (decision 0017, accepted in principle): the
+  // defaults ARE the recommended W5 configuration — V1 workers at 40,
+  // V2 aspects 3-5, V3 a single trim to 150, the V6 cache prefix on, and
+  // the synthesizer targets 8-20 children with a hard maximum of 30 and
+  // no padding.  Campaign-spec fields override any of them.
+  int worker_candidates{40};         // V1: per-aspect candidates in the worker prompt
+  int aspects_min{3};                // V2: planner aspect range (non-light)
+  int aspects_max{5};
+  std::vector<int> trim_keeps{150};  // V3: full funnel trims in order;
+                                     // light runs the last one once
+  int synth_max_children{30};        // hard maximum (owner: 30, no padding)
+  int synth_target_min{8};           // the range the prompt asks the model to keep
+  int synth_target_max{20};
   bool compact_output{false};        // V5: titles array + atomic index list
   std::string cache_prefix;          // V6: shared fixed block prepended to
                                      // every prompt (cache-hit prefix)

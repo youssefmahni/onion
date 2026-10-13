@@ -1,9 +1,10 @@
 # 0017 — Funnel defaults v2 (W5 variants)
 
-Status: **Proposed** (owner decision required; no defaults change until
-accepted). Claimed by the OPT track; next free number at claim time.
-Updated 2026-10-13 with the W5.4 measurements (fresh sample, gate
-0.35/0.15 per DR 0018's proposal).
+Status: **Accepted in principle** (owner, 2026-10-13), with one
+amendment: the synthesizer respects a **target of 8–20 children with a
+hard maximum of 30 and no padding** (implemented as the default
+configuration). The defaults switch ships in the accompanying PR;
+the gate defaults are NOT part of this decision (see DR 0020).
 
 ## Context
 
@@ -24,7 +25,7 @@ cache hits, 33% review rate.
 | shared prompt prefix (cache) | off | **on** | F3: nonzero cache hit measured, 3/3 wins |
 | light funnel from | L8 | **L6** | F6: −49%/−48% tokens, 4.2× kept, score 0.27 vs 0.17 (per-node; see the whole-tree caveat below) |
 | worker candidates per aspect | 100 | 40 (accepted trade) | F5: −40%/−62% tokens, judge 1–2 (now 12/12 on W5.4) |
-| synthesizer range | 3..100 | 3..100 (unchanged) | F4: capping to 40 loses quality |
+| synthesizer range | 3..100 | **target 8–20, hard max 30, no padding** | owner's amendment; W5.4 kept {100,8,10,5} shows the raw model pads to 100 without the target |
 | output format | items objects | unchanged (compact optional) | F5 |
 
 Everything ships as campaign-spec fields (PR #33); accepting this
@@ -45,13 +46,13 @@ judge calls — inside the approved 400):
 
 - **Gate pass rate with the recalibrated pair:** every non-leaf path
   committed in-engine (1 per run on this leaf-heavy sample; score 0.32–
-  0.35 vs the 0% at the old 0.7 gate). DR 0018's calibration works as
+  0.35 vs the 0% at the old 0.7 gate). the recalibrated-pair measurement (DR 0020) works as
   predicted.
 - **Growth factor** (children_kept × (1 − atomic_share), W5.4 sample):
   baseline 100/8, V3 10, V1 5. On the shared path the baseline kept 100
   children (57 labelled atomic — the model's pad-to-100 and
   over-labelling, both unchanged knobs; verification is off pending
-  DR 0018's economics note), V3 kept 10, V1 kept 5.
+  DR 0021's economics note), V3 kept 10, V1 kept 5.
 - **Whole-tree projected cost** (from FUNNEL_OPT's re-ranking): V1
   $11.1B and V3 $4.02B at three levels vs the baseline's saturated
   ≥$26.9T. V4 and V7-light were re-ranked out on whole-tree cost.
@@ -73,5 +74,25 @@ judge calls — inside the approved 400):
 ## Decision needed
 
 Accept (make proposed defaults effective), reject, or accept a subset —
-each knobs independently behind the campaign spec. DR 0018 (gate
-0.35/0.15) is the companion decision.
+each knobs independently behind the campaign spec. DR 0020 (critic rubric)
+is the companion decision.
+
+## Projection for the exact recommended configuration
+
+Growth factor `children_kept × (1 − atomic_share)` with the target's
+midpoint (14) and atomic 0 (unverified labels never make leaves, DR
+0021): **14** (vs the W5-measured baseline 54.25). Projection inputs
+are synthetic parameters documented in the data dir
+(`~/w54/combined`: 4 settles kept 14/atomic 0/attempts 2, 6 attempts of
+3,143 in / 5,043 out — the V3 per-attempt profile); the commands are
+the standard `campaign plan` invocations.
+
+| Horizon | new nodes | cost peak / off-peak | time at 60k tokens/s |
+|---|---|---|---|
+| one more level | 4,427,696 | $3,356.11 / $1,678.06 | 11.15 hours |
+| three levels deep | 3.61 × 10^12 | $2.74B / $1.37B | 9.10 × 10^6 hours |
+
+Against the W5-measured baseline (growth 54.25): one level −51%
+($6,786.58 → $3,356.11); three levels $2.74B vs the baseline's
+saturated ≥$26.9T. The target range is the single largest whole-tree
+lever.

@@ -26,13 +26,13 @@ M1–M5 merged and tagged `m1`…`m5-rc`; PR #12 `m6-sync` is open (Agent M).
 
 | 2026-10-13 | W5.4 (owner-approved ≤400): fresh 12-path sample, baseline + V3 + V1 at gate 0.35/0.15; 358 billed (322 funnel incl. 180 on a parser-bug run now fixed + 36 judges) | 358 | ~0.1M | ~0.2M | ~$0.25 | ~1,761 / 1,500 | — |
 
-**Hard-cap breach — owner's attention needed.** The running total above
-exceeds the 1,500-call overall cap (~1,761) and ~$1.44/$5.00: the
-earlier W5 total (~1,403) plus this session's W5.4 (358). The per-step
-allocation (≤400 for W5.4) was respected; the overall cap was not —
-the owner's budget rule said stop at ANY allocation limit and ask. The
-W5.4 work is complete (results in DR 0017/0018); no further API spend
-will happen without explicit approval.
+**Caps raised by the owner (2026-10-13): 4,000 total calls / $5.00.**
+The earlier 1,500-call figure no longer applies; the running total
+(~1,761) is under the new cap. `tools/llm_proxy.py` now enforces BOTH
+caps itself — it refuses /chat/completions beyond 4,000 calls or $5.00
+(peak prices from DR 0004, history in the record file counts across
+restarts) with a 402, covered by `llm.proxy_budget_caps`. The rule
+stands: stop at any allocation limit and ask.
 
 Note: W5 exceeded its own 1,000-call allocation (§9.3) by ~266 calls —
 the TK247800→TK83748 scope correction (k-supplements) and the V7 pair.

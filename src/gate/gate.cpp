@@ -136,13 +136,16 @@ std::string critique_prompt(const NodeContext& ctx,
 std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
                                const std::string& critique_text,
+                               int target_min, int target_max,
                                int max_children, bool compact) {
   std::ostringstream out;
   out << "From these candidates select the final children set for this node. "
          "Incorporate the critique: drop hallucinated or weak items, include "
-         "the missing items you judge valid, resolve any conflicts. You "
-         "decide how many to keep (between 3 and "
-      << max_children << "). ";
+         "the missing items you judge valid, resolve any conflicts. Keep "
+         "between "
+      << target_min << " and " << target_max
+      << " children (never more than " << max_children
+      << "). Do not pad — keep only what the node genuinely contains. ";
   if (compact) {
     out << "Return JSON {\"titles\": [ kept titles VERBATIM ], "
            "\"atomic_indices\": [ 0-based indexes into titles for the items "
@@ -152,8 +155,6 @@ std::string synthesizer_prompt(const NodeContext& ctx,
            "return {\"title\": \"...\", \"atomic\": true if it cannot be "
            "decomposed into simpler items, false if it should nest further}. ";
   }
-  if (max_children < 100)
-    out << "Do not pad — keep only what the node genuinely contains. ";
   out << "Candidates:\n"
       << join(candidates) << "\nCritique: " << critique_text << "\n"
       << node_line(ctx);
@@ -663,6 +664,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
           synthesizer_prompt(ctx, candidates, critique_text.str(),
+                             impl_->options.synth_target_min,
+                             impl_->options.synth_target_max,
                              impl_->options.synth_max_children,
                              impl_->options.compact_output),
           temperature));

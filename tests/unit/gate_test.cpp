@@ -284,18 +284,34 @@ TEST(GatePrompts, VariantKnobsReachThePromptText) {
   const std::string v2 = planner_prompt(ctx(), "", false, 3, 5);
   EXPECT_NE(v2.find("3-5"), std::string::npos);
 
+  // V4: the synthesizer range (target 8-20, hard max 30, no padding)
+  // is now the default configuration (decision 0017).
   const std::string v4 =
-      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 40, false);
-  EXPECT_NE(v4.find("between 3 and 40"), std::string::npos);
-  // V4 removes the padding hint: the model must not pad up.
+      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 8, 20, 30, false);
+  EXPECT_NE(v4.find("between 8 and 20"), std::string::npos);
+  EXPECT_NE(v4.find("never more than 30"), std::string::npos);
   EXPECT_NE(v4.find("Do not pad"), std::string::npos);
 
   // Compact output (V5) switches the worker and synthesizer formats.
   const std::string v5w = worker_prompt(ctx(), "Aspect", "", 100, true);
   EXPECT_NE(v5w.find("\"titles\""), std::string::npos);
   const std::string v5s =
-      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 100, true);
+      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 8, 20, 30, true);
   EXPECT_NE(v5s.find("atomic_indices"), std::string::npos);
+}
+
+TEST(GatePrompts, Decision0017DefaultsReachThePromptText) {
+  // The accepted defaults: workers ask for 40 candidates, the planner
+  // asks for 3-5 aspects, the synthesizer targets 8-20 with a hard
+  // maximum of 30 and no padding.
+  EXPECT_NE(worker_prompt(ctx(), "Aspect", "").find("top 40"),
+            std::string::npos);
+  EXPECT_NE(planner_prompt(ctx(), "", false).find("3-5"),
+            std::string::npos);
+  const std::string synth = synthesizer_prompt(ctx(), {"A", "B"}, "crit");
+  EXPECT_NE(synth.find("between 8 and 20"), std::string::npos);
+  EXPECT_NE(synth.find("never more than 30"), std::string::npos);
+  EXPECT_NE(synth.find("Do not pad"), std::string::npos);
 }
 
 TEST(GateParsers, CompactOutputParses) {

@@ -87,9 +87,9 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   }
   if (value.contains("aspects_min") || value.contains("aspects_max")) {
     const std::int64_t min =
-        value.value("aspects_min", std::int64_t{4});
+        value.value("aspects_min", std::int64_t{3});
     const std::int64_t max =
-        value.value("aspects_max", std::int64_t{8});
+        value.value("aspects_max", std::int64_t{5});
     if (min < 2 || max < min || max > 20)
       return fail("aspects range invalid (2 <= min <= max <= 20)");
     spec.aspects_min = static_cast<int>(min);
@@ -118,7 +118,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
     spec.synth_max_children = static_cast<int>(v);
   }
   spec.compact_output = value.value("compact_output", false);
-  spec.cache_prefix = value.value("cache_prefix", false);
+  spec.cache_prefix = value.value("cache_prefix", true);
   spec.verify_atomic = value.value("verify_atomic", false);
   if (spec.loop_budget < 1) return fail("loop_budget must be positive");
   if (spec.chunk < 1) return fail("chunk must be positive");
@@ -858,8 +858,15 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         }
         result.settled++;
         result.atomic += atomic;
-        settled_samples.push_back(SettledSample{atomic > 0 ? 1 : 0,
-                                                chosen.score});
+        // DESIGN › Quality gate: a child labelled atomic is a leaf only
+        // after the separate verification agrees; unverified labels must
+        // not make leaves.  The stop rule's atomic clause is the one
+        // mechanism that would let them — only VERIFIED labels count
+        // toward it (verify_atomic is off by default in M3, so the
+        // model's raw labels score 0 here; DR 0021 covers batching).
+        settled_samples.push_back(SettledSample{
+            (funnel_options.verify_atomic && atomic > 0) ? 1 : 0,
+            chosen.score});
         break;
       }
       case gate::Decision::NeedsReview: {
