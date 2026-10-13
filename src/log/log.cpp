@@ -596,8 +596,30 @@ Verify verify(const Batch& batch, const VerifyContext& context) {
   if (public_key.size() != 32) return Verify::BadSig;
   if (crypto_ed25519_check(signature.data(), public_key.data(),
                            reinterpret_cast<const std::uint8_t*>(signed_bytes.data()),
-                           signed_bytes.size()) != 0)
+                           signed_bytes.size()) != 0) {
+    if (std::getenv("ONION_SYNC_DEBUG")) {
+      // Diagnosis aid: the exact hash and signed bytes, so a platform
+      // difference is visible byte-for-byte.
+      std::fprintf(stderr,
+                   "[batch-verify] BADSIG origin=%s n=%llu prev=%s\n"
+                   "  computed-hash=%s stored-hash=%s signed-bytes-hex=%s\n",
+                   batch.origin.c_str(),
+                   static_cast<unsigned long long>(batch.number),
+                   batch.prev.c_str(), hash_records_hex(batch.records).c_str(),
+                   batch.hash.c_str(),
+                   [&]() {
+                     static const char* digits = "0123456789abcdef";
+                     std::string hex;
+                     for (const unsigned char byte : signed_bytes) {
+                       hex.push_back(digits[byte >> 4]);
+                       hex.push_back(digits[byte & 0xf]);
+                     }
+                     return hex;
+                   }()
+                       .c_str());
+    }
     return Verify::BadSig;
+  }
   return Verify::Ok;
 }
 
