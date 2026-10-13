@@ -1,6 +1,7 @@
 #include "store.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -45,7 +46,7 @@ CREATE TABLE IF NOT EXISTS settles   (path TEXT PRIMARY KEY, kept INT, atomic IN
 CREATE TABLE IF NOT EXISTS attempts  (path TEXT, n INT, score TEXT, passed INT, tokens_in INT, tokens_cached INT,
                         tokens_out INT, cost TEXT, campaign TEXT, hlc INT, origin TEXT);
 CREATE TABLE IF NOT EXISTS critiques (path TEXT, score TEXT, issues TEXT, remove TEXT, add_ TEXT, hlc INT, origin TEXT);
-CREATE TABLE IF NOT EXISTS reviews   (path TEXT PRIMARY KEY, reason TEXT, state TEXT, note TEXT, hlc INT, origin TEXT);
+CREATE TABLE IF NOT EXISTS reviews   (path TEXT PRIMARY KEY, reason TEXT, state TEXT, note TEXT, atomic INT NOT NULL DEFAULT 0, hlc INT, origin TEXT);
 CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, spec TEXT, state TEXT, hlc INT, origin TEXT);
 CREATE TABLE IF NOT EXISTS members   (device_id TEXT PRIMARY KEY, pubkey BLOB, slot INT, state TEXT, incarnation INT,
                          sync_url TEXT, swim_url TEXT,
@@ -248,6 +249,25 @@ bool Db::open(std::string* error) {
       return false;
     }
   }
+  // Migration: reviews.atomic arrived with the W5 gate calibration.  It
+  // runs after the newer-schema refusal so an unknown-newer database is
+  // never mutated.  "duplicate column name" means the database already
+  // has the column — everything else is a real failure.
+  {
+    char* errmsg = nullptr;
+    if (sqlite3_exec(handle_,
+                     "ALTER TABLE reviews ADD COLUMN atomic INT NOT NULL "
+                     "DEFAULT 0;",
+                     nullptr, nullptr, &errmsg) != SQLITE_OK) {
+      const bool duplicate =
+          errmsg != nullptr && strstr(errmsg, "duplicate column") != nullptr;
+      sqlite3_free(errmsg);
+      if (!duplicate) {
+        set_error(error, handle_, "cannot migrate reviews.atomic");
+        return false;
+      }
+    }
+  }
   // M7: the members table gains the address columns (ALTER is a no-op
   // when they already exist; the error is ignorable).
   sqlite3_exec(handle_,
@@ -407,7 +427,8 @@ std::vector<Node> Db::nodes_with_path_prefix(std::string_view prefix,
 
 std::vector<Review> Db::open_reviews(std::string* error) const {
   std::optional<Statement> stmt = prepare(
-      "SELECT path, reason, state, note, hlc, origin FROM reviews ORDER BY path;",
+      "SELECT path, reason, state, note, atomic, hlc, origin FROM reviews "
+      "ORDER BY path;",
       error);
   if (!stmt) return {};
   std::string step_error;
@@ -418,8 +439,9 @@ std::vector<Review> Db::open_reviews(std::string* error) const {
     review.reason = stmt->text(1);
     review.state = stmt->text(2);
     review.note = stmt->text(3);
-    review.hlc = static_cast<std::uint64_t>(stmt->integer(4));
-    review.origin = stmt->text(5);
+    review.atomic = stmt->integer_int(4);
+    review.hlc = static_cast<std::uint64_t>(stmt->integer(5));
+    review.origin = stmt->text(6);
     reviews.push_back(std::move(review));
   }
   if (!step_error.empty()) set_error(error, handle_, "review query failed");

@@ -70,6 +70,7 @@ struct Review {
   std::string reason;
   std::string state;  // open | decided
   std::string note;
+  int atomic{};  // atomic children stored with the review (W5)
   std::uint64_t hlc{};
   std::string origin;
 };

@@ -104,6 +104,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   }
   spec.compact_output = value.value("compact_output", false);
   spec.cache_prefix = value.value("cache_prefix", false);
+  spec.verify_atomic = value.value("verify_atomic", false);
   if (spec.loop_budget < 1) return fail("loop_budget must be positive");
   if (spec.chunk < 1) return fail("chunk must be positive");
   return spec;
@@ -367,6 +368,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       spec_json["synth_max_children"] = *spec.synth_max_children;
     if (spec.compact_output) spec_json["compact_output"] = true;
     if (spec.cache_prefix) spec_json["cache_prefix"] = true;
+    if (spec.verify_atomic) spec_json["verify_atomic"] = true;
     writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", std::move(spec_json)},
@@ -389,6 +391,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   if (spec.synth_max_children)
     funnel_options.synth_max_children = *spec.synth_max_children;
   funnel_options.compact_output = spec.compact_output;
+  funnel_options.verify_atomic = spec.verify_atomic;
   if (spec.cache_prefix)
     funnel_options.cache_prefix =
         // Shared fixed block (~120 tokens): identical for every funnel
@@ -820,9 +823,12 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       case gate::Decision::NeedsReview: {
         const auto& chosen = funnel_result.attempts[funnel_result.chosen];
         // Children are stored with the review so accept can settle without
-        // spending more (decision 0008).
+        // spending more (decision 0008).  Atomic labels survive too: the
+        // ATOMIC records mirror the Commit branch and the NEEDS_REVIEW
+        // payload carries the count so accept can settle it faithfully.
         std::vector<log::Record> records;
         std::vector<std::string> new_ids;
+        int review_atomic = 0;
         for (const gate::Child& child : chosen.children) {
           const std::string id = node_ids_->allocate();
           new_ids.push_back(id);
@@ -830,6 +836,12 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
               "ADD_NODE", {{"path", ticket.path + "-" + id},
                            {"layer", ticket.layer + 1},
                            {"title", child.title}}));
+          if (child.atomic) {
+            ++review_atomic;
+            records.push_back(make_record(
+                "ATOMIC", {{"path", ticket.path + "-" + id},
+                           {"verified", true}}));
+          }
         }
         records.push_back(make_record(
             "CRITIQUE", {{"path", ticket.path},
@@ -839,6 +851,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
             "NEEDS_REVIEW", {{"path", ticket.path},
                              {"reason", "below floor"},
                              {"attempts", funnel_result.attempts.size()},
+                             {"atomic", review_atomic},
                              {"score", std::to_string(chosen.score)}}));
         writer.submit(state::CommitTerminal{std::move(records)});
         if (cache_valid) {

@@ -135,6 +135,12 @@ struct FunnelOptions {
   bool compact_output{false};        // V5: titles array + atomic index list
   std::string cache_prefix;          // V6: shared fixed block prepended to
                                      // every prompt (cache-hit prefix)
+  // W5 gate calibration: the DESIGN atomic check (admits_children) runs
+  // per labelled-atomic child when on. Default off in M3 — ATOMIC has no
+  // store effect yet ("store effects arrive with their milestones"), and
+  // the new model labels ~70% of children atomic, which makes the sweep
+  // expensive (see DR 0018).
+  bool verify_atomic{false};
   // Optional per-1M-token prices (USD per 1M). When set, the attempt cost
   // is computed from usage; when absent, cost stays 0 (node.conf arrives
   // with M5 — decision 0004: no implicit monetary defaults).

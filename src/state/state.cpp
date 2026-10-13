@@ -176,9 +176,10 @@ void upsert_review(store::Db& db, const log::Record& record,
   const auto& payload = record.payload;
   const std::string path = payload.at("path").get<std::string>();
   auto statement = db.prepare(
-      "INSERT INTO reviews(path, reason, state, note, hlc, origin) "
-      "VALUES (?1, ?2, 'open', '', ?3, ?4) "
+      "INSERT INTO reviews(path, reason, state, note, atomic, hlc, origin) "
+      "VALUES (?1, ?2, 'open', '', ?3, ?4, ?5) "
       "ON CONFLICT(path) DO UPDATE SET state='open', reason=excluded.reason, "
+      "atomic=excluded.atomic, "
       "hlc=excluded.hlc, origin=excluded.origin "
       "WHERE excluded.hlc > reviews.hlc OR "
       "(excluded.hlc = reviews.hlc AND excluded.origin > reviews.origin);",
@@ -187,8 +188,9 @@ void upsert_review(store::Db& db, const log::Record& record,
   std::string bind_error;
   if (!statement->bind(1, path, &bind_error) ||
       !statement->bind(2, payload.value("reason", std::string{}), &bind_error) ||
-      !statement->bind(3, static_cast<std::int64_t>(record.hlc), &bind_error) ||
-      !statement->bind(4, payload.value("origin", std::string(writer_origin)), &bind_error)) {
+      !statement->bind(3, payload.value("atomic", std::int64_t{0}), &bind_error) ||
+      !statement->bind(4, static_cast<std::int64_t>(record.hlc), &bind_error) ||
+      !statement->bind(5, payload.value("origin", std::string(writer_origin)), &bind_error)) {
     if (error) *error = "fold review bind failed: " + bind_error;
     return;
   }

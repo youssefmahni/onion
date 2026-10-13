@@ -45,6 +45,7 @@ struct CampaignSpec {
   std::optional<int> synth_max_children;
   bool compact_output{false};
   bool cache_prefix{false};
+  bool verify_atomic{false};              // DESIGN atomic check (M3: opt-in)
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
