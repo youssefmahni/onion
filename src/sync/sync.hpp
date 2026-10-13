@@ -88,9 +88,11 @@ class SyncServer {
     std::shared_ptr<const log::DeviceKey> key;
     std::vector<MemberKey> members;  // device_id -> public key
     // M7 joining: the fleet's reachable addresses, so the admission
-    // response can tell the joiner where every member syncs.
+    // response can tell the joiner where every member syncs and gossips.
     std::map<std::string, std::string> member_urls;
     std::string self_url;  // this device's own host:port
+    std::map<std::string, std::string> member_swim_urls;
+    std::string self_swim_url;  // this device's own host:udp_port
   };
 
   explicit SyncServer(Options options);

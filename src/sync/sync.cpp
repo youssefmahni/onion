@@ -427,6 +427,12 @@ bool SyncServer::start(std::string* error) {
       return impl_->options.bind_address + ":" +
              std::to_string(impl_->port.load());
     };
+    const auto swim_url_of = [&](const std::string& device_id) {
+      const auto found = impl_->options.member_swim_urls.find(device_id);
+      return found == impl_->options.member_swim_urls.end()
+                 ? std::string{}
+                 : found->second;
+    };
     for (const auto& entry : impl_->options.members) {
       std::string hex;
       static const char* digits = "0123456789abcdef";
@@ -438,18 +444,28 @@ bool SyncServer::start(std::string* error) {
           entry.device_id == impl_->options.key->device_id
               ? my_url()
               : url_of(entry.device_id);
+      const std::string swim_url =
+          entry.device_id == impl_->options.key->device_id
+              ? impl_->options.self_swim_url
+              : swim_url_of(entry.device_id);
       members.push_back({{"device_id", entry.device_id},
                          {"public_key", hex},
-                         {"url", url}});
+                         {"url", url},
+                         {"swim", swim_url}});
     }
     for (const auto& row : impl_->options.writer->members_table()) {
       const std::string url =
           row.device_id == impl_->options.key->device_id
               ? my_url()
               : url_of(row.device_id);
+      const std::string swim_url =
+          row.device_id == impl_->options.key->device_id
+              ? impl_->options.self_swim_url
+              : swim_url_of(row.device_id);
       members.push_back({{"device_id", row.device_id},
                          {"public_key", row.pubkey_hex},
-                         {"url", url}});
+                         {"url", url},
+                         {"swim", swim_url}});
     }
     response.status = 200;
     response.set_content(
@@ -772,11 +788,23 @@ int SyncClient::run_round(std::string_view peer_base_url,
   // 2. Pull every origin where the peer is ahead.
   const std::string peer_id =
       peer_vector_json.value("device_id", std::string{});
-  if (peer_id.empty() || !impl_->options.members.count(peer_id)) {
+  if (peer_id.empty()) {
     if (error) *error = "unknown peer identity";
     return applied;
   }
-  const auto& peer_key = impl_->options.members.at(peer_id);
+  // The peer's key: the static map, or the members table for devices
+  // admitted through the join endpoint.
+  const auto peer_entry = impl_->options.members.find(peer_id);
+  std::vector<std::uint8_t> peer_public_key;
+  if (peer_entry != impl_->options.members.end())
+    peer_public_key = peer_entry->second.public_key;
+  else if (const auto stored =
+               impl_->options.writer.member_public_key(peer_id))
+    peer_public_key = *stored;
+  if (peer_public_key.empty()) {
+    if (error) *error = "unknown peer identity";
+    return applied;
+  }
   for (const auto& [origin, peer_seq] :
        peer_vector_json["vector"].items()) {
     const std::int64_t peer_last = peer_seq.get<std::int64_t>();
@@ -824,7 +852,25 @@ int SyncClient::run_round(std::string_view peer_base_url,
       context.version = 1;
       context.expected_prev = expected_prev;
       context.expected_first_seq = expected_first;
-      context.origin_public_key = &peer_key.public_key;
+      // The origin of a pulled batch may be a THIRD device — resolve its
+      // key from the static map or, for devices admitted through the
+      // join endpoint, from the members table.
+      const auto origin_key = [&]() -> std::vector<std::uint8_t> {
+        if (batch.origin == peer_id) return peer_public_key;
+        const auto static_entry =
+            impl_->options.members.find(batch.origin);
+        if (static_entry != impl_->options.members.end())
+          return static_entry->second.public_key;
+        if (const auto stored =
+                impl_->options.writer.member_public_key(batch.origin))
+          return *stored;
+        return {};
+      }();
+      if (origin_key.empty()) {
+        if (quarantined) (*quarantined)[origin] = "unknown origin key";
+        break;
+      }
+      context.origin_public_key = &origin_key;
       // The first batch of an origin chains from that origin's public-key
       // hash (the batch's own origin may be a third device).
       if (expected_prev.empty() && batch.number == 1) {
@@ -832,14 +878,23 @@ int SyncClient::run_round(std::string_view peer_base_url,
             [&]() -> std::string {
               if (batch.origin == peer_id)
                 return onion::log::blake2b_hex(std::string_view(
-                    reinterpret_cast<const char*>(peer_key.public_key.data()),
-                    peer_key.public_key.size()));
+                    reinterpret_cast<const char*>(peer_public_key.data()),
+                    peer_public_key.size()));
               const auto member = impl_->options.members.find(batch.origin);
-              if (member == impl_->options.members.end()) return {};
-              const auto& key_bytes = member->second.public_key;
-              return onion::log::blake2b_hex(std::string_view(
-                  reinterpret_cast<const char*>(key_bytes.data()),
-                  key_bytes.size()));
+              if (member != impl_->options.members.end()) {
+                const auto& key_bytes = member->second.public_key;
+                return onion::log::blake2b_hex(std::string_view(
+                    reinterpret_cast<const char*>(key_bytes.data()),
+                    key_bytes.size()));
+              }
+              // A device admitted through the join endpoint resolves
+              // from the members table.
+              if (const auto stored =
+                      impl_->options.writer.member_public_key(batch.origin))
+                return onion::log::blake2b_hex(std::string_view(
+                    reinterpret_cast<const char*>(stored->data()),
+                    stored->size()));
+              return std::string{};
             }();
         if (origin_pubkey.empty()) {
           if (quarantined) (*quarantined)[origin] = "unknown origin key";

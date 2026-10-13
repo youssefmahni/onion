@@ -54,7 +54,8 @@ std::string flag(int argc, char** argv, const std::string& name,
 int parse_port(const std::string& text, int fallback) {
   char* end = nullptr;
   const long value = std::strtol(text.c_str(), &end, 10);
-  if (end == nullptr || *end != '\0' || value < 1 || value > 65535)
+  // 0 is a valid request (bind to an ephemeral port).
+  if (end == nullptr || *end != '\0' || value < 0 || value > 65535)
     return fallback;
   return static_cast<int>(value);
 }
@@ -774,13 +775,43 @@ int node_cmd(int argc, char** argv) {
   std::vector<onion::sched::LaneMember> lane_members;
   std::vector<onion::sync::MemberKey> sync_members;
   std::map<std::string, std::string> member_urls;
+  std::map<std::string, std::string> member_swim_urls;
   std::unique_ptr<onion::sync::SyncServer> sync_server;
   const std::string members_path = flag(argc, argv, "--members", "");
   const std::string self_host = flag(argc, argv, "--host", "127.0.0.1");
   const int self_sync_port = std::atoi(flag(argc, argv, "--sync-port", "7947").c_str());
+  const int self_swim_port =
+      parse_port(flag(argc, argv, "--swim-port", "7946"), 7946);
   // node join wraps the member list with a "joined" marker: the device
   // starts JOINING and turns ACTIVE once its lag is under 100 ops.
   bool joined_device = false;
+  // The swim transport opens first so the sync server's admission
+  // response can carry this device's REAL swim (UDP) address as a
+  // unicast gossip seed.
+  constexpr std::string_view beacon_group = "239.255.77.31";
+  std::unique_ptr<onion::swim::Swim> swim;
+  std::unique_ptr<onion::swim::UdpTransport> swim_transport;
+  int bound_swim_port = 0;
+  std::string self_swim_url;
+  if (self_swim_port == 0 || !members_path.empty()) {
+    // Always open on an ephemeral port when asked, or when a member list
+    // exists (gossip addresses must be real, never a guessed default).
+  }
+  {
+    swim_transport = std::make_unique<onion::swim::UdpTransport>();
+    std::string swim_error;
+    if (swim_transport->open(static_cast<std::uint16_t>(self_swim_port),
+                             std::string(beacon_group), &swim_error)) {
+      bound_swim_port = *swim_transport->port();
+      self_swim_url = self_host + ":" + std::to_string(bound_swim_port);
+    } else {
+      // Several nodes on ONE machine share UDP 7946 (the multi-process
+      // test); the second binder runs without swim instead of dying.
+      std::cerr << "swim disabled (udp:" << self_swim_port
+                << " unavailable): " << swim_error << "\n";
+      swim_transport.reset();
+    }
+  }
   if (!members_path.empty()) {
     std::ifstream members_file(members_path);
     auto members_json = json::parse(members_file, nullptr, false);
@@ -818,6 +849,8 @@ int node_cmd(int argc, char** argv) {
       sync_members.push_back({member_id, public_key});
       if (member.contains("url"))
         member_urls[member_id] = member["url"].get<std::string>();
+      if (member.contains("swim"))
+        member_swim_urls[member_id] = member["swim"].get<std::string>();
     }
     onion::sync::SyncServer::Options sync_options;
     sync_options.port = self_sync_port;
@@ -826,6 +859,8 @@ int node_cmd(int argc, char** argv) {
     sync_options.key = device_key;
     sync_options.members = sync_members;
     sync_options.member_urls = member_urls;
+    sync_options.member_swim_urls = member_swim_urls;
+    sync_options.self_swim_url = self_swim_url;
     // self_url stays empty: the server derives its own address from the
     // REAL bound port (the requested port may be 0 = ephemeral).
     sync_server = std::make_unique<onion::sync::SyncServer>(std::move(sync_options));
@@ -842,25 +877,6 @@ int node_cmd(int argc, char** argv) {
 
   // M7: the SWIM membership engine over UDP (DESIGN › Transport: 7946)
   // and the signed LAN beacon (decision 0013: group 239.255.77.31).
-  const int self_swim_port =
-      parse_port(flag(argc, argv, "--swim-port", "7946"), 7946);
-  constexpr std::string_view beacon_group = "239.255.77.31";
-  std::unique_ptr<onion::swim::Swim> swim;
-  std::unique_ptr<onion::swim::UdpTransport> swim_transport;
-  int bound_swim_port = 0;
-  if (!lane_members.empty()) {
-    swim_transport = std::make_unique<onion::swim::UdpTransport>();
-    std::string swim_error;
-    if (!swim_transport->open(static_cast<std::uint16_t>(self_swim_port),
-                              std::string(beacon_group), &swim_error)) {
-      // Several nodes on ONE machine share UDP 7946 (the multi-process
-      // test); the second binder runs without swim instead of dying.
-      // Distinct devices on a real LAN each hold the port.
-      std::cerr << "swim disabled (udp:" << self_swim_port
-                << " unavailable): " << swim_error << "\n";
-      swim_transport.reset();
-    }
-  }
   if (swim_transport) {
     bound_swim_port = *swim_transport->port();
     onion::swim::Options swim_options;
@@ -889,30 +905,38 @@ int node_cmd(int argc, char** argv) {
           return onion::swim::sign_beacon(device_id, updates_json,
                                           timestamp_s, signer);
         });
-    // Inbound updates must be signed by a known member; failures are
+    // Inbound updates must be signed by a known member (the static list
+    // or a device admitted through the join endpoint); failures are
     // rate-limited so a clock-skewed or stale member does not spam.
     swim->set_updates_verifier(
         [&](std::string_view device_id, std::string_view updates_json,
             std::string_view signature_hex, std::int64_t timestamp_s,
             std::int64_t now_s) {
+          std::vector<std::uint8_t> public_key;
           for (const auto& member : sync_members)
-            if (member.device_id == device_id) {
-              const bool valid = onion::swim::beacon_signature_valid(
-                  device_id, updates_json, signature_hex,
-                  member.public_key, timestamp_s, now_s);
-              if (!valid) {
-                static int failures = 0;
-                if (++failures % 100 == 1)
-                  std::cerr << "swim: dropped a bad signature from "
-                            << device_id << "\n";
-              }
-              return valid;
-            }
-          static int unknown = 0;
-          if (++unknown % 100 == 1)
-            std::cerr << "swim: dropped an update from unknown device "
-                      << device_id << "\n";
-          return false;
+            if (member.device_id == device_id)
+              public_key = member.public_key;
+          if (public_key.empty())
+            if (const auto stored =
+                    writer->member_public_key(device_id))
+              public_key = *stored;
+          if (public_key.empty()) {
+            static int unknown = 0;
+            if (++unknown % 100 == 1)
+              std::cerr << "swim: dropped an update from unknown device "
+                        << device_id << "\n";
+            return false;
+          }
+          const bool valid = onion::swim::beacon_signature_valid(
+              device_id, updates_json, signature_hex, public_key,
+              timestamp_s, now_s);
+          if (!valid) {
+            static int failures = 0;
+            if (++failures % 100 == 1)
+              std::cerr << "swim: dropped a bad signature from "
+                        << device_id << "\n";
+          }
+          return valid;
         });
     // The beacon payload (already signed by the engine) goes to the group.
     swim->beacon_hook = [&](std::string payload) {
@@ -925,6 +949,18 @@ int node_cmd(int argc, char** argv) {
         joined_device ? onion::swim::MemberState::JOINING
                       : onion::swim::MemberState::ACTIVE,
         1);
+    // The beacon/gossip carries the SYNC address (host:port) in the
+    // member capabilities, so the fleet learns where to pull from —
+    // including devices admitted through the join endpoint.
+    {
+      auto self = swim->mutable_membership().self();
+      self.capabilities = {{"sync", self_host + ":" +
+                                        std::to_string(
+                                            sync_server
+                                                ? sync_server->bound_port()
+                                                : self_sync_port)}};
+      swim->mutable_membership().upsert(std::move(self));
+    }
     if (std::getenv("ONION_SYNC_DEBUG"))
       std::fprintf(stderr, "swim self state: %.*s (joined=%d)\n",
                    static_cast<int>(onion::swim::to_string(
@@ -939,6 +975,11 @@ int node_cmd(int argc, char** argv) {
       seed.device_id = member.device_id;
       seed.state = onion::swim::MemberState::ACTIVE;
       seed.incarnation = 1;
+      // The unicast gossip seed: the member's UDP address (the beacon
+      // may be blocked on some networks).
+      const auto swim_entry = member_swim_urls.find(member.device_id);
+      if (swim_entry != member_swim_urls.end())
+        seed.address = swim_entry->second;
       swim->mutable_membership().upsert(std::move(seed));
     }
     swim->announce();
@@ -1065,6 +1106,7 @@ int node_cmd(int argc, char** argv) {
     std::vector<onion::sched::LaneMember> new_lanes;
     std::vector<onion::sync::MemberKey> new_members;
     std::map<std::string, std::string> new_urls;
+    std::map<std::string, std::string> new_swim_urls;
     for (const auto& member : parsed) {
       if (!member.contains("device_id") || !member.contains("public_key"))
         continue;
@@ -1079,10 +1121,13 @@ int node_cmd(int argc, char** argv) {
       new_members.push_back({member_id, public_key});
       if (member.contains("url"))
         new_urls[member_id] = member["url"].get<std::string>();
+      if (member.contains("swim"))
+        new_swim_urls[member_id] = member["swim"].get<std::string>();
     }
     lane_members = std::move(new_lanes);
     sync_members = std::move(new_members);
     member_urls = std::move(new_urls);
+    member_swim_urls = std::move(new_swim_urls);
     if (std::getenv("ONION_SYNC_DEBUG"))
       std::fprintf(stderr, "members.json reloaded: %zu members, %zu urls\n",
                    lane_members.size(), member_urls.size());
@@ -1144,12 +1189,9 @@ int node_cmd(int argc, char** argv) {
           while (std::getline(split, id, ','))
             if (!id.empty()) partitioned.insert(id);
         }
-        for (const auto& member : lane_members) {
-          if (member.device_id == device_key->device_id) continue;
-          if (partitioned.count(member.device_id)) continue;
-          const auto peer_entry = member_urls.find(member.device_id);
-          if (peer_entry == member_urls.end()) continue;
-          const std::string peer = peer_entry->second;
+        for (const auto& [peer_id, peer] : member_urls) {
+          if (peer_id == device_key->device_id) continue;
+          if (partitioned.count(peer_id)) continue;
           std::map<std::string, std::string> quarantined;
           std::string sync_error;
           std::map<std::string, onion::sync::MemberKey> client_members;
@@ -1181,10 +1223,8 @@ int node_cmd(int argc, char** argv) {
                         onion::swim::MemberState::JOINING) {
           std::int64_t worst_lag = 0;
           bool lag_known = false;
-          for (const auto& member : lane_members) {
-            if (member.device_id == device_key->device_id) continue;
-            const auto peer_entry = member_urls.find(member.device_id);
-            if (peer_entry == member_urls.end()) continue;
+          for (const auto& [peer_id, peer] : member_urls) {
+            if (peer_id == device_key->device_id) continue;
             std::map<std::string, onion::sync::MemberKey> client_members;
             for (const auto& entry : sync_members)
               client_members[entry.device_id] = entry;
@@ -1192,7 +1232,7 @@ int node_cmd(int argc, char** argv) {
                 {*writer, device_key, std::move(client_members)});
             std::string lag_error;
             const std::int64_t lag =
-                lag_client.peer_lag(peer_entry->second, &lag_error);
+                lag_client.peer_lag(peer, &lag_error);
             if (lag < 0) continue;
             lag_known = true;
             worst_lag = std::max(worst_lag, lag);
@@ -1280,6 +1320,38 @@ if (!members_path.empty()) reload_members();
             visible++;
         }
       const bool majority_visible = visible * 2 > total;
+      if (std::getenv("ONION_SYNC_DEBUG")) {
+        static std::size_t last_swim_size = 0;
+        if (swim->membership().size() != last_swim_size) {
+          last_swim_size = swim->membership().size();
+          std::fprintf(stderr, "swim view now %zu members\n",
+                       last_swim_size);
+        }
+      }
+      // The gossip seeds: the members.json swim addresses (the two-phase
+      // tests and joined fleets learn them after startup).
+      for (const auto& [member_id, swim_url] : member_swim_urls) {
+        if (member_id == device_key->device_id) continue;
+        const auto* existing = swim->membership().get(member_id);
+        if (existing && existing->address == swim_url) continue;
+        onion::swim::Member seeded;
+        seeded.device_id = member_id;
+        seeded.state = existing ? existing->state
+                                : onion::swim::MemberState::ACTIVE;
+        seeded.incarnation = existing ? existing->incarnation : 1;
+        seeded.address = swim_url;
+        swim->mutable_membership().upsert(std::move(seeded));
+      }
+      // The fleet's sync addresses travel in gossip: member_urls stays
+      // current for every member, joined devices included.
+      for (const auto& member : swim->membership().list()) {
+        if (member.device_id == device_key->device_id) continue;
+        if (member.capabilities.is_object() &&
+            member.capabilities.contains("sync") &&
+            member.capabilities["sync"].is_string())
+          member_urls[member.device_id] =
+              member.capabilities["sync"].get<std::string>();
+      }
       std::vector<onion::sched::LaneMember> live;
       for (const auto& member : swim->membership().list()) {
         if (member.device_id == device_key->device_id) continue;

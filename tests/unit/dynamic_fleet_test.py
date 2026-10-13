@@ -99,6 +99,8 @@ def main():
                 entry = member(devices, index)
                 if "port" in devices[index]:
                     entry["url"] = "127.0.0.1:%d" % devices[index]["port"]
+                if "swim" in devices[index]:
+                    entry["swim"] = "127.0.0.1:%d" % devices[index]["swim"]
                 members.append(entry)
             with open(path, "w") as f:
                 json.dump(members, f)
@@ -129,6 +131,7 @@ def main():
             ports = wait_port_file(port_file)
             devices[index]["port"] = ports["sync"]
             devices[index]["api"] = ports["api"]
+            devices[index]["swim"] = ports["swim"]
             return node
 
         def wait_settled(apis, minimum=1, timeout=180):
@@ -396,7 +399,9 @@ def main():
             if os.path.exists(log):
                 lines = open(log).read().splitlines()
                 sync_lines = [l for l in lines
-                              if "sync" in l.lower() or "verify" in l.lower()]
+                              if "sync" in l.lower() or
+                              "verify" in l.lower() or
+                              "swim" in l.lower()]
                 print("--- node%d log head ---" % index)
                 print("\n".join(lines[:4]))
                 print("--- node%d log tail ---" % index)
@@ -420,7 +425,10 @@ def main():
             fake.wait(timeout=10)
         except subprocess.TimeoutExpired:
             fake.kill()
-        shutil.rmtree(root, ignore_errors=True)
+        if os.environ.get("ONION_KEEP_ROOT"):
+            print("KEPT ROOT:", root)
+        else:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":
