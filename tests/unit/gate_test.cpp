@@ -467,6 +467,32 @@ TEST(GateParsers, CritiqueScoreScaleDriftIsRejected) {
   EXPECT_FALSE(parse_critique(R"({"score": "0.15"})").has_value());
 }
 
+TEST(GateParsers, ChildrenKeyFromTheRecordedW54Replies) {
+  // The W5.4 synthesizer replies drifted from "items" to "children"
+  // (recorded shapes below); the parser accepts both and stays strict
+  // on the entries.
+  auto c1 = parse_children(
+      R"({"children":[{"title":"Time-Based Expiration Conditions","atomic":false},{"title":"Conflict of Interest Screening","atomic":true}]})");
+  ASSERT_TRUE(c1.has_value());
+  ASSERT_EQ(c1->size(), 2u);
+  EXPECT_FALSE((*c1)[0].atomic);
+  EXPECT_TRUE((*c1)[1].atomic);
+
+  auto c2 = parse_children(
+      R"({"children": [{"title": "Expiration Notification Requirements", "atomic": true}, {"title": "Expiration Trigger Types", "atomic": false}]})");
+  ASSERT_TRUE(c2.has_value());
+  EXPECT_TRUE((*c2)[0].atomic);
+
+  // The old "items" shape still parses.
+  ASSERT_TRUE(parse_children(
+      R"({"items": [{"title": "A", "atomic": false}]})").has_value());
+
+  // Strict entries: a string entry or a missing title fails.
+  EXPECT_FALSE(parse_children(R"({"children": ["not an object"]})"));
+  EXPECT_FALSE(parse_children(R"({"children": [{"atomic": true}]})"));
+  EXPECT_FALSE(parse_children(R"({"other": []})"));
+}
+
 TEST(GateFunnel, AtomicVerificationKeepsOnlyAgreedLeaves) {
   FunnelOptions options;
   options.verify_atomic = true;

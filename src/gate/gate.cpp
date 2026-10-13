@@ -187,9 +187,15 @@ std::optional<std::vector<std::string>> parse_items(const std::string& body) {
 std::optional<std::vector<Child>> parse_children(const std::string& body) {
   auto json = nlohmann::json::parse(body, nullptr, false);
   if (json.is_discarded() || !json.is_object()) return std::nullopt;
-  if (json.contains("items") && json["items"].is_array()) {
+  // The prompt asks for "items"; the model drifts between "items" and
+  // "children" (recorded in the W5.4 cassettes — both shapes appear).
+  // Both object-array shapes are accepted; the entries stay strict.
+  const char* object_key = json.contains("items") ? "items"
+                           : json.contains("children") ? "children"
+                                                       : nullptr;
+  if (object_key != nullptr && json[object_key].is_array()) {
     std::vector<Child> children;
-    for (const auto& item : json["items"]) {
+    for (const auto& item : json[object_key]) {
       if (!item.is_object() || !item.contains("title") ||
           !item["title"].is_string())
         return std::nullopt;
