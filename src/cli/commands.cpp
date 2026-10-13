@@ -1080,7 +1080,9 @@ int node_cmd(int argc, char** argv) {
 
   // M7: the device's reachable addresses, written once per run into the
   // log (the deterministic discovery channel — gossip refreshes between
-  // runs), then PUSHED to every known peer so they can pull the rest.
+  // runs), then PUSHED to every known peer each sync round so they can
+  // pull the rest (a peer cannot pull before it has our address).
+  std::string member_addr_batch;
   if (!lane_members.empty()) {
     writer->submit(onion::state::CommitTerminal{{make_record(
         "MEMBER_ADDR",
@@ -1090,29 +1092,12 @@ int node_cmd(int argc, char** argv) {
                                                  : self_sync_port)},
          {"swim", self_host + ":" + std::to_string(bound_swim_port)}})}});
     writer->sync();
-    // The push closes the discovery circle: a peer cannot pull this
-    // device's log without first learning its address.
-    std::string pushed_batch;
-    {
-      std::ifstream in(writer->segments().active_path());
-      std::string last_line;
-      std::string line;
-      while (std::getline(in, line))
-        if (!line.empty()) last_line = line;
-      pushed_batch = std::move(last_line);
-    }
-    if (!pushed_batch.empty()) {
-      for (const auto& [peer_id, peer] : member_urls) {
-        if (peer_id == device_key->device_id || peer.empty()) continue;
-        std::map<std::string, onion::sync::MemberKey> client_members;
-        for (const auto& entry : sync_members)
-          client_members[entry.device_id] = entry;
-        onion::sync::SyncClient pusher(
-            {*writer, device_key, std::move(client_members)});
-        std::string push_error;
-        pusher.push_batch(peer, pushed_batch, &push_error);
-      }
-    }
+    std::ifstream in(writer->segments().active_path());
+    std::string line;
+    std::string last_line;
+    while (std::getline(in, line))
+      if (!line.empty()) last_line = line;
+    member_addr_batch = std::move(last_line);
   }
   // --port-file: the real bound ports (port 0 = ephemeral), so tests and
   // orchestration never guess or hard-code ports.
@@ -1253,6 +1238,40 @@ int node_cmd(int argc, char** argv) {
         // reservations and feeds the measured-chunk window — a fully
         // partitioned round must not unlock more spending.
         if (any_peer_answered) engine.note_sync_round();
+        // M7: push this device's newest batch to every peer (DESIGN ›
+        // New children and claims are pushed at once). The repeated push
+        // also closes the address-discovery circle under load: a peer
+        // cannot pull before it has our address, so the push carries it.
+        {
+          std::ifstream in(writer->segments().active_path());
+          std::string line;
+          std::string last_line;
+          while (std::getline(in, line))
+            if (!line.empty()) last_line = line;
+          const std::string pushed_batch = std::move(last_line);
+          for (const auto& [peer_id, peer] : member_urls) {
+            if (peer_id == device_key->device_id || peer.empty())
+              continue;
+            if (partitioned.count(peer_id)) continue;  // the split holds
+            std::map<std::string, onion::sync::MemberKey> client_members;
+            for (const auto& entry : sync_members)
+              client_members[entry.device_id] = entry;
+            onion::sync::SyncClient pusher(
+                {*writer, device_key, std::move(client_members),
+                 self_host + ":" +
+                     std::to_string(sync_server ? sync_server->bound_port()
+                                                : self_sync_port)});
+            std::string push_error;
+            if (!member_addr_batch.empty())
+              pusher.push_batch(peer, member_addr_batch, &push_error);
+            if (!pushed_batch.empty() &&
+                pushed_batch != member_addr_batch)
+              pusher.push_batch(peer, pushed_batch, &push_error);
+            if (std::getenv("ONION_SYNC_DEBUG") && !push_error.empty())
+              std::fprintf(stderr, "push to %s failed: %s\n",
+                           peer.c_str(), push_error.c_str());
+          }
+        }
         // M7 joining: a JOINING device turns ACTIVE once its lag behind
         // every origin is under 100 ops.
         if (swim && swim->membership().self().state ==
@@ -1265,7 +1284,10 @@ int node_cmd(int argc, char** argv) {
             for (const auto& entry : sync_members)
               client_members[entry.device_id] = entry;
             onion::sync::SyncClient lag_client(
-                {*writer, device_key, std::move(client_members)});
+                {*writer, device_key, std::move(client_members),
+                 self_host + ":" +
+                     std::to_string(sync_server ? sync_server->bound_port()
+                                                : self_sync_port)});
             std::string lag_error;
             const std::int64_t lag =
                 lag_client.peer_lag(peer, &lag_error);

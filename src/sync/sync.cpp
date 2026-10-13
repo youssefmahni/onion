@@ -558,6 +558,34 @@ bool SyncServer::start(std::string* error) {
   impl_->server->Post("/sync/v1/push", [this](const httplib::Request& request,
                                                httplib::Response& response) {
     if (!impl_->authenticate(request, response)) return;
+    // The push itself delivers the pusher's address (DESIGN › New
+    // children are pushed at once): a peer that never pulled the origin
+    // cannot verify the pushed batch yet, but it CAN learn where to
+    // pull from.
+    const std::string sender =
+        request.get_header_value("X-Onion-Device");
+    const std::string sender_url =
+        request.get_header_value("X-Onion-Sync-Url");
+    if (!sender.empty() && !sender_url.empty()) {
+      if (const auto stored =
+              impl_->options.writer->member_public_key(sender)) {
+        auto statement = [&]() {
+          std::string error;
+          return const_cast<onion::store::Db&>(
+                     impl_->options.writer->db())
+              .prepare(
+                  "UPDATE members SET sync_url=?2 WHERE device_id=?1;",
+                  &error);
+        }();
+        if (statement) {
+          std::string bind_error;
+          statement->bind(1, sender, &bind_error);
+          statement->bind(2, sender_url, &bind_error);
+          std::string step_error;
+          statement->step(&step_error);
+        }
+      }
+    }
     auto batch_json =
         nlohmann::json::parse(request.body, nullptr, false);
     if (batch_json.is_discarded() || !batch_json.contains("recs")) {
@@ -828,6 +856,8 @@ void SyncClient::push_batch(std::string_view peer_base_url,
   for (const auto& [name, value] : signed_post_headers(
            self, "/sync/v1/push", batch_json, signer))
     headers.emplace(name, value);
+  if (!impl_->options.self_url.empty())
+    headers.emplace("X-Onion-Sync-Url", impl_->options.self_url);
   const auto response = client.Post("/sync/v1/push", headers,
                                     std::string(batch_json),
                                     "application/json");

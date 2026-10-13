@@ -119,6 +119,9 @@ class SyncClient {
     state::StateWriter& writer;
     std::shared_ptr<const log::DeviceKey> key;
     std::map<std::string, MemberKey> members;  // by device id
+    // M7: this device's own sync address, carried in the push headers so
+    // the receiver learns where to pull from.
+    std::string self_url;
   };
 
   explicit SyncClient(Options options);
