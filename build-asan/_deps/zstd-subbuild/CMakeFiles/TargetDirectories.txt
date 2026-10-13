@@ -1,3 +1,0 @@
-/home/youssef/Desktop/onion-opt/build-asan/_deps/zstd-subbuild/CMakeFiles/zstd-populate.dir
-/home/youssef/Desktop/onion-opt/build-asan/_deps/zstd-subbuild/CMakeFiles/edit_cache.dir
-/home/youssef/Desktop/onion-opt/build-asan/_deps/zstd-subbuild/CMakeFiles/rebuild_cache.dir

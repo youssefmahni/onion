@@ -1,5 +1,0 @@
-if(EXISTS "/home/youssef/Desktop/onion-opt/build-asan/onion_limiter_test[1]_tests.cmake")
-  include("/home/youssef/Desktop/onion-opt/build-asan/onion_limiter_test[1]_tests.cmake")
-else()
-  add_test(onion_limiter_test_NOT_BUILT onion_limiter_test_NOT_BUILT)
-endif()

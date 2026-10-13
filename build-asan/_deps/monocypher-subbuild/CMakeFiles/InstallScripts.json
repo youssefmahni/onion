@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/youssef/Desktop/onion-opt/build-asan/_deps/monocypher-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
