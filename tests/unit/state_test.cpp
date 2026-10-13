@@ -1192,6 +1192,10 @@ TEST_F(StateWriterTest, MemberEvictNeedsAMajorityOrTheAdminKey) {
   ASSERT_TRUE(statement->step_row(&step_error));
   EXPECT_EQ(statement->text(0), "EVICTED");
   EXPECT_EQ(statement->integer(1), 42);
+  // Current-membership: the evicted device is not current; the admin
+  // (and any ACTIVE row) is.
+  EXPECT_FALSE(writer_->member_is_current(victim.device_id));
+  EXPECT_TRUE(writer_->member_is_current(admin.device_id));
 }
 
 TEST_F(StateWriterTest, MemberLeaveIsValidOnlyFromTheDeviceItself) {

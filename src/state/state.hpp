@@ -139,6 +139,11 @@ class StateWriter {
   // M7 joining: a member's public key (32 bytes) from the members table.
   std::optional<std::vector<std::uint8_t>> member_public_key(
       std::string_view device_id) const;
+  // True when the member row exists and is neither EVICTED nor LEFT
+  // (those states are terminal). Address recording and other
+  // current-member-only decisions use this, not member_public_key,
+  // because an evicted member's key stays in the table.
+  bool member_is_current(std::string_view device_id) const;
   // M7 stealing: whether another device holds an unexpired CLAIM on the
   // path (timed from THIS device's receipt — never the claimer's clock).
   // Returns the claimer's device id, or empty.

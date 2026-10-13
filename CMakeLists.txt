@@ -14,6 +14,7 @@ option(ONION_ENABLE_ASAN "Build with AddressSanitizer" OFF)
 option(ONION_ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 option(ONION_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
 option(ONION_ENABLE_FUZZING "Build the libFuzzer targets (clang only)" OFF)
+option(ONION_CHAOS_HOOKS "Compile the test-only chaos hooks (env-driven kill points, clock jumps, disk-full, partitions)" OFF)
 
 if((ONION_ENABLE_ASAN OR ONION_ENABLE_UBSAN OR ONION_ENABLE_TSAN) AND MSVC)
   message(FATAL_ERROR "The configured sanitizer jobs require a GCC or Clang toolchain")
@@ -325,6 +326,13 @@ if(BUILD_TESTING)
     TIMEOUT 420
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
     SKIP_RETURN_CODE 77)
+  # A hookless (release) build must ignore the chaos env knobs entirely.
+  if(NOT ONION_CHAOS_HOOKS)
+    add_test(NAME m7.release_ignores_chaos_hooks COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/release_ignores_chaos_test.py" "$<TARGET_FILE:data_depot>")
+    set_tests_properties(m7.release_ignores_chaos_hooks PROPERTIES
+      TIMEOUT 240
+      ENVIRONMENT "ONION_MP_DEADLINE_S=180")
+  endif()
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 
@@ -353,6 +361,9 @@ add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
 target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
+if(ONION_CHAOS_HOOKS)
+  target_compile_definitions(data_depot PRIVATE ONION_CHAOS_HOOKS=1)
+endif()
 
 # Standalone real-DeepSeek concurrency probe (dev tool, OPT track W1).
 # Links only libcurl; not part of the engine.

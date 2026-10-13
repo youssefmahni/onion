@@ -41,6 +41,20 @@ onion::log::Record make_record(std::string type, nlohmann::json payload) {
   return record;
 }
 
+std::string pubkey_hex(const DeviceKey& key) {
+  static const char* digits = "0123456789abcdef";
+  std::string hex;
+  for (const unsigned char byte : key.public_key) {
+    hex.push_back(digits[byte >> 4]);
+    hex.push_back(digits[byte & 0xf]);
+  }
+  return hex;
+}
+
+std::int64_t now_s() {
+  return static_cast<std::int64_t>(std::time(nullptr));
+}
+
 std::unique_ptr<StateWriter> open_writer(const std::filesystem::path& dir,
                                          const DeviceKey& key) {
   StateWriter::Options options;
@@ -150,6 +164,90 @@ TEST_F(SyncTest, NonceCacheRejectsReplaysInTheWindow) {
   EXPECT_FALSE(cache.seen_and_add("dev1", "sig2", 1050));   // new signature
   EXPECT_FALSE(cache.seen_and_add("dev2", "sig1", 1050));   // other device
   EXPECT_FALSE(cache.seen_and_add("dev1", "sig1", 2000));   // window moved on
+}
+
+TEST_F(SyncTest, PushAddressRecordingRequiresACurrentMemberSignature) {
+  // B gets a row in A's members table (a dynamic member). The push
+  // endpoint records a sync URL only for the device the signature
+  // proves — an unsigned or foreign-key push must change nothing.
+  writer_a_->submit(CommitTerminal{{
+      make_record("MEMBER_ADD", {{"pubkey", pubkey_hex(*key_b_)},
+                                 {"nonce", "7c7d7e7f8081828384858687"}}),
+  }});
+  writer_a_->sync();
+  start_server_a();
+  httplib::Client client("127.0.0.1", server_->bound_port());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+
+  const auto b_url = [&]() {
+    for (const auto& row : writer_a_->members_table())
+      if (row.device_id == key_b_->device_id) return row.sync_url;
+    return std::string{};
+  };
+  EXPECT_EQ(b_url(), "");
+
+  const std::string planted = "127.0.0.1:60000";
+  const httplib::Headers url_only{{"X-Onion-Sync-Url", planted}};
+  const httplib::Headers url_only_device{
+      {"X-Onion-Device", key_b_->device_id},
+      {"X-Onion-Sync-Url", planted}};
+
+  // A valid batch from B (its first — the genesis fallback applies).
+  writer_b_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01-IN01-T01-TK00001"},
+                               {"layer", 4}, {"title", "From B"}}),
+  }});
+  writer_b_->sync();
+  std::string batch_json;
+  {
+    std::ifstream in(writer_b_->segments().active_path());
+    std::string line;
+    while (std::getline(in, line))
+      if (!line.empty()) batch_json = line;
+  }
+  ASSERT_FALSE(batch_json.empty());
+
+  // (a) No signature at all: rejected before any recording.
+  auto response = client.Post("/sync/v1/push", url_only_device,
+                              batch_json, "application/json");
+  EXPECT_EQ(response->status, 401);
+  EXPECT_EQ(b_url(), "");
+
+  // (b) A foreign key (not a member, not in the table): rejected.
+  const auto key_c =
+      std::make_shared<DeviceKey>(DeviceKey::from_seed(seed(32)));
+  Ed25519Signer signer_c(*key_c);
+  const std::string nonce_c = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+  const std::string sig_c = sign_request(
+      key_c->device_id, "POST", "/sync/v1/push", batch_json, nonce_c,
+      now_s(), signer_c);
+  const httplib::Headers foreign{
+      {"X-Onion-Device", key_c->device_id},
+      {"X-Onion-Time", std::to_string(now_s())},
+      {"X-Onion-Nonce", nonce_c},
+      {"X-Onion-Sig", sig_c},
+      {"X-Onion-Sync-Url", "127.0.0.1:60001"}};
+  response = client.Post("/sync/v1/push", foreign, batch_json,
+                         "application/json");
+  EXPECT_EQ(response->status, 401);
+  EXPECT_EQ(b_url(), "");
+
+  // (c) B's own signature with a URL: recorded, and only as B's own
+  // address (the signature covers the device id, so B cannot record
+  // anyone else's row).
+  Ed25519Signer signer_b(*key_b_);
+  const auto headers_b = onion::sync::signed_post_headers(
+      key_b_->device_id, "/sync/v1/push", batch_json, signer_b);
+  httplib::Headers with_url;
+  for (const auto& [name, value] : headers_b)
+    with_url.emplace(name, value);
+  with_url.emplace("X-Onion-Sync-Url", planted);
+  response = client.Post("/sync/v1/push", with_url, batch_json,
+                         "application/json");
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(b_url(), planted);
 }
 
 TEST_F(SyncTest, OneRoundConvergesBothSettlesAndNodes) {
