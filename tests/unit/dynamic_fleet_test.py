@@ -112,27 +112,38 @@ def main():
             env = dict(os.environ, ONION_SYNC_DEBUG="1")
             if extra_env:
                 env.update(extra_env)
-            scenario_tag["counter"] += 1
-            port_file = os.path.join(root, "port%d_%d.json" % (
-                index, scenario_tag["counter"]))
             member_copy = os.path.join(data, "members.json")
             if os.path.abspath(members_file) != os.path.abspath(member_copy):
                 shutil.copyfile(members_file, member_copy)
-            node = subprocess.Popen(
-                [binary, "node", "run", "--data-dir", data,
-                 "--base-url", "http://127.0.0.1:%d" % fake_port,
-                 "--members", os.path.join(data, "members.json"),
-                 "--host", "127.0.0.1", "--sync-port", "0",
-                 "--api-port", "0", "--swim-port", "0",
-                 "--port-file", port_file],
-                stdout=open(os.path.join(root, "node%d.log" % index), "w"),
-                stderr=subprocess.STDOUT, env=env)
-            nodes.append(node)
-            ports = wait_port_file(port_file)
-            devices[index]["port"] = ports["sync"]
-            devices[index]["api"] = ports["api"]
-            devices[index]["swim"] = ports["swim"]
-            return node
+            # A previous scenario's process may release its file handles a
+            # beat late on Windows: retry the launch once if the node
+            # exits before writing its port file.
+            for attempt in (1, 2):
+                scenario_tag["counter"] += 1
+                port_file = os.path.join(root, "port%d_%d.json" % (
+                    index, scenario_tag["counter"]))
+                log_path = os.path.join(root, "node%d.log" % index)
+                node = subprocess.Popen(
+                    [binary, "node", "run", "--data-dir", data,
+                     "--base-url", "http://127.0.0.1:%d" % fake_port,
+                     "--members", member_copy,
+                     "--host", "127.0.0.1", "--sync-port", "0",
+                     "--api-port", "0", "--swim-port", "0",
+                     "--port-file", port_file],
+                    stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
+                    env=env)
+                nodes.append(node)
+                try:
+                    ports = wait_port_file(port_file, timeout=20)
+                    devices[index]["port"] = ports["sync"]
+                    devices[index]["api"] = ports["api"]
+                    devices[index]["swim"] = ports["swim"]
+                    return node
+                except AssertionError:
+                    if node.poll() is not None and attempt == 1:
+                        time.sleep(2.0)  # let the stale handles go
+                        continue
+                    raise
 
         def wait_settled(apis, minimum=1, timeout=180):
             end = time.time() + timeout
