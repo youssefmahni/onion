@@ -2,6 +2,9 @@
 
 ## Current
 
+- Milestone: M7 merged (`1a5e448`, PR #31), tagged `m7-rc` — CI green 8/8 with the dynamic-fleet scenarios on every OS (Windows/ASan included; the sanitizer jobs skip the scenarios, the repo's llm-scenario pattern)
+- Next: M8 Depth and scale; owner live checks OA-15 (Linux join) and OA-16 (Mac power pull) remain open
+
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
 - Landed so far: signed LAN beacon + `node run` swim wiring (decision 0013 canonical signing over the updates payload, signer/verifier hooks, tolerant UDP bind so co-located nodes survive; ASAN smoke of two real nodes exchanging over UDP clean) — CI green 8/8 (run 38160064783, includes the multi-process test); three review rounds, all findings fixed (stack-use-after-scope signer capture, malformed-datagram sig/ts crash, vacuous signing test, doc drift)
 - Next: invite/join (token, slot collision, clone + Merkle, ACTIVE at lag<100), majority & eviction, stealing, chaos tools, multi-process join/kill scenarios
