@@ -2,160 +2,175 @@
 """Tests for the llm_proxy budget caps (owner rule: the proxy enforces
 the 4,000-call / $5.00 lifetime caps itself and refuses calls beyond).
 
-Standard library only. The proxy is driven against a local fake
-upstream; small caps are injected via ONION_PROXY_CALL_CAP /
-ONION_PROXY_USD_CAP so the tests stay fast and deterministic.
+In-process and platform-independent: the proxy module is imported, its
+UPSTREAM is never contacted (the refusal path returns before any
+network I/O), and the pass-through accounting path runs against a
+mocked urlopen. Standard library only.
 """
 
+import importlib.util
+import io
 import json
-import os
-import subprocess
 import sys
-import threading
-import time
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 PROXY = ROOT / "tools" / "llm_proxy.py"
 
-FAKE_USAGE = {"prompt_tokens": 1000, "completion_tokens": 1000}  # 0.00137 USD
-
-UPSTREAM_HITS = 0
-
-
-class FakeUpstream(BaseHTTPRequestHandler):
-    def log_message(self, *_args):
-        return
-
-    def do_POST(self):
-        global UPSTREAM_HITS
-        UPSTREAM_HITS += 1
-        payload = json.dumps({
-            "choices": [{"message": {"content": "x"}}],
-            "usage": FAKE_USAGE,
-        }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+spec = importlib.util.spec_from_file_location("llm_proxy", str(PROXY))
+llm_proxy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(llm_proxy)
 
 
-def start_server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
+class ShimHandler:
+    """Minimal stand-in for BaseHTTPRequestHandler for _forward."""
+
+    budget = None  # filled from Proxy.budget below
+
+    def __init__(self, body=""):
+        self.headers = {}
+        self.rfile = io.BytesIO(body.encode())
+        self.status = None
+        self.body = b""
+
+    def send_response(self, code, *_args, **_kwargs):
+        self.status = code
+
+    def send_header(self, _name, _value):
+        pass
+
+    def end_headers(self):
+        pass
+
+    @property
+    def wfile(self):
+        return self
+
+    def write(self, data):
+        self.body += data
 
 
-def start_proxy(record, env_extra):
-    env = dict(os.environ)
-    env.update(env_extra)
-    process = subprocess.Popen(
-        [sys.executable, str(PROXY), "--port", "0", "--record", str(record)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
-    port = int(process.stdout.readline().strip())
-    return process, port
+USAGE = {"prompt_tokens": 1000, "completion_tokens": 1000}
+OK_BODY = json.dumps({"choices": [], "usage": USAGE})
 
 
-def post(url):
-    body = json.dumps({"model": "deepseek-flash", "messages": []}).encode()
-    request = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read()
+class BudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.old_caps = (llm_proxy.CALL_CAP, llm_proxy.USD_CAP)
+
+    def tearDown(self):
+        llm_proxy.CALL_CAP, llm_proxy.USD_CAP = self.old_caps
+
+    def fresh(self):
+        return llm_proxy.Budget()
+
+    def test_usage_usd_uses_peak_prices(self):
+        # 1000 in at 0.27/1M + 1000 out at 1.10/1M = 0.00137.
+        self.assertAlmostEqual(llm_proxy.Budget.usage_usd(OK_BODY), 0.00137)
+
+    def test_usage_usd_tolerates_garbage(self):
+        self.assertEqual(llm_proxy.Budget.usage_usd("not json"), 0.0)
+        self.assertEqual(llm_proxy.Budget.usage_usd("{}"), 0.0)
+
+    def test_refused_at_the_call_cap(self):
+        budget = self.fresh()
+        llm_proxy.CALL_CAP = 2
+        self.assertFalse(budget.refused())
+        budget.account(OK_BODY)
+        budget.account(OK_BODY)
+        self.assertTrue(budget.refused())
+
+    def test_refused_at_the_usd_cap(self):
+        budget = self.fresh()
+        llm_proxy.USD_CAP = 0.002
+        budget.account(OK_BODY)  # 0.00137
+        self.assertFalse(budget.refused())
+        budget.account(OK_BODY)  # 0.00274
+        self.assertTrue(budget.refused())
+
+    def test_history_counts_toward_the_lifetime_cap(self):
+        budget = self.fresh()
+        record = Path("/tmp") if sys.platform != "win32" else Path(".") \
+            if False else None
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cassette.jsonl"
+            path.write_text(json.dumps({
+                "ts": 1, "method": "POST", "path": "/v1/chat/completions",
+                "headers": {}, "body": "{}", "status": 200,
+                "response": OK_BODY,
+            }) + "\n")
+            budget.load_history(path)
+        self.assertEqual(budget.calls, 1)
+        self.assertAlmostEqual(budget.usd, 0.00137)
 
 
-def main():
-    failures = []
+class RefusalTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.old_caps = (llm_proxy.CALL_CAP, llm_proxy.USD_CAP)
+        self.old_upstream = llm_proxy.UPSTREAM
+        self.old_recorder = llm_proxy.Proxy.recorder
+        llm_proxy.Proxy.recorder = llm_proxy.Recorder(
+            Path(self._tmp.name) / "cassette.jsonl")
 
-    def check(name, condition):
-        print(("PASS" if condition else "FAIL") + " " + name)
-        if not condition:
-            failures.append(name)
+    def tearDown(self):
+        (llm_proxy.CALL_CAP, llm_proxy.USD_CAP) = self.old_caps
+        llm_proxy.UPSTREAM = self.old_upstream
+        llm_proxy.Proxy.recorder = self.old_recorder
+        self._tmp.cleanup()
 
-    global UPSTREAM_HITS
+    def test_forward_refuses_before_any_network_io(self):
+        llm_proxy.CALL_CAP = 1
+        llm_proxy.USD_CAP = 5.0
+        llm_proxy.Proxy.budget = llm_proxy.Budget()
+        llm_proxy.Proxy.budget.account(OK_BODY)  # already at the cap
+        handler = ShimHandler(body="{}")
+        handler.path = "/v1/chat/completions"
+        handler.budget = llm_proxy.Proxy.budget
+        handler.budget = llm_proxy.Proxy.budget
+        llm_proxy.UPSTREAM = "http://127.0.0.1:1"  # would fail if contacted
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            llm_proxy.Proxy._forward(handler, "POST")
+        urlopen.assert_not_called()
+        self.assertEqual(handler.status, 402)
+        self.assertIn(b"budget exhausted", handler.body)
 
-    # 1. The call cap refuses further completions without forwarding.
-    UPSTREAM_HITS = 0
-    upstream = start_server()
-    record = Path("/tmp") / "llm_proxy_caps_test.jsonl"
-    record.unlink(missing_ok=True)
-    proxy, port = start_proxy(record, {
-        "ONION_PROXY_CALL_CAP": "2", "ONION_PROXY_USD_CAP": "5.00",
-        "DEEPSEEK_API_KEY": "test",
-        "ONION_PROXY_UPSTREAM": f"http://127.0.0.1:{upstream.server_address[1]}"})
-    time.sleep(0.5)
-    url = f"http://127.0.0.1:{port}/v1/chat/completions"
-    status1, _ = post(url)
-    status2, _ = post(url)
-    status3, body3 = post(url)
-    check("first call under the call cap passes (200)", status1 == 200)
-    check("second call at the cap passes (200)", status2 == 200)
-    check("third call over the call cap is refused (402)", status3 == 402)
-    check("refusal body names the budget", b"budget exhausted" in body3)
-    check("only the two allowed calls reach the upstream",
-          UPSTREAM_HITS == 2)
-    proxy.terminate()
-    upstream.shutdown()
-    record.unlink(missing_ok=True)
+    def test_forward_accounts_a_successful_completion(self):
+        llm_proxy.CALL_CAP = 4000
+        llm_proxy.USD_CAP = 5.0
+        budget = llm_proxy.Budget()
+        llm_proxy.Proxy.budget = budget
+        handler = ShimHandler(body="{}")
+        handler.path = "/v1/chat/completions"
+        handler.budget = llm_proxy.Proxy.budget
+        handler.budget = llm_proxy.Proxy.budget
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.status = 200
+            urlopen.return_value.__enter__.return_value.read.return_value = \
+                OK_BODY.encode()
+            llm_proxy.Proxy._forward(handler, "POST")
+        self.assertEqual(budget.calls, 1)
+        self.assertAlmostEqual(budget.usd, 0.00137)
 
-    # 2. The USD cap refuses on the dollar total.
-    upstream = start_server()
-    record = Path("/tmp") / "llm_proxy_usd_test.jsonl"
-    record.unlink(missing_ok=True)
-    # Two completions at ~0.00137 USD exceed a 0.002 cap after two calls.
-    proxy, port = start_proxy(record, {
-        "ONION_PROXY_CALL_CAP": "4000", "ONION_PROXY_USD_CAP": "0.002",
-        "DEEPSEEK_API_KEY": "test",
-        "ONION_PROXY_UPSTREAM": f"http://127.0.0.1:{upstream.server_address[1]}"})
-    time.sleep(0.5)
-    url = f"http://127.0.0.1:{port}/v1/chat/completions"
-    status1, _ = post(url)
-    status2, _ = post(url)
-    status3, _ = post(url)
-    check("USD cap: first call passes", status1 == 200)
-    check("USD cap: second call passes (still under 0.002)", status2 == 200)
-    check("USD cap: third call refused", status3 == 402)
-    proxy.terminate()
-    upstream.shutdown()
-    record.unlink(missing_ok=True)
-
-    # 3. The history in the record file counts toward the lifetime cap.
-    upstream = start_server()
-    record = Path("/tmp") / "llm_proxy_hist_test.jsonl"
-    record.unlink(missing_ok=True)
-    with record.open("w") as out:
-        out.write(json.dumps({
-            "ts": time.time(), "method": "POST",
-            "path": "/v1/chat/completions", "headers": {}, "body": "{}",
-            "status": 200,
-            "response": json.dumps({"choices": [], "usage": FAKE_USAGE}),
-        }) + "\n")
-    proxy, port = start_proxy(record, {
-        "ONION_PROXY_CALL_CAP": "1", "ONION_PROXY_USD_CAP": "5.00",
-        "DEEPSEEK_API_KEY": "test",
-        "ONION_PROXY_UPSTREAM": f"http://127.0.0.1:{upstream.server_address[1]}"})
-    time.sleep(0.5)
-    url = f"http://127.0.0.1:{port}/v1/chat/completions"
-    status1, _ = post(url)
-    check("history counts: a fresh proxy refuses at the pre-spent cap",
-          status1 == 402)
-    proxy.terminate()
-    upstream.shutdown()
-    record.unlink(missing_ok=True)
-
-    if failures:
-        print(f"{len(failures)} FAILURES")
-        return 1
-    print("all proxy cap checks passed")
-    return 0
+    def test_models_discovery_never_counts(self):
+        llm_proxy.CALL_CAP = 1
+        llm_proxy.USD_CAP = 5.0
+        budget = llm_proxy.Budget()
+        llm_proxy.Proxy.budget = budget
+        handler = ShimHandler()
+        handler.path = "/models"
+        handler.budget = llm_proxy.Proxy.budget
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.status = 200
+            urlopen.return_value.__enter__.return_value.read.return_value = \
+                b"{}"
+            llm_proxy.Proxy._forward(handler, "GET")
+        self.assertEqual(budget.calls, 0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main()
