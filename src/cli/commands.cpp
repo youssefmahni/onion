@@ -1110,8 +1110,14 @@ int review_cmd(int argc, char** argv) {
           dash == std::string::npos ? "" : node.path.substr(0, dash);
       if (parent == path) kept++;
     }
+    // The atomic count comes from the review record (the funnel stored it
+    // with the children), not from the store: ATOMIC has no store effect
+    // yet in M3.
+    int atomic = 0;
+    for (const auto& review : writer->db().open_reviews(&qerror))
+      if (review.path == path) atomic = review.atomic;
     records.push_back(make_record(
-        "SETTLE", {{"path", path}, {"kept", kept}, {"atomic", 0},
+        "SETTLE", {{"path", path}, {"kept", kept}, {"atomic", atomic},
                    {"attempts", 0}, {"score", "0"}, {"end", "children"}}));
   } else if (action == "retry") {
     records.push_back(

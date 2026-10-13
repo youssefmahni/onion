@@ -445,6 +445,118 @@ TEST(GateFunnel, NeedsReviewBelowFloorSpendsNothingMore) {
   EXPECT_EQ(result.attempts.size(), 3u);  // nothing beyond the third attempt
 }
 
+TEST(GateParsers, CritiqueScoreScaleDriftIsRejected) {
+  // W5 gate calibration (DR 0018): the critic must stay on the 0.0-1.0
+  // scale the prompt asks for. Recorded replies parse cleanly; drifted
+  // scales (0-10, 0-100, negative, >1) must fail the attempt instead of
+  // silently mis-scoring the gate.
+  auto ok_parse = parse_critique(
+      R"({"score": 0.15, "remove": [], "add": [], "issues": "x"})");
+  ASSERT_TRUE(ok_parse.has_value());
+  EXPECT_DOUBLE_EQ(ok_parse->score, 0.15);
+  // The two recorded reply shapes from the W5 cassettes.
+  EXPECT_TRUE(parse_critique(
+      R"({"score": 0.62, "remove": ["A"], "add": ["B"], "issues": "pool"})"));
+  EXPECT_TRUE(parse_critique(
+      R"({"score": 0.35, "remove": [], "add": ["X", "Y"], "issues": ""})"));
+  // Scale drift: 0-10, 0-100, negative, above one, non-numeric.
+  EXPECT_FALSE(parse_critique(R"({"score": 7.2})").has_value());
+  EXPECT_FALSE(parse_critique(R"({"score": 72})").has_value());
+  EXPECT_FALSE(parse_critique(R"({"score": -0.1})").has_value());
+  EXPECT_FALSE(parse_critique(R"({"score": 1.5})").has_value());
+  EXPECT_FALSE(parse_critique(R"({"score": "0.15"})").has_value());
+}
+
+TEST(GateFunnel, AtomicVerificationKeepsOnlyAgreedLeaves) {
+  FunnelOptions options;
+  options.verify_atomic = true;
+  options.params.floor_score = 0.0;
+  options.params.pass_score = 0.0;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int verify_calls = 0;
+  auto fake = [&](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos)
+      return ok(R"({"splits": true})");
+    if (request.user.find("Critique this candidate set") != std::string::npos)
+      return ok(R"({"score": 0.9, "remove": [], "add": [], "issues": ""})");
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": true}, {"title": "Three", "atomic": false}]})");
+    // Atomic verification: "One" agrees it admits no children (stays
+    // atomic); "Two" admits children (becomes a task).
+    if (request.user.find("was labelled atomic") != std::string::npos) {
+      ++verify_calls;
+      if (request.user.find("\"One\"") != std::string::npos)
+        return ok(R"({"admits_children": false})");
+      return ok(R"({"admits_children": true})");
+    }
+    return ok(R"({"items": ["A", "B", "C", "D"]})");
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  const auto& children = result.attempts[result.chosen].children;
+  ASSERT_EQ(children.size(), 3u);
+  EXPECT_TRUE(children[0].atomic);   // check agreed: leaf stays atomic
+  EXPECT_FALSE(children[1].atomic);  // check disagreed: stays a task
+  EXPECT_FALSE(children[2].atomic);  // never labelled
+  EXPECT_EQ(verify_calls, 2);        // one call per labelled child
+}
+
+TEST(GateFunnel, AtomicVerificationFailureKeepsTheChildATask) {
+  FunnelOptions options;
+  options.verify_atomic = true;
+  options.params.floor_score = 0.0;
+  options.params.pass_score = 0.0;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  auto fake = [&](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos)
+      return ok(R"({"splits": true})");
+    if (request.user.find("Critique this candidate set") != std::string::npos)
+      return ok(R"({"score": 0.9, "remove": [], "add": [], "issues": ""})");
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
+    if (request.user.find("was labelled atomic") != std::string::npos) {
+      Result bad;
+      bad.kind = Kind::Transport;
+      return bad;  // the verification call itself fails
+    }
+    return ok(R"({"items": ["A", "B", "C", "D"]})");
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  const auto& children = result.attempts[result.chosen].children;
+  // A transport failure must not decide atomicity: the child stays a task.
+  EXPECT_FALSE(children[0].atomic);
+}
+
+TEST(GateFunnel, AtomicVerificationOffPassesLabelsThrough) {
+  FunnelOptions options;
+  options.params.floor_score = 0.0;
+  options.params.pass_score = 0.0;
+  Funnel funnel(options);  // verify_atomic defaults off
+  NodeContext context = ctx();
+  int verify_calls = 0;
+  auto fake = [&](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos)
+      return ok(R"({"splits": true})");
+    if (request.user.find("Critique this candidate set") != std::string::npos)
+      return ok(R"({"score": 0.9, "remove": [], "add": [], "issues": ""})");
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
+    if (request.user.find("was labelled atomic") != std::string::npos)
+      ++verify_calls;
+    return ok(R"({"items": ["A", "B", "C", "D"]})");
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_TRUE(result.attempts[result.chosen].children[0].atomic);
+  EXPECT_EQ(verify_calls, 0);
+}
+
 // ---------------- quality guard ----------------
 
 TEST(QualityGuard, FlagsScoresBelowThresholdWithEnoughEvidence) {

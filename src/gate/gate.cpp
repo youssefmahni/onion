@@ -1,6 +1,7 @@
 #include "gate.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -231,6 +232,13 @@ std::optional<Critique> parse_critique(const std::string& body) {
     return std::nullopt;
   Critique critique;
   critique.score = json["score"].get<double>();
+  // The prompt asks for 0.0-1.0 (usable-candidate ratio).  A score outside
+  // that range means the model drifted scale (0-10, 0-100, percent) and
+  // the attempt must fail rather than silently mis-score the gate — W5
+  // gate calibration finding (DR 0018).
+  if (!std::isfinite(critique.score) || critique.score < 0.0 ||
+      critique.score > 1.0)
+    return std::nullopt;
   if (json.contains("issues") && json["issues"].is_string())
     critique.issues = json["issues"].get<std::string>();
   if (json.contains("remove") && json["remove"].is_array())
@@ -660,6 +668,26 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         if (!parsed) failed = true;
         else children = std::move(*parsed);
         if (children.size() > 100) children.resize(100);
+      }
+    }
+
+    // Atomic verification (DESIGN › Quality gate and retries): a child the
+    // synthesizer labelled atomic is treated as a leaf only when the short
+    // separate check agrees it admits no further decomposition; otherwise
+    // it stays a task.  A failed call also keeps it a task — a transport
+    // error must not decide atomicity.
+    if (!failed && impl_->options.verify_atomic) {
+      for (Child& child : children) {
+        if (!child.atomic) continue;
+        const llm::Result verify = counted(make_request(
+            impl_->options, ctx,
+            atomic_verification_prompt(ctx.title, child.title), 0.0, 32));
+        meter.add(verify);
+        const auto verdict = result_ok(verify)
+                                 ? parse_atomic_verdict(verify.content)
+                                 : std::nullopt;
+        // admits_children true → decomposable → not a leaf: un-flag.
+        if (!verdict || *verdict) child.atomic = false;
       }
     }
 
