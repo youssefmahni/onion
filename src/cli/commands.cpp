@@ -1573,7 +1573,9 @@ int campaign_cmd(int argc, char** argv) {
       return 3;
     }
     writer->submit(onion::state::CommitTerminal{{make_record(
-        "CAMPAIGN", {{"id", spec->id}, {"spec", file}, {"state", "running"}})}});
+        "CAMPAIGN", {{"id", spec->id},
+                     {"spec", onion::sched::campaign_spec_json(*spec)},
+                     {"state", "running"}})}});
     writer->sync();
     std::cout << "campaign " << spec->id << " started\n";
     return 0;

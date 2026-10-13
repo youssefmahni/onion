@@ -51,6 +51,12 @@ struct CampaignSpec {
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
                                            std::string* error);
 
+// The canonical record form of a spec (decision 0003: no floats — gate,
+// floor and every score are exact decimal strings).  Both the campaign
+// start command and the engine's CAMPAIGN record use this, so a record
+// parsed back by parse_campaign yields the same spec.
+nlohmann::json campaign_spec_json(const CampaignSpec& spec);
+
 // Node ids: TK + decimal of slot × 2^40 + counter (DESIGN › Device identity
 // and ID slots). Legacy ids live in slot 0 and keep their numbers.
 class NodeIdAllocator {

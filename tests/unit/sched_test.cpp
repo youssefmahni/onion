@@ -79,6 +79,42 @@ TEST(ParseCampaign, AcceptsTheW5VariantFields) {
   EXPECT_FALSE(plain->compact_output);
 }
 
+TEST(ParseCampaign, GateAndFloorAcceptNumericStrings) {
+  // Decision 0003: records carry scores as exact decimal strings, so the
+  // canonical campaign_spec_json writes gate/floor as strings and the
+  // parser must round-trip them.
+  std::string error;
+  const auto spec = parse_campaign(json{{"id", "s"},
+                                        {"gate", "0.35"},
+                                        {"floor", "0.15"}},
+                                   &error);
+  ASSERT_TRUE(spec.has_value()) << error;
+  EXPECT_DOUBLE_EQ(spec->gate, 0.35);
+  EXPECT_DOUBLE_EQ(spec->floor, 0.15);
+
+  // Numbers still parse (the campaign files use them).
+  const auto number_spec = parse_campaign(
+      json{{"id", "n"}, {"gate", 0.7}, {"floor", 0.5}}, &error);
+  ASSERT_TRUE(number_spec.has_value());
+  EXPECT_DOUBLE_EQ(number_spec->gate, 0.7);
+
+  // The serializer round-trips through the parser (the record carries
+  // the id separately; add it back for the parse).
+  const auto canonical = onion::sched::campaign_spec_json(*spec);
+  EXPECT_TRUE(canonical["gate"].is_string());
+  EXPECT_EQ(canonical["gate"].get<std::string>(), "0.350000");
+  auto canonical_with_id = canonical;
+  canonical_with_id["id"] = "s";
+  const auto reparsed = parse_campaign(canonical_with_id, &error);
+  ASSERT_TRUE(reparsed.has_value()) << error;
+  EXPECT_DOUBLE_EQ(reparsed->gate, 0.35);
+  EXPECT_DOUBLE_EQ(reparsed->floor, 0.15);
+
+  // Garbage strings fail cleanly, not silently.
+  EXPECT_FALSE(parse_campaign(json{{"id", "x"}, {"gate", "high"}}, &error)
+                   .has_value());
+}
+
 TEST(ParseCampaign, RejectsInvalidVariantFields) {
   std::string error;
   EXPECT_FALSE(parse_campaign(json{{"id", "c"}, {"worker_candidates", 0}},
