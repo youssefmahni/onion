@@ -448,6 +448,28 @@ TEST(MeasureParams, PrefersAttemptRowsOverReviewAcceptedSettles) {
   EXPECT_NEAR(params.tokens_out_per_call, 760.0 / 2.0 / 8.0, 1e-9);
 }
 
+TEST(PlanGrowLevels, ClosedFormIsGrowthTimesTheWaveSum) {
+  // N more levels on the whole tree = T × (g + g² + … + g^N): the owner's
+  // growth arithmetic, unlike the depth-target cascade.
+  onion::sched::PlanParams params;
+  params.children_kept = 14.0;
+  params.atomic_share = 0.49;  // the measured verified share (DR 0021)
+  params.attempts_avg = 1.0;
+  params.calls_per_attempt = 1.0;
+  params.precheck_calls = 0.0;
+  const double growth = 14.0 * (1.0 - 0.49);  // 7.14
+  const auto plan = onion::sched::plan_grow_levels(1000, 3, params);
+  EXPECT_EQ(plan.levels.size(), 3u);
+  EXPECT_EQ(plan.levels[0].expandable, 1000);
+  EXPECT_NEAR(plan.levels[0].new_nodes, 1000 * growth, 1.0);
+  EXPECT_NEAR(plan.levels[1].new_nodes, 1000 * growth * growth, 1.0);
+  EXPECT_NEAR(plan.levels[2].new_nodes,
+              1000 * growth * growth * growth, 1.0);
+  EXPECT_NEAR(plan.total_new_nodes,
+              1000 * (growth + growth * growth + growth * growth * growth),
+              2.0);
+}
+
 TEST(PlanCampaign, TimeScalesWithOutputTokensNotCallCount) {
   // Long outputs dominate the funnel: 1,400-token calls take longer than
   // 365-token calls even at the same call count.  Two plans with the same

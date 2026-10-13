@@ -1515,6 +1515,7 @@ int campaign_cmd(int argc, char** argv) {
     }
     const int plan_depth = std::atoi(flag(argc, argv, "--depth-to", "8").c_str());
     const bool one_level = has_flag(argc, argv, "--one-level");
+    const int grow_levels = std::atoi(flag(argc, argv, "--grow-levels", "0").c_str());
     onion::sched::PlanParams params =
         onion::sched::measure_params(writer->db(), &error);
     std::vector<std::int64_t> level_nodes;
@@ -1540,10 +1541,19 @@ int campaign_cmd(int argc, char** argv) {
         }
       if (level_nodes.empty()) level_nodes.push_back(1);  // a fresh root
     }
-    std::cout << onion::sched::plan_report(
-        onion::sched::plan_campaign(level_nodes, plan_depth, params,
-                                    !one_level),
-        params);
+    if (grow_levels > 0) {
+      std::int64_t total = 0;
+      for (const std::int64_t count : level_nodes) total += count;
+      std::cout << onion::sched::plan_report(
+          onion::sched::plan_grow_levels(total, grow_levels, params), params);
+      std::cout << "grow-levels " << grow_levels << " on "
+                << total << " existing nodes\n";
+    } else {
+      std::cout << onion::sched::plan_report(
+          onion::sched::plan_campaign(level_nodes, plan_depth, params,
+                                      !one_level),
+          params);
+    }
     return 0;
   }
 
@@ -1572,6 +1582,9 @@ int campaign_cmd(int argc, char** argv) {
     // cache split, peak/off-peak cost, time and spend per hour, computed
     // from the store's measured records (defaults where unmeasured).
     const int plan_depth = std::atoi(flag(argc, argv, "--depth-to", "8").c_str());
+    const bool one_level = has_flag(argc, argv, "--one-level");
+    const int grow_levels =
+        std::atoi(flag(argc, argv, "--grow-levels", "0").c_str());
     onion::sched::PlanParams params =
         onion::sched::measure_params(writer->db(), &error);
     std::vector<std::int64_t> level_nodes;
@@ -1586,9 +1599,18 @@ int campaign_cmd(int argc, char** argv) {
         }
       if (level_nodes.empty()) level_nodes.push_back(1);  // a fresh root
     }
-    std::cout << onion::sched::plan_report(
-                     onion::sched::plan_campaign(level_nodes, plan_depth, params),
-                     params);
+    if (grow_levels > 0) {
+      std::int64_t total = 0;
+      for (const std::int64_t count : level_nodes) total += count;
+      std::cout << onion::sched::plan_report(
+          onion::sched::plan_grow_levels(total, grow_levels, params), params);
+      std::cout << "grow-levels " << grow_levels << " on "
+                << total << " existing nodes\n";
+    } else {
+      std::cout << onion::sched::plan_report(
+          onion::sched::plan_campaign(level_nodes, plan_depth, params),
+          params);
+    }
     if (!has_flag(argc, argv, "--yes")) {
       std::cerr << "run with --yes to confirm the projection\n";
       return 3;

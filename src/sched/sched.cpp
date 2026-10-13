@@ -1116,6 +1116,78 @@ CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
   return plan;
 }
 
+CampaignPlan plan_grow_levels(std::int64_t expandable_total, int levels,
+                              const PlanParams& params) {
+  CampaignPlan plan;
+  const double per_attempt_in =
+      params.calls_per_attempt * params.tokens_in_per_call;
+  const double per_attempt_out =
+      params.calls_per_attempt * params.tokens_out_per_call;
+  const double hit = params.cache_hit_ratio;
+  const double growth = params.children_kept * (1.0 - params.atomic_share);
+
+  const auto sat = [](std::int64_t value) {
+    return value < 0 ? std::numeric_limits<std::int64_t>::max() : value;
+  };
+  const auto sat_add = [&](std::int64_t a, std::int64_t b) {
+    if (a >= std::numeric_limits<std::int64_t>::max() - b)
+      return std::numeric_limits<std::int64_t>::max();
+    return a + b;
+  };
+
+  long double expandable = static_cast<long double>(expandable_total);
+  for (int wave = 1; wave <= levels; ++wave) {
+    LevelPlan row;
+    row.level = wave;
+    row.expandable = static_cast<std::int64_t>(expandable);
+    const double attempts_d =
+        static_cast<double>(expandable) * params.attempts_avg;
+    row.attempts = sat(static_cast<std::int64_t>(std::llround(attempts_d)));
+    const double calls_d = attempts_d * params.calls_per_attempt +
+        static_cast<double>(expandable) * params.precheck_calls;
+    row.calls = sat(static_cast<std::int64_t>(std::llround(calls_d)));
+    const double prechecks =
+        static_cast<double>(expandable) * params.precheck_calls;
+    const double in_d = attempts_d * per_attempt_in +
+        prechecks * params.precheck_tokens_in;
+    const double out_d = attempts_d * per_attempt_out +
+        prechecks * params.precheck_tokens_out;
+    row.tokens_in_hit = sat(static_cast<std::int64_t>(std::llround(in_d * hit)));
+    row.tokens_in_miss =
+        sat(static_cast<std::int64_t>(std::llround(in_d * (1.0 - hit))));
+    row.tokens_out = sat(static_cast<std::int64_t>(std::llround(out_d)));
+    row.new_nodes = sat(static_cast<std::int64_t>(std::llround(
+        static_cast<long double>(expandable) * growth)));
+    row.cost_peak = money(row.tokens_in_miss, params.price_peak_in) +
+        money(row.tokens_in_hit, params.price_peak_cache) +
+        money(row.tokens_out, params.price_peak_out);
+    row.cost_offpeak = money(row.tokens_in_miss, params.price_offpeak_in) +
+        money(row.tokens_in_hit, params.price_offpeak_cache) +
+        money(row.tokens_out, params.price_offpeak_out);
+    row.hours = static_cast<double>(row.tokens_out) /
+                params.output_tokens_per_s / 3600.0;
+    plan.levels.push_back(row);
+
+    plan.total_new_nodes = sat_add(plan.total_new_nodes, row.new_nodes);
+    plan.total_attempts = sat_add(plan.total_attempts, row.attempts);
+    plan.total_calls = sat_add(plan.total_calls, row.calls);
+    plan.tokens_in_miss = sat_add(plan.tokens_in_miss, row.tokens_in_miss);
+    plan.tokens_in_hit = sat_add(plan.tokens_in_hit, row.tokens_in_hit);
+    plan.tokens_out = sat_add(plan.tokens_out, row.tokens_out);
+    plan.cost_peak += row.cost_peak;
+    plan.cost_offpeak += row.cost_offpeak;
+    plan.hours += row.hours;
+    if (row.new_nodes >= std::numeric_limits<std::int64_t>::max())
+      plan.saturated = true;
+    expandable *= growth;
+  }
+  plan.spend_per_hour_peak =
+      plan.hours > 0.0 ? plan.cost_peak / plan.hours : 0.0;
+  plan.spend_per_hour_offpeak =
+      plan.hours > 0.0 ? plan.cost_offpeak / plan.hours : 0.0;
+  return plan;
+}
+
 PlanParams measure_params(const store::Db& db, std::string* error) {
   PlanParams params;
   std::string query_error;

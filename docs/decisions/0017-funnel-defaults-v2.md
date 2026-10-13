@@ -80,19 +80,29 @@ is the companion decision.
 ## Projection for the exact recommended configuration
 
 Growth factor `children_kept × (1 − atomic_share)` with the target's
-midpoint (14) and atomic 0 (unverified labels never make leaves, DR
-0021): **14** (vs the W5-measured baseline 54.25). Projection inputs
-are synthetic parameters documented in the data dir
-(`~/w54/combined`: 4 settles kept 14/atomic 0/attempts 2, 6 attempts of
-3,143 in / 5,043 out — the V3 per-attempt profile); the commands are
-the standard `campaign plan` invocations.
+midpoint (14) and the **measured verified atomic share 0.49** (DR
+0021): **7.14** (vs the W5-measured baseline 54.25). Projection inputs
+are synthetic parameters documented in the data dir (`~/w54/combined`:
+4 settles kept 14/atomic 7 — share 0.50 ≈ the measured 0.49 —
+attempts 2, 6 attempts of 3,143 in / 5,043 out — the V3 per-attempt
+profile); the commands are the standard `campaign plan` invocations.
 
 | Horizon | new nodes | cost peak / off-peak | time at 60k tokens/s |
 |---|---|---|---|
-| one more level | 4,427,696 | $3,356.11 / $1,678.06 | 11.15 hours |
-| three levels deep | 3.61 × 10^12 | $2.74B / $1.37B | 9.10 × 10^6 hours |
+| one more level | 2,213,848 | $3,356.11 / $1,678.06 | 11.15 hours |
+| three more levels (`--grow-levels 3`) | 126,189,336 | $191,298.53 / $95,649.26 | 635.50 hours |
+
+**Scope of the figures (the owner's ratio question).** The earlier
+3-level row ($2.74B) used `--depth-to 9`, which regrows every level's
+subtree to depth 9: the L0 root's subtree alone cascades 9 growth steps
+(9 × g⁹), so the ratio to the one-level figure came out ~800,000×
+instead of the expected ~g². The faithful "N more levels on the whole
+tree" is the closed-form sum `Σ g^i` over the existing nodes — the new
+`--grow-levels N` mode. At growth 14 the ratio is (14 + 196 + 2,744)/14
+≈ 211 (the owner's ~200×); at the post-verification growth 7.14 it is
+~59×. The corrected three-level row above uses that mode.
 
 Against the W5-measured baseline (growth 54.25): one level −51%
-($6,786.58 → $3,356.11); three levels $2.74B vs the baseline's
-saturated ≥$26.9T. The target range is the single largest whole-tree
-lever.
+($6,786.58 → $3,356.11); the corrected three-level horizon $191k vs the
+baseline's saturated ≥$26.9T depth-9 figure. The target range plus the
+verified atomic share are the two largest whole-tree levers.

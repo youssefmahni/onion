@@ -176,6 +176,15 @@ CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
                            int target_depth, const PlanParams& params,
                            bool expand_children = true);
 
+// "Grow N more levels on the whole existing tree": every existing node
+// expands once (wave 1) and the cascade continues exactly N waves — the
+// closed form sum over waves of growth^i.  Unlike plan_campaign's
+// depth target (which re-grows every level's subtree to the target
+// depth), this is the faithful N-level horizon the owner's growth
+// arithmetic expects (g^N, not g^(depth-L)).
+CampaignPlan plan_grow_levels(std::int64_t expandable_total, int levels,
+                              const PlanParams& params);
+
 // Fills the measured parameters (children kept, atomic share, attempts and
 // tokens per node) from the store's settle and attempt records; every field
 // with no measured data keeps its clearly-labelled default.  Prices, the

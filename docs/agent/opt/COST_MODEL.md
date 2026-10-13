@@ -9,7 +9,7 @@ are listed; the binary is `build/<preset>/data_depot`).
 | Parameter | Value | Source |
 |---|---|---|
 | children kept per node | 54.25 | W5 baseline measured, n=4 non-leaf settles: kept {100, 100, 10, 7} |
-| atomic share | 0.00 | W5 baseline measured: 0 atomic children in the kept sets |
+| atomic share | 0.49 | measured VERIFIED share, DR 0021 (166/340 on the W5 sample) |
 | attempts per node | 1.75 | W5 baseline measured: 21 attempts / 12 settles (attempts table) |
 | calls per attempt | 8 | engine |
 | input tokens per call | ~570 | measured: 95,784 in / 21 attempts / 8 calls |
@@ -44,8 +44,9 @@ output tokens (the probe's tiny answers were about 365). Money =
 tokens × price / 1M (the engine's integer-decimal metering); spend per
 hour = cost ÷ hours.
 
-## Projection tables (2026-10-13, W5 baseline measured parameters, from
-## `--data-dir ~/w5-base/data`)
+## Projection tables (2026-10-13, decision-0017 configuration: the
+## target 8-20 midpoint 14 with the measured verified atomic share 0.49 —
+## growth 7.14; synthetic params in `~/w54/combined`)
 
 ### A. P01+P06, one more level (existing corpus processed once; the new
 ### children are not re-expanded)
@@ -57,12 +58,12 @@ campaign plan campaign.json --depth-to 6 --one-level --from-counts 9,17,95,818,1
 | Quantity | Value |
 |---|---|
 | expandable nodes | 316,264 |
-| new nodes (one level of children) | 17,157,323 |
-| attempts / calls | 553,462 / 4,743,960 |
-| input (miss/hit) · output tokens | 2.59B / 0 · 5.01B |
-| cost peak / off-peak | $6,786.58 / $3,393.29 |
-| time at 60k output tokens/s | 23.19 hours |
-| spend per hour peak / off-peak | $292.68 / $146.34 |
+| new nodes (one level of children) | 2,213,848 |
+| attempts / calls | 474,399 / 4,111,432 |
+| input (miss/hit) · output tokens | 1.02B / 0 · 1.59B |
+| cost peak / off-peak | $3,356.11 / $1,678.06 |
+| time at 60k output tokens/s | 11.15 hours |
+| spend per hour peak / off-peak | $301.02 / $150.51 |
 
 ### B. The 7 empty phases, grown to today's depth (L6)
 
@@ -72,12 +73,16 @@ campaign plan campaign.json --depth-to 5 --from-counts 7 --data-dir ~/w5-base/da
 
 | Quantity | Value |
 |---|---|
-| new nodes | 181,912,497,644 |
-| attempts / calls | 5.87B / 50.30B |
-| input · output tokens | 27.44T · 53.10T |
-| cost peak / off-peak | $71,955,530.36 / $35,977,765.18 |
-| time at 60k output tokens/s | 245,851.48 hours (~28 years) |
-| spend per hour peak / off-peak | $292.68 / $146.34 |
+| new nodes (`--grow-levels 3` on all 316,264) | 126,189,336 |
+| attempts / calls | 27.04M / 234.35M |
+| input · output tokens | 88.59B · 137.27B |
+| cost peak / off-peak | $191,298.53 / $95,649.26 |
+| time at 60k output tokens/s | 635.50 hours (~26 days) |
+| spend per hour peak / off-peak | $301.02 / $150.51 |
+
+Note the scope change: the earlier B table grew the seven empty phases
+from their 7 roots; this one is the whole existing tree grown three
+waves (the owner's ~g²-ratio semantics; see DR 0017).
 
 ### C. The full tree to L9 (everything expanded)
 
