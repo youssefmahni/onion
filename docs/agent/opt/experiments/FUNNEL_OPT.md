@@ -121,3 +121,38 @@ configuration on a fresh 12-path sample. W5's real-API spend exceeded
 its 1,000-call allocation (see PROGRESS.md) — 1,226 funnel completions
 plus ~40 judge calls — so the combined-config validation is deferred to
 the owner's call on DR 0017.
+
+## Whole-tree re-ranking (2026-10-13, no new spend)
+
+`campaign plan` per variant with that variant's measured parameters
+(merged sample-path + TK83748 supplement dirs), full-corpus counts,
+one level (`--one-level`) and three levels deep (`--depth-to 9`).
+
+| Variant | one-level cost | 3-level cost (3L) | 3L new nodes | measured growth | notes |
+|---|---|---|---|---|---|
+| v5 compact | $16,206.90 | **$1.37M** | 80.2M | 50 × (1−0.94) = 3.0 | atomic share 0.94 is an *unverified-label artifact*: the engine-committed settle labelled 94/94 children atomic. With verification (DR 0018) the share collapses and the true growth ≈ 50 — its #1 spot is fake. |
+| v7-full (L6 paths) | — | $2.84B | 861B | 12 | the default knobs on L6 nodes keep few children — a level effect, not a config win |
+| v3 trim 150 | $7,822.45 | $4.02B | 2.15T | 17.8 × (1−0.25) = 13.3 | atomic 0.25 from one 18/18 commit; verified growth ≈ 17.8 |
+| v1 candidates 40 | $5,230.63 | $11.1B | 10.5T | 15.7 × 1.0 | atomic 0 — clean |
+| v6 cache prefix | $15,523.28 | $26.1B | 8.1T | 17.8 | |
+| v4 synth max 40 | $10,214.98 | $6.4T | 5.94e15 | 30.0 × 1.0 | worst non-artifact growth |
+| v2 aspects 3–5 | $9,939.05 | saturated ≥$14.8T | — | 36.2 | |
+| base | $6,786.58 | saturated ≥$26.9T | — | 54.25 | |
+| v7-light | — | saturated ≥$41.2T | — | 100 (one 100-kept path) | |
+
+**V4 re-evaluated: excluded.** At depth the per-node savings vanish: V4
+keeps 30 children/node (atomic 0) so the tree grows ~2× faster than v1
+and ~1.7× faster than v3 — whole-tree cost $6.4T, the worst non-artifact
+projection. V4's per-node economy is a depth-1 illusion.
+
+**V7 re-evaluated: the light funnel loses on whole-tree cost.** The
+light funnel halves per-node tokens but kept 100 children on its
+splittable L6 path vs the full funnel's 8–16 — a ~6× growth-factor
+increase that saturates the depth projection (≥$41.2T vs $2.84B).
+The light funnel is a per-node saving at a tree-growth cost; on this
+sample the trade loses. (The right lever is *what the synthesizer is
+asked to keep*, not *how many aspects the light funnel trims*.)
+
+**Re-ranked top two (real configs):** v3 (single trim to 150) and v1
+(40 candidates) — the two lowest genuine whole-tree costs; these are
+the W5.4 candidates.
