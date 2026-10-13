@@ -531,4 +531,31 @@ bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
   return true;
 }
 
+std::vector<Attempt> Db::attempts(std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT path, n, score, passed, tokens_in, tokens_cached, tokens_out, "
+      "cost, campaign, hlc, origin FROM attempts ORDER BY origin, hlc;",
+      error);
+  if (!stmt) return {};
+  std::string step_error;
+  std::vector<Attempt> attempts;
+  while (stmt->step_row(&step_error)) {
+    Attempt attempt;
+    attempt.path = stmt->text(0);
+    attempt.n = stmt->integer_int(1);
+    attempt.score = stmt->text(2);
+    attempt.passed = stmt->integer_int(3);
+    attempt.tokens_in = stmt->integer(4);
+    attempt.tokens_cached = stmt->integer(5);
+    attempt.tokens_out = stmt->integer(6);
+    attempt.cost = stmt->text(7);
+    attempt.campaign = stmt->text(8);
+    attempt.hlc = static_cast<std::uint64_t>(stmt->integer(9));
+    attempt.origin = stmt->text(10);
+    attempts.push_back(std::move(attempt));
+  }
+  if (!step_error.empty()) set_error(error, handle_, "attempts query failed");
+  return attempts;
+}
+
 }  // namespace onion::store

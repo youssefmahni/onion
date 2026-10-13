@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <cstdio>
 #include <deque>
 #include <limits>
@@ -894,6 +896,144 @@ std::optional<std::string> lane_owner(std::string_view path,
     }
   }
   return best_id;
+}
+
+// ----------------------------------------------------------------- plan
+
+namespace {
+double money(std::int64_t tokens, double per_million) {
+  return static_cast<double>(tokens) * per_million / 1000000.0;
+}
+}  // namespace
+
+CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
+                           int target_depth, const PlanParams& params,
+                           bool expand_children) {
+  CampaignPlan plan;
+  std::vector<std::int64_t> expandable = level_nodes;
+  if (expandable.size() < static_cast<std::size_t>(target_depth + 2))
+    expandable.resize(target_depth + 2, 0);
+
+  const double per_attempt_in =
+      params.calls_per_attempt * params.tokens_in_per_call;
+  const double per_attempt_out =
+      params.calls_per_attempt * params.tokens_out_per_call;
+  const double hit = params.cache_hit_ratio;
+  const double growth = params.children_kept * (1.0 - params.atomic_share);
+
+  for (int level = 0; level <= target_depth; ++level) {
+    LevelPlan row;
+    row.level = level;
+    row.expandable = expandable[level];
+    const double attempts_d =
+        static_cast<double>(row.expandable) * params.attempts_avg;
+    row.attempts = static_cast<std::int64_t>(std::llround(attempts_d));
+    const double calls_d = attempts_d * params.calls_per_attempt +
+        static_cast<double>(row.expandable) * params.precheck_calls;
+    row.calls = static_cast<std::int64_t>(std::llround(calls_d));
+    const double prechecks =
+        static_cast<double>(row.expandable) * params.precheck_calls;
+    const double in_d = attempts_d * per_attempt_in +
+        prechecks * params.precheck_tokens_in;
+    const double out_d = attempts_d * per_attempt_out +
+        prechecks * params.precheck_tokens_out;
+    row.tokens_in_hit = static_cast<std::int64_t>(std::llround(in_d * hit));
+    row.tokens_in_miss = static_cast<std::int64_t>(std::llround(in_d * (1.0 - hit)));
+    row.tokens_out = static_cast<std::int64_t>(std::llround(out_d));
+    row.new_nodes =
+        static_cast<std::int64_t>(std::llround(attempts_d / params.attempts_avg * growth));
+    if (expand_children && level + 1 < static_cast<int>(expandable.size()))
+      expandable[level + 1] += row.new_nodes;
+    const double cost_in_peak = money(row.tokens_in_miss, params.price_peak_in) +
+        money(row.tokens_in_hit, params.price_peak_cache);
+    const double cost_in_off = money(row.tokens_in_miss, params.price_offpeak_in) +
+        money(row.tokens_in_hit, params.price_offpeak_cache);
+    row.cost_peak = cost_in_peak + money(row.tokens_out, params.price_peak_out);
+    row.cost_offpeak = cost_in_off + money(row.tokens_out, params.price_offpeak_out);
+    row.hours = static_cast<double>(row.tokens_out) / params.output_tokens_per_s / 3600.0;
+    plan.levels.push_back(row);
+
+    plan.total_new_nodes += row.new_nodes;
+    plan.total_attempts += row.attempts;
+    plan.total_calls += row.calls;
+    plan.tokens_in_miss += row.tokens_in_miss;
+    plan.tokens_in_hit += row.tokens_in_hit;
+    plan.tokens_out += row.tokens_out;
+    plan.cost_peak += row.cost_peak;
+    plan.cost_offpeak += row.cost_offpeak;
+    plan.hours += row.hours;
+  }
+  plan.spend_per_hour_peak = plan.hours > 0.0 ? plan.cost_peak / plan.hours : 0.0;
+  plan.spend_per_hour_offpeak =
+      plan.hours > 0.0 ? plan.cost_offpeak / plan.hours : 0.0;
+  return plan;
+}
+
+PlanParams measure_params(const store::Db& db, std::string* error) {
+  PlanParams params;
+  std::string query_error;
+  const auto settles = db.settles(&query_error);
+  const auto attempts = db.attempts(&query_error);
+  if (!query_error.empty() && error) *error = query_error;
+
+  double kept_sum = 0.0;
+  double atomic_sum = 0.0;
+  double attempts_sum = 0.0;
+  std::int64_t settles_with_children = 0;
+  for (const auto& settle : settles) {
+    if (settle.kept <= 0) continue;
+    ++settles_with_children;
+    kept_sum += static_cast<double>(settle.kept);
+    atomic_sum += static_cast<double>(settle.atomic);
+    attempts_sum += static_cast<double>(settle.attempts);
+  }
+  if (settles_with_children > 0) {
+    params.children_kept = kept_sum / settles_with_children;
+    params.atomic_share = atomic_sum / kept_sum;
+    params.attempts_avg = attempts_sum / settles_with_children;
+  }
+  double in_sum = 0.0;
+  double out_sum = 0.0;
+  std::int64_t attempt_rows = 0;
+  for (const auto& attempt : attempts) {
+    in_sum += static_cast<double>(attempt.tokens_in);
+    out_sum += static_cast<double>(attempt.tokens_out);
+    ++attempt_rows;
+  }
+  if (attempt_rows > 0) {
+    // One attempt is about `calls_per_attempt` calls; recover the per-call
+    // average from the measured per-attempt tokens.
+    params.tokens_in_per_call = in_sum / attempt_rows / params.calls_per_attempt;
+    params.tokens_out_per_call = out_sum / attempt_rows / params.calls_per_attempt;
+  }
+  return params;
+}
+
+std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
+  std::ostringstream out;
+  out << "level expandable new_nodes attempts calls in_miss in_hit out_tokens"
+         " cost_peak cost_offpeak hours\n";
+  for (const auto& row : plan.levels) {
+    out << row.level << " " << row.expandable << " " << row.new_nodes << " "
+        << row.attempts << " " << row.calls << " " << row.tokens_in_miss << " "
+        << row.tokens_in_hit << " " << row.tokens_out << " "
+        << std::fixed << std::setprecision(2) << row.cost_peak << " "
+        << row.cost_offpeak << " " << row.hours << "\n";
+  }
+  out << "total new_nodes=" << plan.total_new_nodes
+      << " attempts=" << plan.total_attempts
+      << " calls=" << plan.total_calls << "\n";
+  out << "tokens in_miss=" << plan.tokens_in_miss
+      << " in_hit=" << plan.tokens_in_hit
+      << " out=" << plan.tokens_out << "\n";
+  out << std::fixed << std::setprecision(2)
+      << "cost peak=" << plan.cost_peak << " offpeak=" << plan.cost_offpeak
+      << " USD\n";
+  out << "time at " << std::setprecision(0) << params.output_tokens_per_s
+      << " output tokens/s: " << std::setprecision(2) << plan.hours << " hours\n";
+  out << "spend/hour peak=" << plan.spend_per_hour_peak
+      << " offpeak=" << plan.spend_per_hour_offpeak << " USD\n";
+  return out.str();
 }
 
 }  // namespace onion::sched

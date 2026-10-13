@@ -158,6 +158,9 @@ class StateWriter {
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
+  // Duplicate-path rows skipped by the last development import (INSERT OR
+  // IGNORE keeps the first row); reported by the CLI.
+  std::size_t last_import_skipped() const { return import_skipped_.load(); }
 
  private:
   struct Command {
@@ -204,6 +207,7 @@ class StateWriter {
 
   std::atomic<std::uint64_t> next_seq_{1};
   std::atomic<std::uint64_t> next_batch_{1};
+  std::atomic<std::size_t> import_skipped_{0};
   std::string prev_hash_;  // empty until the first batch
 
   // Writer-thread state: pending ATTEMPT group-commit.

@@ -129,6 +129,9 @@ class Db {
   // Closes the handle so the file can be deleted (needed on Windows, where
   // an open database keeps its files locked).
   void close();
+  // The raw handle, for callers that need sqlite3 functions directly
+  // (e.g. sqlite3_changes).
+  sqlite3* handle() const { return handle_; }
 
   // Plain SQL with no results.
   bool exec(std::string_view sql, std::string* error);
@@ -145,6 +148,8 @@ class Db {
   std::vector<Review> open_reviews(std::string* error) const;
   std::vector<Campaign> campaigns(std::string* error) const;
   std::vector<Settle> settles(std::string* error) const;
+  // All ATTEMPT audit rows, for measured cost parameters (decision 0016).
+  std::vector<Attempt> attempts(std::string* error) const;
   std::int64_t max_node_id(std::string* error) const;
   // The largest numeric TK id value (TK<digits>) in nodes.
   std::int64_t max_tk_value(std::string* error) const;
