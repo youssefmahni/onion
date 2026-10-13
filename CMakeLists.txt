@@ -331,7 +331,7 @@ if(BUILD_TESTING)
     ENVIRONMENT "ONION_SYNC_SAT_DEADLINE_S=180;TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan_suppressions.txt")
   add_test(NAME m7.dynamic_fleet_scenarios COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dynamic_fleet_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(m7.dynamic_fleet_scenarios PROPERTIES
-    TIMEOUT 420
+    TIMEOUT 540
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
     SKIP_RETURN_CODE 77)
   # A hookless (release) build must ignore the chaos env knobs entirely.

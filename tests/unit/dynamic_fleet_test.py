@@ -211,6 +211,24 @@ def main():
                 time.sleep(2.0)
             raise AssertionError("nodes never converged: %r" % last)
 
+        def wait_merkle(apis, timeout=60):
+            # Equal settled counts can momentarily precede the last
+            # conflicting settle's propagation (a steal lands twice with
+            # different scores and the winner fold resolves it everywhere
+            # only once both records arrived). The Merkle root proves
+            # every device holds the same records — the deterministic
+            # gate before any winner scan.
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    roots = [state(a)["merkle_root"] for a in apis]
+                    if roots[0] and roots[0] == roots[1] == roots[2]:
+                        return
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            raise AssertionError("merkle roots never agreed")
+
         # ---------------------------------------------------------------
         # Scenario A: node 3 joins mid-run and converges.
         # The campaign starts BEFORE the nodes launch (one writer per
@@ -369,6 +387,10 @@ def main():
             write_members([1, 2, 3], os.path.join(devices[index]["data"],
                                                   "members.json"))
         settled = wait_converged([devices[i]["api"] for i in (1, 2, 3)])
+        # Every device must hold the SAME records before the winner
+        # scan: a stolen ticket settled twice resolves by the winner
+        # fold only once both records reached every replica.
+        wait_merkle([devices[i]["api"] for i in (1, 2, 3)])
         # The steal actually happened: node 3's oplog carries CLAIM
         # records (the fleet works through its own lanes first, then
         # claims from the busy ones).
