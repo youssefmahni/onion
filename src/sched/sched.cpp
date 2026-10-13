@@ -127,6 +127,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
 
 nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   nlohmann::json out{
+      {"id", spec.id},
       {"scope", spec.scope},
       {"loop_budget", spec.loop_budget},
       {"mode", spec.mode},

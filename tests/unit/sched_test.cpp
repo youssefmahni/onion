@@ -103,9 +103,7 @@ TEST(ParseCampaign, GateAndFloorAcceptNumericStrings) {
   const auto canonical = onion::sched::campaign_spec_json(*spec);
   EXPECT_TRUE(canonical["gate"].is_string());
   EXPECT_EQ(canonical["gate"].get<std::string>(), "0.350000");
-  auto canonical_with_id = canonical;
-  canonical_with_id["id"] = "s";
-  const auto reparsed = parse_campaign(canonical_with_id, &error);
+  const auto reparsed = parse_campaign(canonical, &error);
   ASSERT_TRUE(reparsed.has_value()) << error;
   EXPECT_DOUBLE_EQ(reparsed->gate, 0.35);
   EXPECT_DOUBLE_EQ(reparsed->floor, 0.15);
