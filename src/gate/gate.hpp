@@ -60,9 +60,12 @@ std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::string& critique_text,
                                int target_min = 8, int target_max = 20,
                                int max_children = 30, bool compact = false);
-// The short separate call that confirms a child labelled atomic is a leaf.
-std::string atomic_verification_prompt(const std::string& node_title,
-                                       const std::string& child_title);
+// The short separate call that confirms a child labelled atomic is a leaf
+// (decision 0021: batched — ONE call per parent listing every labelled
+// child; the reply names which admit no further decomposition).
+std::string atomic_verification_prompt(
+    const std::string& node_title,
+    const std::vector<std::string>& labelled_children);
 
 // ---- strict parsers (reject malformed bodies) ----
 std::optional<std::vector<std::string>> parse_items(const std::string& body);
@@ -75,7 +78,8 @@ struct Critique {
 };
 std::optional<Critique> parse_critique(const std::string& body);
 std::optional<bool> parse_precheck(const std::string& body);
-std::optional<bool> parse_atomic_verdict(const std::string& body);
+std::optional<std::vector<std::string>> parse_atomic_verdict(
+    const std::string& body);
 
 // ---- deterministic checks (pure) ----
 struct Checks {
@@ -147,7 +151,7 @@ struct FunnelOptions {
   // store effect yet ("store effects arrive with their milestones"), and
   // the new model labels ~70% of children atomic, which makes the sweep
   // expensive (see DR 0018).
-  bool verify_atomic{false};
+  bool verify_atomic{true};  // decision 0021: batched, on by default
   // Optional per-1M-token prices (USD per 1M). When set, the attempt cost
   // is computed from usage; when absent, cost stays 0 (node.conf arrives
   // with M5 — decision 0004: no implicit monetary defaults).

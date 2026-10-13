@@ -1,7 +1,7 @@
 # 0021 — Batched atomic verification (Proposed)
 
-Status: **Proposed** (owner decision required). Claimed by the OPT
-track; next free number at claim time.
+Status: **Accepted** (owner, 2026-10-13): implement behind
+`verify_atomic`, default on once tested, measure the verified share.
 
 ## What the engine does today (verify_atomic off — the default)
 
@@ -46,8 +46,17 @@ with 20 titles, ~100 out) per parent — roughly a 6–20× reduction, or
 one extra call per commit (~2% of the attempt's tokens at the V3
 profile of 3,143 in / 5,043 out per attempt).
 
-## Decision needed
+## Implementation and measurement (done)
 
-Accept (implement the batched prompt + wiring behind `verify_atomic`),
-adjust, or reject. Until approved, the stop-rule fix above keeps
-unverified labels inert.
+The per-child loop is replaced by ONE call per attempt listing the
+labelled children; the reply's `admits_none` names the verified leaves.
+`verify_atomic` is ON by default; unit tests cover the named/unnamed/
+failure/default paths and the strict parser. Engine-test fake updated.
+
+**Measured on the W5 sample** (5 settled sets, 340 kept children, one
+call each): **verified atomic share 0.49** (166/340) — per set
+0.00→0.50/0.57/0.92/1.00 after fixing a truncation bug found by the
+measurement itself (a 128-token reply cap cannot name 57 titles; the
+call budget now scales with the list, `max(128, 10×labelled)`). The
+growth factor halves post-verification: `children_kept × (1 − 0.49)`.
+COST_MODEL.md was regenerated with the measured share.

@@ -119,7 +119,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   }
   spec.compact_output = value.value("compact_output", false);
   spec.cache_prefix = value.value("cache_prefix", true);
-  spec.verify_atomic = value.value("verify_atomic", false);
+  spec.verify_atomic = value.value("verify_atomic", true);
   if (spec.loop_budget < 1) return fail("loop_budget must be positive");
   if (spec.chunk < 1) return fail("chunk must be positive");
   return spec;

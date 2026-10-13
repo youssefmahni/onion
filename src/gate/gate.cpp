@@ -176,13 +176,19 @@ std::string synthesizer_prompt(const NodeContext& ctx,
   return out.str();
 }
 
-std::string atomic_verification_prompt(const std::string& node_title,
-                                       const std::string& child_title) {
-  return "The item \"" + child_title + "\" was labelled atomic under \"" +
-         node_title +
-         "\". Does it admit further decomposition into simpler sub-items for "
-         "an AI-agent knowledge base? Answer ONLY with JSON "
-         "{\"admits_children\": true} or {\"admits_children\": false}.";
+std::string atomic_verification_prompt(
+    const std::string& node_title,
+    const std::vector<std::string>& labelled_children) {
+  std::ostringstream out;
+  out << "The node \"" << node_title
+      << "\" was expanded and these children were labelled atomic (cannot "
+         "be decomposed further):\n";
+  for (const std::string& child : labelled_children) out << "- " << child << "\n";
+  out << "Verify each against the node: which of these admit NO further "
+         "decomposition into simpler sub-items for an AI-agent knowledge "
+         "base? Answer ONLY with JSON {\"admits_none\": [ their titles "
+         "VERBATIM ]}.";
+  return out.str();
 }
 
 std::optional<std::vector<std::string>> parse_items(const std::string& body) {
@@ -280,13 +286,18 @@ std::optional<bool> parse_precheck(const std::string& body) {
   return json["splits"].get<bool>();
 }
 
-std::optional<bool> parse_atomic_verdict(const std::string& body) {
+std::optional<std::vector<std::string>> parse_atomic_verdict(
+    const std::string& body) {
   auto json = nlohmann::json::parse(body, nullptr, false);
   if (json.is_discarded() || !json.is_object() ||
-      !json.contains("admits_children") ||
-      !json["admits_children"].is_boolean())
+      !json.contains("admits_none") || !json["admits_none"].is_array())
     return std::nullopt;
-  return json["admits_children"].get<bool>();
+  std::vector<std::string> admits_none;
+  for (const auto& item : json["admits_none"]) {
+    if (!item.is_string()) return std::nullopt;
+    admits_none.push_back(item.get<std::string>());
+  }
+  return admits_none;
 }
 
 bool Checks::passed() const {
@@ -695,23 +706,36 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       }
     }
 
-    // Atomic verification (DESIGN › Quality gate and retries): a child the
-    // synthesizer labelled atomic is treated as a leaf only when the short
-    // separate check agrees it admits no further decomposition; otherwise
-    // it stays a task.  A failed call also keeps it a task — a transport
-    // error must not decide atomicity.
+    // Atomic verification (DESIGN › Quality gate and retries; decision
+    // 0021: batched — ONE call per parent).  A child the synthesizer
+    // labelled atomic is a leaf only when the check names it in
+    // admits_none; otherwise it stays a task.  A failed call keeps every
+    // labelled child a task — a transport error must not decide
+    // atomicity.
     if (!failed && impl_->options.verify_atomic) {
-      for (Child& child : children) {
-        if (!child.atomic) continue;
+      std::vector<std::string> labelled;
+      for (const Child& child : children)
+        if (child.atomic) labelled.push_back(child.title);
+      if (!labelled.empty()) {
+        // The reply must be able to NAME titles: the budget scales with
+        // the labelled list (a 128-token cap truncated the 57-title
+        // replies in the DR 0021 measurement).
         const llm::Result verify = counted(make_request(
             impl_->options, ctx,
-            atomic_verification_prompt(ctx.title, child.title), 0.0, 32));
+            atomic_verification_prompt(ctx.title, labelled), 0.0,
+            std::max(128, 10 * static_cast<int>(labelled.size()))));
         meter.add(verify);
         const auto verdict = result_ok(verify)
                                  ? parse_atomic_verdict(verify.content)
                                  : std::nullopt;
-        // admits_children true → decomposable → not a leaf: un-flag.
-        if (!verdict || *verdict) child.atomic = false;
+        std::set<std::string> admits_none;
+        if (verdict)
+          for (const std::string& title : *verdict)
+            admits_none.insert(depot::canonical(title));
+        for (Child& child : children)
+          if (child.atomic &&
+              admits_none.count(depot::canonical(child.title)) == 0)
+            child.atomic = false;
       }
     }
 

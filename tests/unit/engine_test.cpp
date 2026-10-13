@@ -94,10 +94,14 @@ SyncAsk funnel_fake(int max_depth, std::vector<json>* calls = nullptr,
              {"atomic", depth >= atomic_from}});
       return reply(json{{"items", children}}.dump());
     }
-    // Atomic verification (DR 0021): the fake agrees the labelled-atomic
-    // children admit no further decomposition, so the labels are verified.
-    if (prompt.find("was labelled atomic") != std::string::npos)
-      return reply(json{{"admits_children", false}}.dump());
+    // Atomic verification (DR 0021): the fake names the full palette in
+    // admits_none — a superset of the labelled children — so the labels
+    // survive as verified.
+    if (prompt.find("were labelled atomic") != std::string::npos) {
+      json none = json::array();
+      for (const auto& item : kPalette) none.push_back(item);
+      return reply(json{{"admits_none", none}}.dump());
+    }
     return reply(json{{"items", {"One", "Two", "Three"}}}.dump());
   };
 }

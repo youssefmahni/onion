@@ -241,10 +241,10 @@ TEST(GateParsers, StrictJsonRejectsMalformedBodies) {
   const auto splits_no = parse_precheck(R"({"splits": false})");
   ASSERT_TRUE(splits_no.has_value());
   EXPECT_FALSE(*splits_no);
-  const auto verdict = parse_atomic_verdict(R"({"admits_children": true})");
+  const auto verdict = parse_atomic_verdict(R"({"admits_none": ["A"]})");
   ASSERT_TRUE(verdict.has_value());
-  EXPECT_TRUE(*verdict);
-  EXPECT_TRUE(*verdict);
+  EXPECT_EQ(verdict->size(), 1u);
+  EXPECT_EQ((*verdict)[0], "A");
 }
 
 TEST(GatePrompts, PrecheckPromptIsAtMostFourHundredTokensApprox) {
@@ -519,7 +519,7 @@ TEST(GateParsers, ChildrenKeyFromTheRecordedW54Replies) {
   EXPECT_FALSE(parse_children(R"({"other": []})"));
 }
 
-TEST(GateFunnel, AtomicVerificationKeepsOnlyAgreedLeaves) {
+TEST(GateFunnel, BatchedAtomicVerificationKeepsOnlyNamedLeaves) {
   FunnelOptions options;
   options.verify_atomic = true;
   options.params.floor_score = 0.0;
@@ -535,13 +535,14 @@ TEST(GateFunnel, AtomicVerificationKeepsOnlyAgreedLeaves) {
     if (request.user.find("select the final children set") !=
         std::string::npos)
       return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": true}, {"title": "Three", "atomic": false}]})");
-    // Atomic verification: "One" agrees it admits no children (stays
-    // atomic); "Two" admits children (becomes a task).
-    if (request.user.find("was labelled atomic") != std::string::npos) {
+    // Decision 0021: ONE batched call lists the labelled children; the
+    // reply names which admit no decomposition.  "One" is named, "Two"
+    // is not — so "Two" stays a task.
+    if (request.user.find("were labelled atomic") != std::string::npos) {
       ++verify_calls;
-      if (request.user.find("\"One\"") != std::string::npos)
-        return ok(R"({"admits_children": false})");
-      return ok(R"({"admits_children": true})");
+      EXPECT_NE(request.user.find("One"), std::string::npos);
+      EXPECT_NE(request.user.find("Two"), std::string::npos);
+      return ok(R"({"admits_none": ["One"]})");
     }
     return ok(R"({"items": ["A", "B", "C", "D"]})");
   };
@@ -549,13 +550,13 @@ TEST(GateFunnel, AtomicVerificationKeepsOnlyAgreedLeaves) {
   ASSERT_EQ(result.decision, Decision::Commit);
   const auto& children = result.attempts[result.chosen].children;
   ASSERT_EQ(children.size(), 3u);
-  EXPECT_TRUE(children[0].atomic);   // check agreed: leaf stays atomic
-  EXPECT_FALSE(children[1].atomic);  // check disagreed: stays a task
+  EXPECT_TRUE(children[0].atomic);   // named by the check: leaf
+  EXPECT_FALSE(children[1].atomic);  // not named: stays a task
   EXPECT_FALSE(children[2].atomic);  // never labelled
-  EXPECT_EQ(verify_calls, 2);        // one call per labelled child
+  EXPECT_EQ(verify_calls, 1);        // ONE call for the whole attempt
 }
 
-TEST(GateFunnel, AtomicVerificationFailureKeepsTheChildATask) {
+TEST(GateFunnel, BatchedAtomicVerificationFailureKeepsEveryChildATask) {
   FunnelOptions options;
   options.verify_atomic = true;
   options.params.floor_score = 0.0;
@@ -570,7 +571,7 @@ TEST(GateFunnel, AtomicVerificationFailureKeepsTheChildATask) {
     if (request.user.find("select the final children set") !=
         std::string::npos)
       return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
-    if (request.user.find("was labelled atomic") != std::string::npos) {
+    if (request.user.find("were labelled atomic") != std::string::npos) {
       Result bad;
       bad.kind = Kind::Transport;
       return bad;  // the verification call itself fails
@@ -584,11 +585,11 @@ TEST(GateFunnel, AtomicVerificationFailureKeepsTheChildATask) {
   EXPECT_FALSE(children[0].atomic);
 }
 
-TEST(GateFunnel, AtomicVerificationOffPassesLabelsThrough) {
-  FunnelOptions options;
+TEST(GateFunnel, BatchedVerificationRunsByDefault) {
+  FunnelOptions options;  // verify_atomic defaults on (decision 0021)
   options.params.floor_score = 0.0;
   options.params.pass_score = 0.0;
-  Funnel funnel(options);  // verify_atomic defaults off
+  Funnel funnel(options);
   NodeContext context = ctx();
   int verify_calls = 0;
   auto fake = [&](const Request& request) -> Result {
@@ -599,17 +600,31 @@ TEST(GateFunnel, AtomicVerificationOffPassesLabelsThrough) {
     if (request.user.find("select the final children set") !=
         std::string::npos)
       return ok(R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
-    if (request.user.find("was labelled atomic") != std::string::npos)
+    if (request.user.find("were labelled atomic") != std::string::npos) {
       ++verify_calls;
+      return ok(R"({"admits_none": []})");
+    }
     return ok(R"({"items": ["A", "B", "C", "D"]})");
   };
   const FunnelResult result = funnel.run(context, fake);
   ASSERT_EQ(result.decision, Decision::Commit);
-  EXPECT_TRUE(result.attempts[result.chosen].children[0].atomic);
-  EXPECT_EQ(verify_calls, 0);
+  EXPECT_EQ(verify_calls, 1);
+  // The check named nothing: the label does not survive.
+  EXPECT_FALSE(result.attempts[result.chosen].children[0].atomic);
 }
 
-// ---------------- quality guard ----------------
+TEST(GateParsers, BatchedAtomicVerdictIsStrict) {
+  auto verdict = parse_atomic_verdict(R"({"admits_none": ["One", "Two"]})");
+  ASSERT_TRUE(verdict.has_value());
+  ASSERT_EQ(verdict->size(), 2u);
+  EXPECT_EQ((*verdict)[0], "One");
+  EXPECT_TRUE(parse_atomic_verdict(R"({"admits_none": []})").has_value());
+  EXPECT_FALSE(parse_atomic_verdict(R"({"admits_none": ["One", 2]})"));
+  EXPECT_FALSE(parse_atomic_verdict(R"({"other": []})"));
+  EXPECT_FALSE(parse_atomic_verdict(R"({"admits_none": "One"})"));
+}
+
+// ---------------- quality guard ----------------// ---------------- quality guard ----------------
 
 TEST(QualityGuard, FlagsScoresBelowThresholdWithEnoughEvidence) {
   QualityGuard guard(10, 0.4, 0.5);
