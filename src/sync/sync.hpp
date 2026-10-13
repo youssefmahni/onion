@@ -132,6 +132,9 @@ class SyncClient {
   // M7 joining: how far this device lags the peer — the maximum over all
   // origins of (peer's last seq - our applied seq). -1 on any error.
   std::int64_t peer_lag(std::string_view peer_base_url, std::string* error);
+  // M7: push one batch (JSON as written in the log) to the peer.
+  void push_batch(std::string_view peer_base_url,
+                  std::string_view batch_json, std::string* error);
 
  private:
   struct Impl;

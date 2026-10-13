@@ -1080,7 +1080,7 @@ int node_cmd(int argc, char** argv) {
 
   // M7: the device's reachable addresses, written once per run into the
   // log (the deterministic discovery channel — gossip refreshes between
-  // runs).
+  // runs), then PUSHED to every known peer so they can pull the rest.
   if (!lane_members.empty()) {
     writer->submit(onion::state::CommitTerminal{{make_record(
         "MEMBER_ADDR",
@@ -1090,6 +1090,29 @@ int node_cmd(int argc, char** argv) {
                                                  : self_sync_port)},
          {"swim", self_host + ":" + std::to_string(bound_swim_port)}})}});
     writer->sync();
+    // The push closes the discovery circle: a peer cannot pull this
+    // device's log without first learning its address.
+    std::string pushed_batch;
+    {
+      std::ifstream in(writer->segments().active_path());
+      std::string last_line;
+      std::string line;
+      while (std::getline(in, line))
+        if (!line.empty()) last_line = line;
+      pushed_batch = std::move(last_line);
+    }
+    if (!pushed_batch.empty()) {
+      for (const auto& [peer_id, peer] : member_urls) {
+        if (peer_id == device_key->device_id || peer.empty()) continue;
+        std::map<std::string, onion::sync::MemberKey> client_members;
+        for (const auto& entry : sync_members)
+          client_members[entry.device_id] = entry;
+        onion::sync::SyncClient pusher(
+            {*writer, device_key, std::move(client_members)});
+        std::string push_error;
+        pusher.push_batch(peer, pushed_batch, &push_error);
+      }
+    }
   }
   // --port-file: the real bound ports (port 0 = ephemeral), so tests and
   // orchestration never guess or hard-code ports.

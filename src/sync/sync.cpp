@@ -552,6 +552,73 @@ bool SyncServer::start(std::string* error) {
     response.set_content("{\"ok\":true}", "application/json");
   });
 
+  // M7: a pushed batch (DESIGN › New children / claims are pushed to
+  // every device at once). The sender signs the request; the batch must
+  // verify against this device's local chain for the origin.
+  impl_->server->Post("/sync/v1/push", [this](const httplib::Request& request,
+                                               httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    auto batch_json =
+        nlohmann::json::parse(request.body, nullptr, false);
+    if (batch_json.is_discarded() || !batch_json.contains("recs")) {
+      response.status = 400;
+      response.set_content("{\"error\":\"not a batch\"}",
+                           "application/json");
+      return;
+    }
+    log::Batch batch;
+    batch.version = batch_json.value("v", 0);
+    batch.origin = batch_json.value("o", std::string{});
+    batch.number = batch_json.value("b", std::uint64_t{0});
+    batch.prev = batch_json.value("prev", std::string{});
+    batch.hash = batch_json.value("hash", std::string{});
+    batch.sig = batch_json.value("sig", std::string{});
+    for (const auto& record_json : batch_json["recs"])
+      batch.records.push_back(log::Record::from_json(record_json));
+
+    // The origin's key: the static list or the members table.
+    std::vector<std::uint8_t> origin_public_key;
+    {
+      const MemberKey* member =
+          find_member(impl_->options.members, batch.origin);
+      if (member)
+        origin_public_key = member->public_key;
+      else if (const auto stored = impl_->options.writer->member_public_key(
+                   batch.origin))
+        origin_public_key = *stored;
+    }
+    if (origin_public_key.empty()) {
+      response.status = 401;
+      response.set_content("{\"error\":\"unknown origin\"}",
+                           "application/json");
+      return;
+    }
+    log::VerifyContext context;
+    context.version = 1;
+    context.expected_prev = impl_->options.writer->origin_prev_hash(
+        batch.origin).value_or("");
+    const auto applied = impl_->options.writer->vector();
+    const auto applied_it = applied.find(batch.origin);
+    context.expected_first_seq =
+        applied_it == applied.end() ? 1 : applied_it->second + 1;
+    context.origin_public_key = &origin_public_key;
+    if (context.expected_prev.empty() && batch.number == 1)
+      context.expected_prev = onion::log::blake2b_hex(std::string_view(
+          reinterpret_cast<const char*>(origin_public_key.data()),
+          origin_public_key.size()));
+    if (log::verify(batch, context) != log::Verify::Ok) {
+      response.status = 409;
+      response.set_content("{\"error\":\"batch verify failed\"}",
+                           "application/json");
+      return;
+    }
+    impl_->options.writer->submit(
+        state::AppendForeign{std::move(batch)});
+    impl_->options.writer->sync();
+    response.status = 200;
+    response.set_content("{\"ok\":true}", "application/json");
+  });
+
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,
                                                 httplib::Response& response) {
     if (!impl_->authenticate(request, response)) return;
@@ -746,6 +813,29 @@ std::int64_t SyncClient::peer_lag(std::string_view peer_base_url,
     lag = std::max(lag, peer_last - local_last);
   }
   return lag;
+}
+
+void SyncClient::push_batch(std::string_view peer_base_url,
+                            std::string_view batch_json,
+                            std::string* error) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  const std::string self = impl_->options.key->device_id;
+  log::Ed25519Signer signer(*impl_->options.key);
+  httplib::Headers headers;
+  for (const auto& [name, value] : signed_post_headers(
+           self, "/sync/v1/push", batch_json, signer))
+    headers.emplace(name, value);
+  const auto response = client.Post("/sync/v1/push", headers,
+                                    std::string(batch_json),
+                                    "application/json");
+  if (!response || response->status != 200) {
+    if (error)
+      *error = "push failed (status " +
+               std::to_string(response ? response->status : -1) + ")";
+  }
 }
 
 int SyncClient::run_round(std::string_view peer_base_url,
