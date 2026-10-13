@@ -401,6 +401,9 @@ def main():
                 print("\n".join(lines[:4]))
                 print("--- node%d log tail ---" % index)
                 print("\n".join(lines[-5:]))
+                print("--- node%d verify lines ---" % index)
+                verify_lines = [l for l in lines if "BADSIG" in l]
+                print("\n".join(verify_lines[-6:]))
                 print("--- node%d sync tail ---" % index)
                 print("\n".join(sync_lines[-4:]))
         raise
