@@ -94,6 +94,10 @@ SyncAsk funnel_fake(int max_depth, std::vector<json>* calls = nullptr,
              {"atomic", depth >= atomic_from}});
       return reply(json{{"items", children}}.dump());
     }
+    // Atomic verification (DR 0021): the fake agrees the labelled-atomic
+    // children admit no further decomposition, so the labels are verified.
+    if (prompt.find("was labelled atomic") != std::string::npos)
+      return reply(json{{"admits_children", false}}.dump());
     return reply(json{{"items", {"One", "Two", "Three"}}}.dump());
   };
 }
