@@ -52,9 +52,24 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.mode = value.value("mode", std::string{"depth-first"});
   if (spec.mode != "breadth-first" && spec.mode != "depth-first")
     return fail("mode must be breadth-first or depth-first");
-  spec.gate = value.value("gate", 0.7);
+  // Records never contain floats (decision 0003): scores are exact decimal
+  // strings, so gate/floor accept a number or a numeric string.
+  const auto parse_score = [&](const char* key, double fallback) -> double {
+    if (!value.contains(key)) return fallback;
+    if (value[key].is_number())
+      return value[key].get<double>();
+    if (value[key].is_string())
+      return std::stod(value[key].get<std::string>());
+    throw std::runtime_error(std::string(key) + " must be a number or a "
+                             "numeric string");
+  };
+  try {
+    spec.gate = parse_score("gate", 0.7);
+    spec.floor = parse_score("floor", 0.5);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
   spec.max_attempts = value.value("max_attempts", 3);
-  spec.floor = value.value("floor", 0.5);
   spec.chunk = value.value("chunk", std::int64_t{50});
   spec.light_funnel_from = value.value("light_funnel_from", 8);
   spec.structure = value.value("structure", false);
@@ -108,6 +123,35 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   if (spec.loop_budget < 1) return fail("loop_budget must be positive");
   if (spec.chunk < 1) return fail("chunk must be positive");
   return spec;
+}
+
+nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
+  nlohmann::json out{
+      {"id", spec.id},
+      {"scope", spec.scope},
+      {"loop_budget", spec.loop_budget},
+      {"mode", spec.mode},
+      {"gate", std::to_string(spec.gate)},
+      {"floor", std::to_string(spec.floor)},
+      {"max_attempts", spec.max_attempts},
+      {"chunk", spec.chunk},
+      {"light_funnel_from", spec.light_funnel_from},
+      {"structure", spec.structure},
+      {"spillover", spec.spillover},
+      {"model", spec.model},
+      {"critic_model", spec.critic_model},
+      {"auto_accept", spec.auto_accept}};
+  if (spec.worker_candidates)
+    out["worker_candidates"] = *spec.worker_candidates;
+  if (spec.aspects_min) out["aspects_min"] = *spec.aspects_min;
+  if (spec.aspects_max) out["aspects_max"] = *spec.aspects_max;
+  if (spec.trim_keeps) out["trim_keeps"] = *spec.trim_keeps;
+  if (spec.synth_max_children)
+    out["synth_max_children"] = *spec.synth_max_children;
+  if (spec.compact_output) out["compact_output"] = true;
+  if (spec.cache_prefix) out["cache_prefix"] = true;
+  if (spec.verify_atomic) out["verify_atomic"] = true;
+  return out;
 }
 
 std::vector<Ticket> order_tickets(
@@ -349,29 +393,9 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   // Emit the CAMPAIGN record only when the campaign is new (the run loop
   // re-enters run() after every drain; re-emission would spam the log).
   if (!existing) {
-    nlohmann::json spec_json{{"scope", spec.scope},
-                   {"loop_budget", spec.loop_budget},
-                   {"mode", spec.mode},
-                   // Records never contain floats (decision 0003):
-                   // scores are exact decimal strings.
-                   {"gate", std::to_string(spec.gate)},
-                   {"floor", std::to_string(spec.floor)},
-                   {"chunk", spec.chunk},
-                   {"structure", spec.structure},
-                   {"model", spec.model}};
-    if (spec.worker_candidates)
-      spec_json["worker_candidates"] = *spec.worker_candidates;
-    if (spec.aspects_min) spec_json["aspects_min"] = *spec.aspects_min;
-    if (spec.aspects_max) spec_json["aspects_max"] = *spec.aspects_max;
-    if (spec.trim_keeps) spec_json["trim_keeps"] = *spec.trim_keeps;
-    if (spec.synth_max_children)
-      spec_json["synth_max_children"] = *spec.synth_max_children;
-    if (spec.compact_output) spec_json["compact_output"] = true;
-    if (spec.cache_prefix) spec_json["cache_prefix"] = true;
-    if (spec.verify_atomic) spec_json["verify_atomic"] = true;
     writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
-                   {"spec", std::move(spec_json)},
+                   {"spec", campaign_spec_json(spec)},
                    {"state", "running"}})}});
   }
 
