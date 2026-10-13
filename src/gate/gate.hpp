@@ -47,16 +47,18 @@ std::string system_prompt();
 // ≤ 400 tokens: does the node split into at least 3 distinct parts?
 std::string precheck_prompt(const NodeContext& ctx);
 std::string planner_prompt(const NodeContext& ctx, const std::string& injected_issues,
-                           bool light);
+                           bool light, int aspects_min = 4, int aspects_max = 8);
 std::string worker_prompt(const NodeContext& ctx, const std::string& aspect,
-                          const std::string& existing_joined);
+                          const std::string& existing_joined,
+                          int candidates = 100, bool compact = false);
 std::string trimmer_prompt(const NodeContext& ctx,
                            const std::vector<std::string>& candidates, int keep);
 std::string critique_prompt(const NodeContext& ctx,
                             const std::vector<std::string>& candidates);
 std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
-                               const std::string& critique_text);
+                               const std::string& critique_text,
+                               int max_children = 100, bool compact = false);
 // The short separate call that confirms a child labelled atomic is a leaf.
 std::string atomic_verification_prompt(const std::string& node_title,
                                        const std::string& child_title);
@@ -85,7 +87,8 @@ struct Checks {
   std::vector<std::string> failures;
   bool passed() const;
 };
-Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx);
+Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
+                  int max_children = 100);
 
 enum class Decision { Commit, Retry, Leaf, NeedsReview };
 
@@ -122,6 +125,16 @@ struct FunnelOptions {
   double temperatures[3]{0.0, 0.3, 0.5};
   int max_tokens{6000};
   std::string model{"deepseek-flash"};
+  // W5 variant knobs (FUNNEL_OPT experiments; defaults are the baseline).
+  int worker_candidates{100};        // V1: per-aspect candidates in the worker prompt
+  int aspects_min{4};                // V2: planner aspect range (non-light)
+  int aspects_max{8};
+  std::vector<int> trim_keeps{400, 300};  // V3: full funnel trims in order;
+                                          // light runs the last one once
+  int synth_max_children{100};       // V4: synthesizer's 3..N range, no padding
+  bool compact_output{false};        // V5: titles array + atomic index list
+  std::string cache_prefix;          // V6: shared fixed block prepended to
+                                     // every prompt (cache-hit prefix)
   // Optional per-1M-token prices (USD per 1M). When set, the attempt cost
   // is computed from usage; when absent, cost stays 0 (node.conf arrives
   // with M5 — decision 0004: no implicit monetary defaults).

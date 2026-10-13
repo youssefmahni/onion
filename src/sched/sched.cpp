@@ -60,6 +60,48 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  // W5 funnel variants: optional; every value is validated on parse.
+  if (value.contains("worker_candidates")) {
+    if (!value["worker_candidates"].is_number_integer())
+      return fail("worker_candidates must be an integer");
+    const std::int64_t v = value["worker_candidates"].get<std::int64_t>();
+    if (v < 1 || v > 500) return fail("worker_candidates out of range 1..500");
+    spec.worker_candidates = static_cast<int>(v);
+  }
+  if (value.contains("aspects_min") || value.contains("aspects_max")) {
+    const std::int64_t min =
+        value.value("aspects_min", std::int64_t{4});
+    const std::int64_t max =
+        value.value("aspects_max", std::int64_t{8});
+    if (min < 2 || max < min || max > 20)
+      return fail("aspects range invalid (2 <= min <= max <= 20)");
+    spec.aspects_min = static_cast<int>(min);
+    spec.aspects_max = static_cast<int>(max);
+  }
+  if (value.contains("trim_keeps")) {
+    if (!value["trim_keeps"].is_array() || value["trim_keeps"].empty())
+      return fail("trim_keeps must be a non-empty array of integers");
+    std::vector<int> keeps;
+    for (const auto& keep : value["trim_keeps"]) {
+      if (!keep.is_number_integer())
+        return fail("trim_keeps entries must be integers");
+      const std::int64_t k = keep.get<std::int64_t>();
+      if (k < 10 || k > 1000)
+        return fail("trim_keeps entries out of range 10..1000");
+      keeps.push_back(static_cast<int>(k));
+    }
+    spec.trim_keeps = std::move(keeps);
+  }
+  if (value.contains("synth_max_children")) {
+    if (!value["synth_max_children"].is_number_integer())
+      return fail("synth_max_children must be an integer");
+    const std::int64_t v = value["synth_max_children"].get<std::int64_t>();
+    if (v < 3 || v > 100)
+      return fail("synth_max_children out of range 3..100");
+    spec.synth_max_children = static_cast<int>(v);
+  }
+  spec.compact_output = value.value("compact_output", false);
+  spec.cache_prefix = value.value("cache_prefix", false);
   if (spec.loop_budget < 1) return fail("loop_budget must be positive");
   if (spec.chunk < 1) return fail("chunk must be positive");
   return spec;
@@ -257,18 +299,28 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   // Emit the CAMPAIGN record only when the campaign is new (the run loop
   // re-enters run() after every drain; re-emission would spam the log).
   if (!existing) {
+    nlohmann::json spec_json{{"scope", spec.scope},
+                   {"loop_budget", spec.loop_budget},
+                   {"mode", spec.mode},
+                   // Records never contain floats (decision 0003):
+                   // scores are exact decimal strings.
+                   {"gate", std::to_string(spec.gate)},
+                   {"floor", std::to_string(spec.floor)},
+                   {"chunk", spec.chunk},
+                   {"structure", spec.structure},
+                   {"model", spec.model}};
+    if (spec.worker_candidates)
+      spec_json["worker_candidates"] = *spec.worker_candidates;
+    if (spec.aspects_min) spec_json["aspects_min"] = *spec.aspects_min;
+    if (spec.aspects_max) spec_json["aspects_max"] = *spec.aspects_max;
+    if (spec.trim_keeps) spec_json["trim_keeps"] = *spec.trim_keeps;
+    if (spec.synth_max_children)
+      spec_json["synth_max_children"] = *spec.synth_max_children;
+    if (spec.compact_output) spec_json["compact_output"] = true;
+    if (spec.cache_prefix) spec_json["cache_prefix"] = true;
     writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
-                   {"spec", {{"scope", spec.scope},
-                             {"loop_budget", spec.loop_budget},
-                             {"mode", spec.mode},
-                             // Records never contain floats (decision 0003):
-                             // scores are exact decimal strings.
-                             {"gate", std::to_string(spec.gate)},
-                             {"floor", std::to_string(spec.floor)},
-                             {"chunk", spec.chunk},
-                             {"structure", spec.structure},
-                             {"model", spec.model}}},
+                   {"spec", std::move(spec_json)},
                    {"state", "running"}})}});
   }
 
@@ -279,6 +331,24 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   funnel_options.model = spec.critic_model.empty() ? spec.model
                                                    : spec.critic_model;
   funnel_options.prices = impl_->options.prices;
+  // W5 funnel variants (absent spec fields keep the FunnelOptions default).
+  if (spec.worker_candidates)
+    funnel_options.worker_candidates = *spec.worker_candidates;
+  if (spec.aspects_min) funnel_options.aspects_min = *spec.aspects_min;
+  if (spec.aspects_max) funnel_options.aspects_max = *spec.aspects_max;
+  if (spec.trim_keeps) funnel_options.trim_keeps = *spec.trim_keeps;
+  if (spec.synth_max_children)
+    funnel_options.synth_max_children = *spec.synth_max_children;
+  funnel_options.compact_output = spec.compact_output;
+  if (spec.cache_prefix)
+    funnel_options.cache_prefix =
+        // Shared fixed block (~120 tokens): identical for every funnel
+        // call, so the provider's automatic prefix cache can hit on every
+        // call after the first (W5 V6).
+        "You build a hierarchical AI-agent knowledge base. Nodes decompose "
+        "into direct children (Title Case noun phrases, 2-5 words). Strict "
+        "JSON only: no prose, no markdown fences. Follow the instruction "
+        "below exactly for this node.";
 
   std::vector<SettledSample> settled_samples;
   std::deque<Ticket> waiting;

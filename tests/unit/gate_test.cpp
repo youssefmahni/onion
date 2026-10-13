@@ -275,6 +275,63 @@ TEST(GatePrompts, FixedTextPrecedesNodeText) {
   EXPECT_TRUE(ends_with_node(synthesizer_prompt(ctx(), {"A", "B"}, "crit")));
 }
 
+TEST(GatePrompts, VariantKnobsReachThePromptText) {
+  // W5 V1/V2/V4: the candidate count, aspect range and synthesizer maximum
+  // come from the options and land in the prompts the model reads.
+  const std::string v1 = worker_prompt(ctx(), "Aspect", "", 40, false);
+  EXPECT_NE(v1.find("top 40"), std::string::npos);
+
+  const std::string v2 = planner_prompt(ctx(), "", false, 3, 5);
+  EXPECT_NE(v2.find("3-5"), std::string::npos);
+
+  const std::string v4 =
+      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 40, false);
+  EXPECT_NE(v4.find("between 3 and 40"), std::string::npos);
+  // V4 removes the padding hint: the model must not pad up.
+  EXPECT_NE(v4.find("Do not pad"), std::string::npos);
+
+  // Compact output (V5) switches the worker and synthesizer formats.
+  const std::string v5w = worker_prompt(ctx(), "Aspect", "", 100, true);
+  EXPECT_NE(v5w.find("\"titles\""), std::string::npos);
+  const std::string v5s =
+      synthesizer_prompt(ctx(), {"A", "B"}, "crit", 100, true);
+  EXPECT_NE(v5s.find("atomic_indices"), std::string::npos);
+}
+
+TEST(GateParsers, CompactOutputParses) {
+  // V5: titles as a plain string array, atomic flags as a separate index
+  // list; both strict on malformed bodies.
+  auto children = parse_children(
+      R"({"titles": ["Alpha", "Beta", "Gamma"], "atomic_indices": [0, 2]})");
+  ASSERT_TRUE(children.has_value());
+  EXPECT_EQ(children->size(), 3u);
+  EXPECT_TRUE((*children)[0].atomic);
+  EXPECT_FALSE((*children)[1].atomic);
+  EXPECT_TRUE((*children)[2].atomic);
+  EXPECT_EQ((*children)[0].title, "Alpha");
+
+  EXPECT_FALSE(parse_children(R"({"titles": ["Alpha"], "atomic_indices": [7]})"));
+  EXPECT_FALSE(parse_children(R"({"titles": ["Alpha"], "atomic_indices": ["a"]})"));
+  EXPECT_FALSE(parse_children(R"({"titles": ["Alpha", 2]})"));
+
+  auto items = parse_items(R"({"titles": ["A", "B", "C"]})");
+  ASSERT_TRUE(items.has_value());
+  EXPECT_EQ(items->size(), 3u);
+}
+
+TEST(GateChecks, VariantMaxChildrenBoundsTheCount) {
+  // V4: a synthesizer capped at 40 must reject 41 children.
+  std::vector<Child> children;
+  for (int i = 0; i < 41; ++i) {
+    Child child;
+    child.title = "Item " + std::to_string(i);
+    children.push_back(std::move(child));
+  }
+  const auto checks = run_checks(children, ctx(), 40);
+  EXPECT_FALSE(checks.count_ok);
+  EXPECT_EQ(checks.failures.front(), "child count 41 outside 3..40");
+}
+
 // ---------------- funnel behaviours ----------------
 
 Result ok(const std::string& content) {
