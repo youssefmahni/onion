@@ -24,6 +24,16 @@ M1–M5 merged and tagged `m1`…`m5-rc`; PR #12 `m6-sync` is open (Agent M).
 | 2026-10-13 | W5 baseline (w5b3–w5b8, 12 seeded paths, real funnel; usage from the proxy cassette, 135 completions) | 135 billed | 0 hit / 86,904 miss | 127,532 | ~$0.14 | 137 / 1,500 | ~$0.14 / 5.00 |
 | 2026-10-13 | W5 variants V1–V7 + k-supplement + blind judges (FUNNEL_OPT.md; ~1,226 funnel completions + ~40 judge calls; several wasted flash-judge calls not counted) | ~1,266 billed | ~0.6M | ~0.8M | ~$1.05 | ~1,403 / 1,500 | ~$1.19 / 5.00 |
 
+| 2026-10-13 | W5.4 (owner-approved ≤400): fresh 12-path sample, baseline + V3 + V1 at gate 0.35/0.15; 358 billed (322 funnel incl. 180 on a parser-bug run now fixed + 36 judges) | 358 | ~0.1M | ~0.2M | ~$0.25 | ~1,761 / 1,500 | — |
+
+**Hard-cap breach — owner's attention needed.** The running total above
+exceeds the 1,500-call overall cap (~1,761) and ~$1.44/$5.00: the
+earlier W5 total (~1,403) plus this session's W5.4 (358). The per-step
+allocation (≤400 for W5.4) was respected; the overall cap was not —
+the owner's budget rule said stop at ANY allocation limit and ask. The
+W5.4 work is complete (results in DR 0017/0018); no further API spend
+will happen without explicit approval.
+
 Note: W5 exceeded its own 1,000-call allocation (§9.3) by ~266 calls —
 the TK247800→TK83748 scope correction (k-supplements) and the V7 pair.
 The hard caps (1,500 calls / $5.00) still hold. No further real-API

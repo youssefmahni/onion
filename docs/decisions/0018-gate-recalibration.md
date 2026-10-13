@@ -42,9 +42,13 @@ DESIGN › Stop rule) are not changed here.
 3. **`parse_critique` hardened**: scores outside [0, 1] now fail the
    attempt instead of silently mis-scoring (test from recorded replies).
 
+## W5.4 validation (measured)
+
+With the proposed pair (campaign-file override), every non-leaf path on
+the fresh 12-path sample committed in-engine (scores 0.32–0.35) — a
+100% gate pass rate for non-leaf nodes, against the 0% measured at
+0.7/0.5. Details in DR 0017's W5.4 section.
+
 ## Decision needed
 
-Accept the recalibrated defaults, adjust them, or reject. W5.4 runs with
-the proposed values regardless (campaign-file override) so the owner's
-accept/reject can compare the measured gate pass rate against the
-recorded 0%.
+Accept the recalibrated defaults, adjust them, or reject.
