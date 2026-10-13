@@ -80,3 +80,14 @@ run (vs 0% today) — proposed in DR 0018.
 - `*/onion.db` `critiques`, `attempts`, `settles`, `reviews` tables.
 - New tests: `GateParsers.CritiqueScoreScaleDriftIsRejected`,
   `GateFunnel.AtomicVerification*` (3), store `reviews.atomic` migration.
+
+## 3. Do the scores predict the judge? (2026-10-13, no new spend)
+
+All 20 unique judged pairs (17 W5-era pairs + the 3 W5.4 comparisons;
+the W5.4 pairs were judged 12× each with different randomization, one
+decision per comparison): winner's critique score vs loser's —
+**strict agreement 8/20 (40%), disagreement 4/20, equal-score ties
+8/20** (the score's 0.15/0.35 quantization makes 40% of pairs
+inseparable). **AUC 0.60.** The raw-pool precision score is a weak
+judge signal. Conclusion: calibrate the critic, not the threshold —
+see DR 0020 (anchored rubric).
