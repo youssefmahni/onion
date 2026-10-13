@@ -59,6 +59,12 @@ def member(devices, index):
 
 def main():
     binary = sys.argv[1]
+    # The sanitizer builds slow the multi-node timing enough to flake:
+    # skip there, exactly like the repo's llm scenario tests.
+    if (os.environ.get("ASAN_OPTIONS") or os.environ.get("TSAN_OPTIONS") or
+            os.environ.get("UBSAN_OPTIONS")):
+        print("SKIP: sanitizer builds run the scenarios too slowly")
+        sys.exit(77)
     root = tempfile.mkdtemp(prefix="onion_m7_")
 
     fake = subprocess.Popen(
