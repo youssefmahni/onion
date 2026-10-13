@@ -17,3 +17,14 @@ Decision 0010 states that a campaign's loop-budget overshoot is "at most one chu
 - The engine exposes `note_sync_round()`: the node loop calls it after each completed sync round, the engine measures the window, and the next chunk uses the measured size.
 - DESIGN.md's budget text is updated from "overshoot is at most one chunk per device" (aspirational) to the bound this rule makes true: at most one sync round of spending per device.
 - Tests: a deterministic simulation of 3 devices at ~15 attempts/s with a 15 s sync lag and a budget of 1,000 asserts the total spent never exceeds budget + one chunk per device in every delivery order, that a device waits for a reservation less than 10% of the time while budget remains, and that void detection stops new attempts within one round.
+
+## Amendment (owner-asked clarification, 2026-10-13)
+
+**"Completed sync round" is any-answered, not all-answered.** The node
+loop marks a round complete when at least one peer answered within its
+timeouts (3 s connect, 5 s read/write per peer). A slow or unreachable
+peer can never stall reservations: its request times out in bounded time
+and the round still counts. A fully partitioned round (no peer answered)
+does NOT count, so a device cut off from the fleet cannot unlock more
+spending. Implemented in `src/cli/commands.cpp` (the sync loop sets
+`any_peer_answered` and calls `engine.note_sync_round()` only when true).

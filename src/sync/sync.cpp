@@ -561,29 +561,31 @@ bool SyncServer::start(std::string* error) {
     // The push itself delivers the pusher's address (DESIGN › New
     // children are pushed at once): a peer that never pulled the origin
     // cannot verify the pushed batch yet, but it CAN learn where to
-    // pull from.
+    // pull from. authenticate() has already bound the X-Onion-Device
+    // header to the signature (the signed bytes cover the device id, so
+    // only the holder of that member's key can claim it), and the row
+    // must belong to a CURRENT member — an evicted or left device must
+    // not be able to inject addresses.
     const std::string sender =
         request.get_header_value("X-Onion-Device");
     const std::string sender_url =
         request.get_header_value("X-Onion-Sync-Url");
-    if (!sender.empty() && !sender_url.empty()) {
-      if (const auto stored =
-              impl_->options.writer->member_public_key(sender)) {
-        auto statement = [&]() {
-          std::string error;
-          return const_cast<onion::store::Db&>(
-                     impl_->options.writer->db())
-              .prepare(
-                  "UPDATE members SET sync_url=?2 WHERE device_id=?1;",
-                  &error);
-        }();
-        if (statement) {
-          std::string bind_error;
-          statement->bind(1, sender, &bind_error);
-          statement->bind(2, sender_url, &bind_error);
-          std::string step_error;
-          statement->step(&step_error);
-        }
+    if (!sender.empty() && !sender_url.empty() &&
+        (impl_->options.writer->member_is_current(sender) ||
+         find_member(impl_->options.members, sender) != nullptr)) {
+      auto statement = [&]() {
+        std::string error;
+        return const_cast<onion::store::Db&>(impl_->options.writer->db())
+            .prepare(
+                "UPDATE members SET sync_url=?2 WHERE device_id=?1;",
+                &error);
+      }();
+      if (statement) {
+        std::string bind_error;
+        statement->bind(1, sender, &bind_error);
+        statement->bind(2, sender_url, &bind_error);
+        std::string step_error;
+        statement->step(&step_error);
       }
     }
     auto batch_json =

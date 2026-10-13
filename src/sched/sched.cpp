@@ -514,6 +514,24 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // lanes.
     const auto owner_reserved = writer.reserved_by_origin(spec.id);
     std::map<std::string, std::vector<Ticket>> lanes;
+    if (std::getenv("ONION_SYNC_DEBUG")) {
+      std::size_t self_skip = 0, claim_skip = 0, reexpand_skip = 0,
+                  no_owner = 0, kept = 0;
+      for (const Ticket& ticket : all_tickets) {
+        const auto owner = lane_owner(ticket.path, members);
+        if (!owner) { no_owner++; continue; }
+        if (*owner == impl_->options.self) { self_skip++; continue; }
+        if (!writer.claim_holder(ticket.path, impl_->options.self, now_ms)
+                 .empty()) { claim_skip++; continue; }
+        if (writer.reexpand_open(ticket.path)) { reexpand_skip++; continue; }
+        kept++;
+      }
+      std::fprintf(stderr,
+                   "steal debug: all=%zu no_owner=%zu self=%zu claim=%zu "
+                   "reexpand=%zu kept=%zu members=%zu\n",
+                   all_tickets.size(), no_owner, self_skip, claim_skip,
+                   reexpand_skip, kept, members.size());
+    }
     for (const Ticket& ticket : all_tickets) {
       const auto owner = lane_owner(ticket.path, members);
       if (!owner || *owner == impl_->options.self) continue;

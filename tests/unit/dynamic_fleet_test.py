@@ -18,6 +18,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import glob
 import tempfile
 import time
 import urllib.request
@@ -34,8 +35,13 @@ def http_json(url, timeout=10):
 
 
 def run(binary, *args, check=True):
-    return subprocess.run([binary, *args], check=check, capture_output=True,
-                          text=True)
+    try:
+        return subprocess.run([binary, *args], check=check,
+                              capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise AssertionError(
+            "command failed: %r\nstdout: %s\nstderr: %s" % (
+                [binary, *args], exc.stdout, exc.stderr)) from exc
 
 
 def state(port):
@@ -65,6 +71,13 @@ def main():
             os.environ.get("UBSAN_OPTIONS")):
         print("SKIP: sanitizer builds run the scenarios too slowly")
         sys.exit(77)
+    # The chaos hooks are compiled only into test builds (the CMake
+    # ONION_CHAOS_HOOKS option): a release binary must skip the
+    # scenarios (m7.release_ignores_chaos_hooks covers the hookless side).
+    probe = run(binary, "node", "chaos-hooks").stdout.strip()
+    if probe != "1":
+        print("SKIP: chaos hooks not compiled in (release build)")
+        sys.exit(77)
     root = tempfile.mkdtemp(prefix="onion_m7_")
 
     fake = subprocess.Popen(
@@ -87,6 +100,13 @@ def main():
             os.makedirs(corpus)
             with open(os.path.join(corpus, "Onion - level_04.csv"), "w") as f:
                 f.write("code,path,title\nP%02d,P%02d,Phase %d\n" % (index, index, index))
+            # Scenario C's slice: imported up front (a later import fails
+            # the store-vs-corpus Merkle check once the engine has added
+            # runtime children), left untouched by A and B because their
+            # campaigns scope P01-P04 only.
+            with open(os.path.join(corpus, "Onion - level_05.csv"), "w") as f:
+                f.write("code,path,title\nP%02d,P%02d,Steal target %d\n"
+                        % (index + 4, index + 4, index))
             run(binary, "node", "key", "set", "device-key",
                 "%064x" % (index * 0x11111111), "--data-dir", data)
             run(binary, "genesis-import", "--root", corpus, "--data-dir", data)
@@ -307,6 +327,102 @@ def main():
                    for i in (1, 3)]
         assert settled[0] >= settled_before
         print("scenario B (kill mid-run): PASS settled=%r" % settled)
+
+        for node in nodes:
+            node.terminate()
+        for node in nodes:
+            try:
+                node.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                node.kill()
+        nodes.clear()
+        if platform.system() == "Windows":
+            # Windows releases file handles a beat after process exit;
+            # the next scenario's node needs the files to be free.
+            time.sleep(10.0)
+
+        # ---------------------------------------------------------------
+        # Scenario C: an idle node steals work without duplicate children.
+        # Node 3 runs with a near-zero lane weight, so the rendezvous hash
+        # gives it (almost) no home lanes; its engine drains instantly and
+        # steals tickets from the busy lanes of 1 and 2, emitting CLAIM
+        # records. The fleet still converges and every settled path
+        # resolves to exactly ONE winner everywhere (higher score, then
+        # hlc, then origin) — no duplicate children.
+        members_c = os.path.join(root, "members_c.json")
+        devices[3]["weight"] = 0.01
+        write_members([1, 2, 3], members_c)
+        # The P05-P08 trees were imported during setup and are still open
+        # (scenarios A and B scoped P01-P04), so the steal has tickets.
+        campaign_c = os.path.join(root, "campaign_c.json")
+        with open(campaign_c, "w") as f:
+            json.dump({"id": "mp7c",
+                       "scope": ["P05", "P06", "P07", "P08"],
+                       "loop_budget": 300, "mode": "breadth-first",
+                       "chunk": 50, "model": "deepseek-flash"}, f)
+        run(binary, "campaign", "start", campaign_c, "--data-dir",
+            devices[1]["data"], "--yes")
+        start_node(1, members_c)
+        start_node(2, members_c)
+        start_node(3, members_c)
+        for index in (1, 2, 3):
+            write_members([1, 2, 3], os.path.join(devices[index]["data"],
+                                                  "members.json"))
+        settled = wait_converged([devices[i]["api"] for i in (1, 2, 3)])
+        # The steal actually happened: node 3's oplog carries CLAIM
+        # records (the fleet works through its own lanes first, then
+        # claims from the busy ones).
+        claims3 = 0
+        for opdir in glob.glob(
+                os.path.join(devices[3]["data"], "oplog", "*")):
+            for seg in glob.glob(os.path.join(opdir, "*.log")):
+                claims3 += open(seg).read().count('"CLAIM"')
+        assert claims3 > 0, "scenario C: no steal happened"
+        # No duplicate children: one settles row per path per device, and
+        # every device agrees on the winning (score, hlc, origin).
+        import sqlite3
+        winners = {}
+        for index in (1, 2, 3):
+            db = sqlite3.connect(
+                os.path.join(devices[index]["data"], "onion.db"))
+            rows = db.execute(
+                "SELECT path, score, hlc, origin FROM settles").fetchall()
+            db.close()
+            per_device = {}
+            for path, score, hlc, origin in rows:
+                assert path not in per_device, (
+                    "duplicate settle for %s on device %d" % (path, index))
+                per_device[path] = (score, hlc, origin)
+                if path in winners:
+                    assert winners[path] == (score, hlc, origin), (
+                        "conflicting winner for %s" % path)
+                else:
+                    winners[path] = (score, hlc, origin)
+        # Every device resolves the same row set (the api count can tick
+        # forward between the convergence check and this read; the
+        # devices must simply agree with EACH OTHER).
+        row_counts = set()
+        winners = {}
+        for index in (1, 2, 3):
+            db = sqlite3.connect(
+                os.path.join(devices[index]["data"], "onion.db"))
+            rows = db.execute(
+                "SELECT path, score, hlc, origin FROM settles").fetchall()
+            db.close()
+            row_counts.add(len(rows))
+            per_device = {}
+            for path, score, hlc, origin in rows:
+                assert path not in per_device, (
+                    "duplicate settle for %s on device %d" % (path, index))
+                per_device[path] = (score, hlc, origin)
+                if path in winners:
+                    assert winners[path] == (score, hlc, origin), (
+                        "conflicting winner for %s" % path)
+                else:
+                    winners[path] = (score, hlc, origin)
+        assert len(row_counts) == 1, "devices disagree: %r" % row_counts
+        print("scenario C (steal without duplicates): PASS settled=%r"
+              % settled)
 
         for node in nodes:
             node.terminate()

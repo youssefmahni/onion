@@ -300,6 +300,14 @@ void StateWriter::replay(std::string* error) {
   // write and the store update recovers exactly. With a device key, each
   // batch is verified against the chain; the first failing line is a torn
   // tail and is cut from the active segment.
+  //
+  // The applied vector is REBUILT from the replayed log: it must always
+  // equal the folded state. A cut torn tail would otherwise leave the
+  // vector ahead of what this replica (and its peers) actually hold, and
+  // the replica would then ask for batches nobody can serve — a
+  // permanent sync stall. Rebuilding keeps the vector exactly the
+  // replayed batches, so the replica re-pulls anything the cut removed.
+  db_.exec("DELETE FROM applied;", error);
   // Walk every origin directory under oplog/ (the own origin and the
   // synced copies), maintaining per-origin chains.
   std::map<std::string, std::vector<std::filesystem::path>> sealed_by_origin;
@@ -1184,8 +1192,20 @@ std::optional<std::vector<std::uint8_t>> StateWriter::member_public_key(
   return std::vector<std::uint8_t>(blob.begin(), blob.end());
 }
 
-std::vector<StateWriter::MemberRow> StateWriter::members_table() const {
-  std::vector<MemberRow> rows;
+bool StateWriter::member_is_current(std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT state FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return false;
+  const std::string state = statement->text(0);
+  return state != "EVICTED" && state != "LEFT";
+}
+
+std::vector<StateWriter::MemberRow> StateWriter::members_table() const {  std::vector<MemberRow> rows;
   std::string error;
   auto statement = db_.prepare(
       "SELECT device_id, pubkey, slot, state, sync_url, swim_url "

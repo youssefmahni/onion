@@ -91,6 +91,7 @@ std::shared_ptr<onion::log::DeviceKey> load_device_key(
 }
 
 
+#if ONION_CHAOS_HOOKS
 namespace {
 // Chaos tool (M7): ONION_CLOCK_JUMP_MS adds a fixed offset to the swim
 // engine's clock readings (a wall-clock jump on one device).
@@ -108,6 +109,7 @@ class JumpClock final : public onion::swim::Clock {
   std::int64_t jump_ms_;
 };
 }  // namespace
+#endif  // ONION_CHAOS_HOOKS
 std::unique_ptr<onion::state::StateWriter> open_writer(
     const std::filesystem::path& dir, std::string* error) {
   onion::platform::KeyStore store(dir / "keys");
@@ -120,12 +122,14 @@ std::unique_ptr<onion::state::StateWriter> open_writer(
   options.signer = std::make_unique<onion::log::Ed25519Signer>(*key);
   // Chaos tool (M7): ONION_KILL_AT_COMMIT=1 dies after the batch is
   // durable but before the fold (a power cut); =2 dies after the fold.
+#if ONION_CHAOS_HOOKS
   if (std::getenv("ONION_KILL_AT_COMMIT")) {
     const int step = std::atoi(std::getenv("ONION_KILL_AT_COMMIT"));
     options.crash_hook = [step](int hook_step) {
       if (hook_step == step) std::_Exit(137);
     };
   }
+#endif  // ONION_CHAOS_HOOKS
   auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
   if (!writer->start(error)) return nullptr;
   return writer;
@@ -237,6 +241,16 @@ json state_json(onion::state::StateWriter& writer, int api_port,
 
 int node_cmd(int argc, char** argv) {
   // --- subcommands that don't run the node ---
+  if (argc >= 3 && std::string(argv[2]) == "chaos-hooks") {
+    // The scenario tests probe this to decide between running the
+    // chaos scenarios (hooks compiled in) and skipping them.
+#if ONION_CHAOS_HOOKS
+    std::cout << "1\n";
+#else
+    std::cout << "0\n";
+#endif
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[2]) == "profile") {
     const std::filesystem::path dir = data_dir_arg(argc, argv);
     onion::profile::ScanOptions options;
@@ -885,11 +899,13 @@ int node_cmd(int argc, char** argv) {
     swim_options.self_address =
         self_host + ":" + std::to_string(bound_swim_port);
     swim = std::make_unique<onion::swim::Swim>(std::move(swim_options));
+#if ONION_CHAOS_HOOKS
     if (std::getenv("ONION_CLOCK_JUMP_MS")) {
       static JumpClock jump_clock(
           std::atoll(std::getenv("ONION_CLOCK_JUMP_MS")));
       swim->set_clock(&jump_clock);
     }
+#endif  // ONION_CHAOS_HOOKS
     {
       swim->set_transport(swim_transport.get());
       swim_transport->set_receiver(
@@ -1204,12 +1220,14 @@ int node_cmd(int argc, char** argv) {
         // Chaos tool (M7): ONION_PARTITION_FROM=id1,id2 makes this
         // device refuse to talk to the listed peers (a network split).
         std::set<std::string> partitioned;
+#if ONION_CHAOS_HOOKS
         if (std::getenv("ONION_PARTITION_FROM")) {
           std::stringstream split(std::getenv("ONION_PARTITION_FROM"));
           std::string id;
           while (std::getline(split, id, ','))
             if (!id.empty()) partitioned.insert(id);
         }
+#endif  // ONION_CHAOS_HOOKS
         for (const auto& [peer_id, peer] : member_urls) {
           if (peer_id == device_key->device_id) continue;
           if (partitioned.count(peer_id)) continue;
@@ -1421,9 +1439,12 @@ if (!members_path.empty()) reload_members();
           member_urls[member.device_id] =
               member.capabilities["sync"].get<std::string>();
       }
+      // The live lane list INCLUDES this device: lane ownership is the
+      // weighted rendezvous over the whole live set, so a device must
+      // see itself to own its home lanes (DESIGN › Stealing: "A device
+      // works its own lane first and, when the lane runs dry, steals").
       std::vector<onion::sched::LaneMember> live;
       for (const auto& member : swim->membership().list()) {
-        if (member.device_id == device_key->device_id) continue;
         const bool alive = onion::swim::owns_work(member.state);
         if (!alive && majority_visible) continue;  // re-hash to survivors
         if (!alive) continue;  // no majority: keep the dead lanes

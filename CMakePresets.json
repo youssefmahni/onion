@@ -21,7 +21,8 @@
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/linux-debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ONION_CHAOS_HOOKS": "ON"
       }
     },
     {
@@ -49,7 +50,8 @@
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/windows-msvc",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ONION_CHAOS_HOOKS": "ON"
       }
     }
   ],
