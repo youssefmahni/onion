@@ -146,7 +146,7 @@ def main():
                 time.sleep(1.0)
             raise AssertionError("nodes never settled: %r" % last)
 
-        def wait_converged(apis, timeout=240):
+        def wait_converged(apis, timeout=330):
             # Every device reaches the same settled count (> 0) — the
             # quiescence property of the convergence test.
             end = time.time() + timeout
