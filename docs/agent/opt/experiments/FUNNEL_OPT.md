@@ -134,7 +134,7 @@ one level (`--one-level`) and three levels deep (`--depth-to 9`).
 | v7-full (L6 paths) | — | $2.84B | 861B | 12 | the default knobs on L6 nodes keep few children — a level effect, not a config win |
 | v3 trim 150 | $7,822.45 | $4.02B | 2.15T | 17.8 × (1−0.25) = 13.3 | atomic 0.25 from one 18/18 commit; verified growth ≈ 17.8 |
 | v1 candidates 40 | $5,230.63 | $11.1B | 10.5T | 15.7 × 1.0 | atomic 0 — clean |
-| v6 cache prefix | $15,523.28 | $26.1B | 8.1T | 17.8 | |
+| v6 cache prefix | $15,523.28 | $26.1B | 8.1T | 17.75 × (1−0.14) = 15.3 | |
 | v4 synth max 40 | $10,214.98 | $6.4T | 5.94e15 | 30.0 × 1.0 | worst non-artifact growth |
 | v2 aspects 3–5 | $9,939.05 | saturated ≥$14.8T | — | 36.2 | |
 | base | $6,786.58 | saturated ≥$26.9T | — | 54.25 | |
