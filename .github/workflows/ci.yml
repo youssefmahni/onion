@@ -98,7 +98,9 @@ jobs:
       - name: LLM client tests
         run: >-
           ctest --test-dir build/linux-tsan --output-on-failure
-          -R '^(Budget|Metering|CircuitBreaker|llm\.)'
+          -R '^(Budget|Metering|CircuitBreaker|llm\.|sync\.saturation)'
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan_suppressions.txt
 
   legacy:
     name: Legacy (${{ matrix.name }})

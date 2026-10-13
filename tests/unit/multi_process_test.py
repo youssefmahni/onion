@@ -198,8 +198,15 @@ def main():
             time.sleep(2.0)
             current = None
             try:
-                current = [node_state(ports[index]["api"]).get("vector", {})
-                           for index in (1, 2, 3)]
+                # Progress = new records anywhere OR a successful sync
+                # round anywhere (decision 0014 pre-work: a fleet whose
+                # records are frozen but whose rounds keep succeeding is
+                # waiting for the round gate, not stuck).
+                states = [node_state(ports[index]["api"])
+                          for index in (1, 2, 3)]
+                current = [(s.get("vector", {}),
+                            s.get("sync_rounds_completed", 0))
+                           for s in states]
             except Exception:
                 current = None  # a dead node shows as no progress
             if current is not None and current != last_vector:

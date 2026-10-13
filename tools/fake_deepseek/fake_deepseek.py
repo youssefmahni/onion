@@ -183,12 +183,16 @@ def main():
                         help="deterministic funnel replies (offline campaigns)")
     parser.add_argument("--funnel-max-depth", default=5, type=int)
     parser.add_argument("--funnel-score", default=0.9, type=float)
+    parser.add_argument("--delay-ms", default=0, type=float,
+                        help="fixed per-request latency (funnel mode; the "
+                             "sync-decoupling saturation test uses 60000)")
     arguments = parser.parse_args()
     scenario = json.loads(arguments.scenario.read_text(encoding="utf-8"))
     arguments.record.parent.mkdir(parents=True, exist_ok=True)
     fake = FakeDeepSeek(scenario, arguments.record)
     handler = (handler_for_funnel(fake, arguments.funnel_max_depth,
-                                   arguments.funnel_score)
+                                   arguments.funnel_score,
+                                   delay_ms=arguments.delay_ms)
                if arguments.funnel else handler_for(fake))
     server = ConcurrentFakeServer((arguments.host, arguments.port), handler)
     print(server.server_address[1], flush=True)
@@ -268,7 +272,7 @@ def funnel_reply(prompt, max_depth, score=0.9):
     return json.dumps({"items": ["One", "Two", "Three"]}, separators=(",", ":"))
 
 
-def handler_for_funnel(fake, max_depth, score=0.9):
+def handler_for_funnel(fake, max_depth, score=0.9, delay_ms=0.0):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -306,6 +310,15 @@ def handler_for_funnel(fake, max_depth, score=0.9):
             prompt = "\n".join(str(message.get("content", ""))
                                for message in messages
                                if message.get("role") == "user")
+            # Recorded on ARRIVAL: the saturation test watches the record
+            # file to detect the in-flight call before the delay replies.
+            headers = {key: value for key, value in self.headers.items()
+                       if key.lower() != "authorization"}
+            fake.write_record({"method": "POST", "path": self.path,
+                               "headers": headers, "body": request,
+                               "elapsed_ms": 0})
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
             content = funnel_reply(prompt, max_depth, score)
             usage = {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 12,
                      "completion_tokens": 8}
@@ -315,11 +328,6 @@ def handler_for_funnel(fake, max_depth, score=0.9):
                                                           "content": content},
                                               "finish_reason": "stop"}],
                                  "usage": usage})
-            headers = {key: value for key, value in self.headers.items()
-                       if key.lower() != "authorization"}
-            fake.write_record({"method": "POST", "path": self.path,
-                               "headers": headers, "body": request,
-                               "elapsed_ms": round((time.monotonic() - started) * 1000, 3)})
     return Handler
 
 

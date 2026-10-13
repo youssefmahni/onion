@@ -236,7 +236,9 @@ TEST_F(SyncTest, PushAddressRecordingRequiresACurrentMemberSignature) {
 
   // (c) B's own signature with a URL: recorded, and only as B's own
   // address (the signature covers the device id, so B cannot record
-  // anyone else's row).
+  // anyone else's row). The push is answered 202 (the fold is queued —
+  // a handler thread never waits on the writer), so the test drains the
+  // writer queue before checking the row.
   Ed25519Signer signer_b(*key_b_);
   const auto headers_b = onion::sync::signed_post_headers(
       key_b_->device_id, "/sync/v1/push", batch_json, signer_b);
@@ -246,8 +248,132 @@ TEST_F(SyncTest, PushAddressRecordingRequiresACurrentMemberSignature) {
   with_url.emplace("X-Onion-Sync-Url", planted);
   response = client.Post("/sync/v1/push", with_url, batch_json,
                          "application/json");
-  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(response->status, 202);
+  writer_a_->sync();  // the queued batch and address update are folded
   EXPECT_EQ(b_url(), planted);
+}
+
+TEST_F(SyncTest, PushDuplicateBatchIsASuccessNotAFork) {
+  // M8 pre-work classification: re-pushing an already-stored batch with
+  // the SAME hash is an idempotent success (200 duplicate) — never a
+  // forked-log signal, never a double fold.
+  writer_b_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01-IN01-T01-TK00001"},
+                               {"layer", 4}, {"title", "From B"}}),
+  }});
+  writer_b_->sync();
+  std::string batch_json;
+  {
+    std::ifstream in(writer_b_->segments().active_path());
+    std::string line;
+    while (std::getline(in, line))
+      if (!line.empty()) batch_json = line;
+  }
+  ASSERT_FALSE(batch_json.empty());
+
+  start_server_a();
+  httplib::Client client("127.0.0.1", server_->bound_port());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  Ed25519Signer signer_b(*key_b_);
+  const auto post = [&]() {
+    httplib::Headers headers;
+    for (const auto& [name, value] : onion::sync::signed_post_headers(
+             key_b_->device_id, "/sync/v1/push", batch_json, signer_b))
+      headers.emplace(name, value);
+    return client.Post("/sync/v1/push", headers, batch_json,
+                       "application/json");
+  };
+
+  auto response = post();
+  EXPECT_EQ(response->status, 202);
+  writer_a_->sync();  // apply the queued batch
+  const auto vector_after_first =
+      writer_a_->vector()[key_b_->device_id];
+  ASSERT_EQ(vector_after_first, 1);
+
+  // The identical batch again: 200 duplicate, nothing new applied, no
+  // fork recorded.
+  response = post();
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  EXPECT_NE(response->body.find("duplicate"), std::string::npos);
+  writer_a_->sync();
+  EXPECT_EQ(writer_a_->vector()[key_b_->device_id], vector_after_first);
+  EXPECT_TRUE(writer_a_->forks().empty());
+}
+
+TEST_F(SyncTest, PushForkedBatchIsRejectedAndSurfaced) {
+  // M8 pre-work classification: the same (origin, number) with a
+  // DIFFERENT hash is a forked log — 409, never applied, logged at error
+  // level and surfaced in /api/state's forks list (StateWriter::forks).
+  writer_b_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01-IN01-T01-TK00001"},
+                               {"layer", 4}, {"title", "From B"}}),
+  }});
+  writer_b_->sync();
+  std::string batch_json;
+  {
+    std::ifstream in(writer_b_->segments().active_path());
+    std::string line;
+    while (std::getline(in, line))
+      if (!line.empty()) batch_json = line;
+  }
+  ASSERT_FALSE(batch_json.empty());
+
+  start_server_a();
+  httplib::Client client("127.0.0.1", server_->bound_port());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  Ed25519Signer signer_b(*key_b_);
+  const auto post = [&](const std::string& body) {
+    httplib::Headers headers;
+    for (const auto& [name, value] : onion::sync::signed_post_headers(
+             key_b_->device_id, "/sync/v1/push", body, signer_b))
+      headers.emplace(name, value);
+    return client.Post("/sync/v1/push", headers, body,
+                       "application/json");
+  };
+
+  auto response = post(batch_json);
+  EXPECT_EQ(response->status, 202);
+  writer_a_->sync();  // apply the queued batch
+  ASSERT_EQ(writer_a_->vector()[key_b_->device_id], 1);
+  const auto stored_hash =
+      writer_a_->stored_batch_hash(key_b_->device_id, 1);
+  ASSERT_TRUE(stored_hash.has_value());
+
+  // The fork: batch number 1 re-signed by the SAME origin key with
+  // different records — same (origin, number), different hash.
+  auto parsed = nlohmann::json::parse(batch_json, nullptr, false);
+  ASSERT_FALSE(parsed.is_discarded());
+  const std::string prev_hex = parsed["prev"].get<std::string>();
+  std::vector<onion::log::Record> records;
+  records.push_back(make_record(
+      "ADD_NODE", {{"path", "P01-IN01-T01-TK00001"},
+                   {"layer", 4}, {"title", "Forked content"}}));
+  records[0].seq = 1;
+  onion::log::Batch fork = onion::log::make_batch(
+      key_b_->device_id, 1, prev_hex, records, signer_b);
+  ASSERT_NE(fork.hash, *stored_hash);
+  const std::string fork_json = fork.to_json().dump();
+
+  response = post(fork_json);
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 409);
+  EXPECT_NE(response->body.find("forked"), std::string::npos);
+  writer_a_->sync();
+  // Never applied: the vector still ends at seq 1.
+  EXPECT_EQ(writer_a_->vector()[key_b_->device_id], 1);
+  // Surfaced for /api/state.
+  const auto forks = writer_a_->forks();
+  ASSERT_EQ(forks.size(), 1u);
+  EXPECT_EQ(forks[0].origin, key_b_->device_id);
+  EXPECT_EQ(forks[0].number, 1u);
+  EXPECT_EQ(forks[0].incoming_hash, fork.hash);
+  EXPECT_EQ(forks[0].stored_hash, *stored_hash);
 }
 
 TEST_F(SyncTest, OneRoundConvergesBothSettlesAndNodes) {

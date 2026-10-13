@@ -321,6 +321,14 @@ if(BUILD_TESTING)
     TIMEOUT 420
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
     SKIP_RETURN_CODE 77)
+  # The sync scheduler runs on its own thread: a node saturated by 60 s
+  # LLM calls must keep completing rounds and its peers must learn the
+  # campaign within two rounds. Under TSan the SQLite WAL-index false
+  # positives are suppressed (tests/tsan_suppressions.txt).
+  add_test(NAME sync.saturation_decoupled COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/sync_saturation_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(sync.saturation_decoupled PROPERTIES
+    TIMEOUT 240
+    ENVIRONMENT "ONION_SYNC_SAT_DEADLINE_S=180;TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan_suppressions.txt")
   add_test(NAME m7.dynamic_fleet_scenarios COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dynamic_fleet_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(m7.dynamic_fleet_scenarios PROPERTIES
     TIMEOUT 420

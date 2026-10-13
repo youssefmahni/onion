@@ -343,12 +343,15 @@ bool SyncServer::start(std::string* error) {
       return reject("missing auth header");
     // The static members.json first; a device admitted through the join
     // endpoint resolves from the members TABLE (M7 dynamic membership).
+    // The table read goes through the per-handler read-only connection:
+    // authentication must never serialize behind writer transactions.
     std::vector<std::uint8_t> public_key;
     const MemberKey* member = find_member(impl_->options.members, device_id);
     if (member) {
       public_key = member->public_key;
-    } else if (const auto stored =
-                   impl_->options.writer->member_public_key(device_id)) {
+    } else if (const auto stored = onion::state::StateWriter::
+                   member_public_key_on(
+                       impl_->options.writer->read_db(), device_id)) {
       public_key = *stored;
     } else {
       return reject("unknown device");
@@ -394,8 +397,9 @@ bool SyncServer::start(std::string* error) {
       return reject(409, "token already used");
     const auto identity = log::derive_identity(parsed->pubkey_hex);
     if (!identity) return reject(400, "bad public key");
-    if (impl_->options.writer->member_slot_collides(identity->slot,
-                                                    identity->device_id))
+    if (onion::state::StateWriter::member_slot_collides_on(
+            impl_->options.writer->read_db(), identity->slot,
+            identity->device_id))
       return reject(409, "slot collision");
     log::Record admission;
     admission.type = "MEMBER_ADD";
@@ -408,7 +412,8 @@ bool SyncServer::start(std::string* error) {
     // The fold is the authority: sync() drained it. Presence means OUR add
     // (or an earlier add of the same device) won; absence means a
     // concurrent same-slot admission beat us.
-    if (!impl_->options.writer->member_exists(identity->device_id))
+    if (!onion::state::StateWriter::member_exists_on(
+            impl_->options.writer->read_db(), identity->device_id))
       return reject(409, "slot collision");
     // The joiner learns the fleet from this response: the static list
     // plus every admitted member.
@@ -453,7 +458,8 @@ bool SyncServer::start(std::string* error) {
                          {"url", url},
                          {"swim", swim_url}});
     }
-    for (const auto& row : impl_->options.writer->members_table()) {
+    for (const auto& row : onion::state::StateWriter::members_table_on(
+             impl_->options.writer->read_db())) {
       const std::string url =
           row.device_id == impl_->options.key->device_id
               ? my_url()
@@ -555,6 +561,17 @@ bool SyncServer::start(std::string* error) {
   // M7: a pushed batch (DESIGN › New children / claims are pushed to
   // every device at once). The sender signs the request; the batch must
   // verify against this device's local chain for the origin.
+  //
+  // M8 pre-work (the load-starvation fix): the handler NEVER blocks on
+  // the writer. Signature, chain and classification run on the handler
+  // thread over a per-thread read-only SQLite connection; the fold is
+  // enqueued and answered 202 immediately. Classification by exactly
+  // (origin, number):
+  //   - already stored, same hash    -> 200 duplicate (no-op)
+  //   - already stored, other hash   -> 409 forked log (error log, forks
+  //                                     entry in /api/state, never applied)
+  //   - number beyond latest + 1     -> 409 gap (not a fork; pull recovers)
+  //   - otherwise                    -> verify the chain, enqueue, 202
   impl_->server->Post("/sync/v1/push", [this](const httplib::Request& request,
                                                httplib::Response& response) {
     if (!impl_->authenticate(request, response)) return;
@@ -565,29 +582,19 @@ bool SyncServer::start(std::string* error) {
     // header to the signature (the signed bytes cover the device id, so
     // only the holder of that member's key can claim it), and the row
     // must belong to a CURRENT member — an evicted or left device must
-    // not be able to inject addresses.
+    // not be able to inject addresses. The UPDATE itself goes through
+    // the writer queue: a handler thread never writes SQLite.
     const std::string sender =
         request.get_header_value("X-Onion-Device");
     const std::string sender_url =
         request.get_header_value("X-Onion-Sync-Url");
     if (!sender.empty() && !sender_url.empty() &&
-        (impl_->options.writer->member_is_current(sender) ||
-         find_member(impl_->options.members, sender) != nullptr)) {
-      auto statement = [&]() {
-        std::string error;
-        return const_cast<onion::store::Db&>(impl_->options.writer->db())
-            .prepare(
-                "UPDATE members SET sync_url=?2 WHERE device_id=?1;",
-                &error);
-      }();
-      if (statement) {
-        std::string bind_error;
-        statement->bind(1, sender, &bind_error);
-        statement->bind(2, sender_url, &bind_error);
-        std::string step_error;
-        statement->step(&step_error);
-      }
-    }
+        (onion::state::StateWriter::member_is_current_on(
+             impl_->options.writer->read_db(), sender) ||
+         find_member(impl_->options.members, sender) != nullptr))
+      impl_->options.writer->submit(
+          state::SetMemberSyncUrl{sender, sender_url});
+
     auto batch_json =
         nlohmann::json::parse(request.body, nullptr, false);
     if (batch_json.is_discarded() || !batch_json.contains("recs")) {
@@ -606,6 +613,9 @@ bool SyncServer::start(std::string* error) {
     for (const auto& record_json : batch_json["recs"])
       batch.records.push_back(log::Record::from_json(record_json));
 
+    const store::Db& read = impl_->options.writer->read_db();
+    using onion::state::StateWriter;
+
     // The origin's key: the static list or the members table.
     std::vector<std::uint8_t> origin_public_key;
     {
@@ -613,8 +623,8 @@ bool SyncServer::start(std::string* error) {
           find_member(impl_->options.members, batch.origin);
       if (member)
         origin_public_key = member->public_key;
-      else if (const auto stored = impl_->options.writer->member_public_key(
-                   batch.origin))
+      else if (const auto stored =
+                   StateWriter::member_public_key_on(read, batch.origin))
         origin_public_key = *stored;
     }
     if (origin_public_key.empty()) {
@@ -623,11 +633,50 @@ bool SyncServer::start(std::string* error) {
                            "application/json");
       return;
     }
+
+    // Classification by exactly (origin, number).
+    const auto stored =
+        StateWriter::stored_batch_hash_on(read, batch.origin, batch.number);
+    const std::uint64_t latest =
+        StateWriter::latest_batch_number_on(read, batch.origin);
+    if (stored) {
+      if (*stored == batch.hash) {
+        // The batch is already applied: an idempotent success, not an
+        // error and definitely not a fork.
+        response.status = 200;
+        response.set_content("{\"ok\":true,\"duplicate\":true}",
+                             "application/json");
+        return;
+      }
+      // Same (origin, number), different hash: a forked log. Never
+      // apply it; record it, log it, surface it.
+      impl_->options.writer->note_fork(
+          state::StateWriter::ForkEvent{batch.origin, batch.number,
+                                        batch.hash, *stored});
+      std::fprintf(stderr,
+                   "ERROR forked log push: origin=%s number=%llu "
+                   "incoming-hash=%s stored-hash=%s\n",
+                   batch.origin.c_str(),
+                   static_cast<unsigned long long>(batch.number),
+                   batch.hash.c_str(), stored->c_str());
+      response.status = 409;
+      response.set_content("{\"error\":\"forked log\"}",
+                           "application/json");
+      return;
+    }
+    if (batch.number > latest + 1) {
+      // A gap, not a fork: we are behind and the puller will close it.
+      response.status = 409;
+      response.set_content("{\"error\":\"gap\"}", "application/json");
+      return;
+    }
+
     log::VerifyContext context;
     context.version = 1;
-    context.expected_prev = impl_->options.writer->origin_prev_hash(
-        batch.origin).value_or("");
-    const auto applied = impl_->options.writer->vector();
+    const auto head =
+        StateWriter::stored_batch_hash_on(read, batch.origin, latest);
+    context.expected_prev = head.value_or("");
+    const auto applied = StateWriter::vector_on(read);
     const auto applied_it = applied.find(batch.origin);
     context.expected_first_seq =
         applied_it == applied.end() ? 1 : applied_it->second + 1;
@@ -642,21 +691,24 @@ bool SyncServer::start(std::string* error) {
                            "application/json");
       return;
     }
+    // Enqueue for the writer and answer at once: the handler never waits
+    // for sync(). The writer re-checks duplicates and forks before the
+    // fold (the authoritative answer to the race between a push and a
+    // concurrent pull of the same batch).
     impl_->options.writer->submit(
         state::AppendForeign{std::move(batch)});
-    impl_->options.writer->sync();
-    response.status = 200;
+    response.status = 202;
     response.set_content("{\"ok\":true}", "application/json");
   });
 
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,
                                                 httplib::Response& response) {
     if (!impl_->authenticate(request, response)) return;
-    auto& writer = *impl_->options.writer;
     nlohmann::json json;
     json["device_id"] = impl_->options.key->device_id;
     json["incarnation"] = 1;
-    for (const auto& [origin, seq] : writer.vector())
+    for (const auto& [origin, seq] : onion::state::StateWriter::vector_on(
+             impl_->options.writer->read_db()))
       json["vector"][origin] = seq;
     response.set_content(json.dump(), "application/json");
   });
@@ -863,7 +915,7 @@ void SyncClient::push_batch(std::string_view peer_base_url,
   const auto response = client.Post("/sync/v1/push", headers,
                                     std::string(batch_json),
                                     "application/json");
-  if (!response || response->status != 200) {
+  if (!response || (response->status != 200 && response->status != 202)) {
     if (error)
       *error = "push failed (status " +
                std::to_string(response ? response->status : -1) + ")";

@@ -146,3 +146,17 @@ Result: in progress
 Evidence: -
 Lapse: the "record the merge" memory-docs commit landed on main (before branching) — §6.1 says never commit to main. Docs-only and harmless, but recorded. All code commits from here land on m4-signed-log only.
 Next step: DeviceKey + Ed25519Signer in src/log with golden determinism, then verify() with every rejection case.
+
+## 2026-10-13 · m8 pre-work · mp-flake root cause and the sync-scheduler decoupling
+
+Result: in progress
+Evidence:
+- Root cause of the CI flake (`sync.multi_process_convergence`, 3x in runs 38411014186 / 38416803977 / 38420549900): the sync round lived inside the node loop, AFTER engine.run() — a busy engine (13-19 attempts/60 s under load) held the loop thread, so the sync timer never fired (the working node's log had ZERO sync lines). Its peers never learned the campaign and the no-progress window expired. Secondary: the sync-server handlers read SQLite on the single shared writer connection, so handler threads starved behind writer folds (peers saw `status -1`).
+- Fixes: dedicated sync scheduler thread with its own 15 s clock (rounds never overlap; an overrunning round skips the missed ticks with a log line), the members.json reload moved onto the scheduler (a busy engine no longer blocks address discovery), per-handler read-only SQLite connections (store::Db::open_readonly, one per thread via StateWriter::read_db — sync server AND /api/state), push handlers verify on the handler thread and answer 202 without waiting for the fold, and the writer re-checks duplicates/forks as the authority.
+- Push 409 classification by exactly (origin, number) via a new `batches` table: same hash → 200 duplicate (idempotent); different hash → 409 forked log (error log + `/api/state` forks entry, never applied); number beyond latest+1 → 409 gap (pull recovers). Writer-side dedup closes the push/pull race. Tests: `SyncTest.PushDuplicateBatchIsASuccessNotAFork`, `SyncTest.PushForkedBatchIsRejectedAndSurfaced`.
+- `sync.saturation_decoupled`: 2 nodes, node 1 saturated by 60 s-per-call fake-LLM latency (`--delay-ms` added to the funnel fake); node 1 still completes rounds (0→2 in the in-flight window) and node 2 learns the campaign at ~15 s. PASS under TSan with zero reports (SQLite WAL-index races suppressed via tests/tsan_suppressions.txt — fcntl locks invisible to TSan; suppressions wired into the TSan CI job and the test's ctest ENVIRONMENT). The TSan job regex now runs it.
+- mp test hardening: progress = new records anywhere OR a successful sync round anywhere (`sync_rounds_completed` in /api/state), not vector silence alone — timeouts untouched.
+- `EngineTest.StopRuleEndsAnAtomicFrontierCampaign` (4x CI flake): 0/200 reproductions locally under ctest -j8 load; last green main (38408084810 @ 4bfeece) → first failing run (38411014186 @ 92feb5b) differs by a docs-only commit, so it is environmental. Documented in COORDINATION.md; tracked for M9.
+- Proof so far: 30/30 mp runs under ctest -j8 load; full local suite 318/318 (debug). Final 30-run proof on the frozen binary pending, then the PR.
+
+Next step: re-run the 30-loop on the final binary, open the PR, 3 green CI runs, merge; then Part 1 (0014 majority amendment).
