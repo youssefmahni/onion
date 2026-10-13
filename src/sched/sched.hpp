@@ -142,6 +142,7 @@ struct CampaignPlan {
   double cost_peak{};
   double cost_offpeak{};
   double hours{};
+  bool saturated{false};  // int64 clamped at some level
   double spend_per_hour_peak{};
   double spend_per_hour_offpeak{};
 };

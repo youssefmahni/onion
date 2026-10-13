@@ -317,6 +317,47 @@ TEST(PlanCampaign, TimeAndSpendPerHour) {
   EXPECT_NEAR(plan.spend_per_hour_offpeak, plan.cost_offpeak * 3600.0, 1e-6);
 }
 
+TEST(MeasureParams, PrefersAttemptRowsOverReviewAcceptedSettles) {
+  // A review-accepted settle records attempts 0 even though the funnel ran
+  // three attempts; attempts_avg must come from the attempts table.
+  std::error_code ec;
+  const auto dir = std::filesystem::temp_directory_path() /
+                   "measure_params_test";
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+  onion::store::Db db(dir / "onion.db");
+  std::string error;
+  ASSERT_TRUE(db.open(&error)) << error;
+  ASSERT_TRUE(db.exec(
+      "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, "
+      "hlc, origin) VALUES ('a', 100, 0, 0, '0.4', 'c', 1, 'o');",
+      &error)) << error;
+  ASSERT_TRUE(db.exec(
+      "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, "
+      "hlc, origin) VALUES ('b', 10, 0, 0, '0.3', 'c', 2, 'o');",
+      &error)) << error;
+  ASSERT_TRUE(db.exec(
+      "INSERT INTO attempts(path, n, score, passed, tokens_in, "
+      "tokens_cached, tokens_out, cost, campaign, hlc, origin) VALUES "
+      "('a', 1, '0.1', 0, 100, 0, 200, '0', 'c', 1, 'o');",
+      &error)) << error;
+  ASSERT_TRUE(db.exec(
+      "INSERT INTO attempts(path, n, score, passed, tokens_in, "
+      "tokens_cached, tokens_out, cost, campaign, hlc, origin) VALUES "
+      "('a', 2, '0.4', 0, 300, 0, 560, '0', 'c', 2, 'o');",
+      &error)) << error;
+  const auto params = onion::sched::measure_params(db, &error);
+  EXPECT_EQ(error, "");
+  // 100 + 10 kept over two settles with children.
+  EXPECT_NEAR(params.children_kept, 55.0, 1e-9);
+  EXPECT_NEAR(params.atomic_share, 0.0, 1e-9);
+  // Two attempt rows over two settles, NOT zero from the settle rows.
+  EXPECT_NEAR(params.attempts_avg, 1.0, 1e-9);
+  // Per-call tokens: 760 out / 2 attempts / 8 calls per attempt = 47.5.
+  // The distinct token values make this pin the 8-call default.
+  EXPECT_NEAR(params.tokens_out_per_call, 760.0 / 2.0 / 8.0, 1e-9);
+}
+
 TEST(PlanCampaign, TimeScalesWithOutputTokensNotCallCount) {
   // Long outputs dominate the funnel: 1,400-token calls take longer than
   // 365-token calls even at the same call count.  Two plans with the same
