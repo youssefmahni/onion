@@ -124,7 +124,22 @@ std::string critique_prompt(const NodeContext& ctx,
       << "\" (precision), not on whether every candidate is perfect. Check: "
          "(1) hallucinations or off-topic items, (2) duplicates, (3) "
          "important missing categories, (4) weak or vague items, (5) "
-         "compliance (Title Case, no questions, no emoji). Candidates:\n"
+         "compliance (Title Case, no questions, no emoji).\n"
+         // Anchored rubric (decision 0020): the score is calibrated
+         // against these fixed example anchors, so the 0.0-1.0 scale
+         // means the same thing across calls and models.
+         "Calibrate against these anchors for the node \"Order "
+         "Capture\":\n"
+         "- Score 0.8 example: [Order Entry Form, Payment Authorization, "
+         "Shipping Method Selection, Order Confirmation, Order Status "
+         "Tracking] — every item is a direct part, none weak.\n"
+         "- Score 0.5 example: [Order Entry Form, Payment Authorization, "
+         "Discount Codes, Customer Loyalty Program, Refund Policy] — the "
+         "first two are direct parts, the rest belong to sibling nodes.\n"
+         "- Score 0.2 example: [Selling Strategies, Customer Service, Best "
+         "Practices, E-commerce Trends, Tips And Tricks] — mostly "
+         "off-topic.\n"
+         "Apply the same standard to this node. Candidates:\n"
       << join(candidates)
       << "\nReturn JSON {\"score\": 0.0-1.0 usable-candidate ratio, "
          "\"remove\": [ items to drop ], \"add\": [ missing items to include "

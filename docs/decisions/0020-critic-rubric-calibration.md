@@ -35,7 +35,18 @@ change alone would therefore calibrate noise, not quality.
    follow-up is to gate on the judge itself (a cheap judge call per
    commit), which this decision deliberately does not yet authorize.
 
+## Validation (2026-10-13, owner-approved rubric, measured)
+
+The rubric was implemented and re-scored the 93 recorded critique calls
+(no new candidates): **AUC 0.54** vs the target ≥ 0.75, **36% tied**
+vs < 15%, **0% first-attempt ≥ 0.7** vs 80–90%. The anchors did not
+break the critic's 0.15/0.35 quantization or raise its 0.62 ceiling —
+the flash critic cannot be calibrated by prompting. Per this decision's
+own escape hatch, the follow-up is to **gate on the judge itself**; see
+`RUBRIC_VALIDATION.md`. Targets unmet — reported, not tuned.
+
 ## Decision needed
 
-Accept the rubric direction (implementation + measurement follow-up),
-adjust it, or reject.
+Acknowledge the measured failure of the rubric and approve the
+follow-up direction (a per-commit judge call as the gate signal, a new
+Proposed decision), or direct otherwise.

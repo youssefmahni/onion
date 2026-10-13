@@ -483,6 +483,16 @@ TEST(GateParsers, CritiqueScoreScaleDriftIsRejected) {
   EXPECT_FALSE(parse_critique(R"({"score": "0.15"})").has_value());
 }
 
+TEST(GatePrompts, CritiquePromptCarriesTheAnchoredRubric) {
+  // Decision 0020: fixed example anchors calibrate the critic's scale.
+  const std::string prompt = critique_prompt(ctx(), {"A", "B"});
+  EXPECT_NE(prompt.find("Score 0.8 example"), std::string::npos);
+  EXPECT_NE(prompt.find("Score 0.5 example"), std::string::npos);
+  EXPECT_NE(prompt.find("Score 0.2 example"), std::string::npos);
+  EXPECT_NE(prompt.find("Calibrate against these anchors"),
+            std::string::npos);
+}
+
 TEST(GateParsers, ChildrenKeyFromTheRecordedW54Replies) {
   // The W5.4 synthesizer replies drifted from "items" to "children"
   // (recorded shapes below); the parser accepts both and stays strict
