@@ -395,7 +395,8 @@ def main():
             log = os.path.join(root, "node%d.log" % index)
             if os.path.exists(log):
                 lines = open(log).read().splitlines()
-                sync_lines = [l for l in lines if "sync" in l.lower()]
+                sync_lines = [l for l in lines
+                              if "sync" in l.lower() or "verify" in l.lower()]
                 print("--- node%d log head ---" % index)
                 print("\n".join(lines[:4]))
                 print("--- node%d log tail ---" % index)
