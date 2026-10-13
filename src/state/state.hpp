@@ -75,6 +75,10 @@ class StateWriter {
     std::shared_ptr<const log::DeviceKey> device_key;
     // Segment seal threshold (tests use small values to force rotation).
     std::uint64_t seal_bytes{64u * 1024u * 1024u};
+    // The offline admin key's public key (hex), learned at genesis. When
+    // set, a MEMBER_EVICT record signed by it is valid without a
+    // majority (DESIGN › Eviction and retirement).
+    std::string admin_public_key_hex;
     // Test-only crash injection, called at the commit steps:
     // 1 = terminal batch durable, before the fold; 2 = after the fold.
     // Throwing (or terminating) from it simulates a power cut.
@@ -96,6 +100,8 @@ class StateWriter {
   void sync();
   // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
   bool write_checkpoint(std::string* error);
+  // The data directory (checkpoints live next to onion.db).
+  const std::filesystem::path& data_dir() const { return options_.data_dir; }
   // Drains and joins the writer thread.
   void stop();
 
@@ -122,6 +128,38 @@ class StateWriter {
   // Per-origin RESERVE totals for one campaign, for diagnostics.
   std::map<std::string, std::int64_t> reserved_by_origin(
       std::string_view campaign) const;
+  // M7 joining: whether an invitation nonce was already used (single-use
+  // tokens — the MEMBER_ADD fold records each nonce).
+  bool join_nonce_seen(std::string_view nonce) const;
+  // M7 joining: whether the slot already belongs to another device.
+  bool member_slot_collides(std::int64_t slot,
+                            std::string_view device_id) const;
+  // M7 joining: whether the members table holds this device.
+  bool member_exists(std::string_view device_id) const;
+  // M7 joining: a member's public key (32 bytes) from the members table.
+  std::optional<std::vector<std::uint8_t>> member_public_key(
+      std::string_view device_id) const;
+  // M7 stealing: whether another device holds an unexpired CLAIM on the
+  // path (timed from THIS device's receipt — never the claimer's clock).
+  // Returns the claimer's device id, or empty.
+  std::string claim_holder(std::string_view path, std::string_view my_device,
+                           std::int64_t now_ms) const;
+  // M7 re-expansion lock: whether any ancestor of the path has an open
+  // REEXPAND (its subtree pauses until the re-expansion settles).
+  bool reexpand_open(std::string_view path) const;
+  // M7 joining: every member row (device_id, pubkey hex, slot, state).
+  struct MemberRow {
+    std::string device_id;
+    std::string pubkey_hex;
+    std::int64_t slot{};
+    std::string state;
+    std::string sync_url;
+    std::string swim_url;
+  };
+  std::vector<MemberRow> members_table() const;
+  // M7: a member's sync (TCP) address from the durable table, if known.
+  std::optional<std::string> member_sync_url(std::string_view device_id) const;
+  std::optional<std::string> member_swim_url(std::string_view device_id) const;
   std::vector<CampaignInfo> campaigns() const;
   std::uint64_t next_seq() const;
   std::uint64_t next_batch() const;
@@ -200,6 +238,18 @@ class StateWriter {
     std::string origin;
     std::int64_t attempts{};
   };
+  std::unordered_set<std::string> seen_join_nonces_;  // single-use tokens
+  // M7 stealing: per-path claims (claimer, receipt ms, lease s) and the
+  // re-expansion lock set. Both are replay-owned (no store table).
+  struct ClaimEntry {
+    std::string claimer;
+    log::Hlc hlc{};           // the highest (hlc, origin) claim wins
+    std::string origin;
+    std::int64_t received_ms{};
+    std::int64_t lease_s{600};
+  };
+  std::map<std::string, ClaimEntry> claims_;
+  std::unordered_set<std::string> reexpand_paths_;
   std::map<std::string, std::vector<ReserveEntry>> reserve_entries_;
   std::map<std::string, std::int64_t> campaign_budgets_;  // from CAMPAIGN spec
   std::int64_t campaign_budget(std::string_view campaign) const;

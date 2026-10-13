@@ -11,23 +11,7 @@ namespace onion::log {
 
 namespace {
 
-std::vector<std::uint8_t> unhex_bytes(std::string_view hex) {
-  std::vector<std::uint8_t> raw;
-  raw.reserve(hex.size() / 2);
-  const auto digit = [](char c) -> int {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-  };
-  for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
-    const int hi = digit(hex[i]);
-    const int lo = digit(hex[i + 1]);
-    if (hi < 0 || lo < 0) return {};
-    raw.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
-  }
-  return raw;
-}
+
 
 nlohmann::json payload_json(const InviteToken& token) {
   return {

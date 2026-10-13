@@ -1,5 +1,23 @@
 # Traceability — DESIGN.md rules → tests
 
+## M7 scope: DESIGN.md › Membership, Joining, Eviction, Stealing, Eligibility
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| SWIM: ping (1 s), ack (500 ms), 2 indirect probes, SUSPECT, refutation (incarnation + 1), DEAD after the suspicion timeout, piggybacked gossip, 5 s beacon | `SwimProtocol.AckKeepsMembersActive`, `MissedPingWithNoProbersSuspects`, `TwoIndirectProbersForwardAndReport`, `IndirectProbeThroughAPartitionClearsTheProbe`, `RefutationRestoresActiveAndStopsTheClock`, `SuspicionTimesOutToDead`, `PiggybackedGossipDisseminatesSuspicion`, `BeaconFiresEveryPeriodWithPayload`, `RepeatedProbesDoNotExtendSuspicion`, `GossipLearnedSuspicionStillTimesOut`, `StaleIndirectAckDoesNotClearAFreshProbe` | ✅ |
+| Eight membership states; only ACTIVE and SUSPECT own work; EVICTED terminal; LEFT/DEAD return through JOINING | `SwimState.AllEightStatesParseAndRoundTrip`, `OnlyActiveAndSuspectOwnWork`, `EvictedIsTerminal`, `DeadComesBackThroughJoiningNotAlive`, `AliveWithHigherIncarnationRefutesSuspect` | ✅ |
+| Signed invite tokens (single use, TTL) and the admission flow (slot collision, add-wins) | `InviteToken.RoundTrip`, `TtlParsesShorthands`; `SyncTest.JoinEndpointAdmitsAValidToken`, `JoinEndpointRejectsTamperedAndExpiredTokens`; `StateWriterTest.MemberAddDerivesIdentityAndBurnsTheNonce`, `MemberAddRefusesACollidingSlot`, `JoinNonceSurvivesRestart` | ✅ |
+| Clone from a checkpoint: manifest signature, snapshot hash, Merkle root | `SyncTest.CheckpointCloneInstallsAnIdenticalStore`, `CheckpointCloneRefusesATamperedManifest` | ✅ |
+| ACTIVE at lag < 100 | `SyncTest.PeerLagMeasuresTheGapToThePeer`; live smoke (B joins A, ACTIVE at lag 0); scenario A | ✅ |
+| Eviction: majority or the admin key; lone signature rejected; accept-until cutoff | `StateWriterTest.MemberEvictNeedsAMajorityOrTheAdminKey`; scenario E; `log::eviction_valid` (M6 tests) | ✅ |
+| Graceful leave: MEMBER_LEAVE valid only from the device itself | `StateWriterTest.MemberLeaveIsValidOnlyFromTheDeviceItself`; `node stop --leave` | ✅ |
+| Stealing: CLAIM lease timed on the receiver's clock, settle ends the claim, REEXPAND pauses the subtree | `StateWriterTest.ClaimsExpireFromTheReceiversClock`, `ReexpandPausesTheSubtreeUntilTheSettle`, `EngineTest.IdleFleetEngineStealsFromTheBusiestLane` | ✅ |
+| Eligibility: DEAD lanes re-hash to the survivors only with a visible majority; a split moves nothing | `EngineTest.DeadMemberDropsOutOfTheLiveLaneList`-replacement (steal + rehash), scenario D | ✅ |
+| Budget (0014): capped fold, void stops new attempts, one reservation per sync round, measured chunks | `StateWriterTest.CappedFoldVoidsPastBudgetInEveryDeliveryOrder`, `ReservationThatExactlyFitsIsNotVoid`, `ReserveFoldSurvivesRestart`, `StaleCampaignRecordDoesNotMoveTheBudget`; `EngineTest.FleetEngineReservesOnlyOncePerSyncRound`, `VoidReservationStopsNewAttempts`, `MeasuredChunkScalesWithWindowAttempts` | ✅ |
+| Chaos tools: kill points, clock jumps, disk-full, partitions | `ONION_KILL_AT_COMMIT`, `ONION_CLOCK_JUMP_MS`, `ONION_SIM_DISK_FULL`, `ONION_PARTITION_FROM` — exercised by scenarios B and D; fork-based crash tests | ✅ |
+| Multi-process scenarios | `m7.dynamic_fleet_scenarios` (join mid-run, kill mid-run, 2-and-2 split, lone eviction) — CI green on every OS | ✅ |
+
+
 Every rule touched by a milestone must have at least one passing test before that milestone merges; a ⏳ row is an explicitly tracked waiver (owner action). Status: ✅ passing in CI · ⏳ pending/waived · 🔵 owner live check.
 
 ## M2 scope: DESIGN.md › LLM provider, keys and budgets

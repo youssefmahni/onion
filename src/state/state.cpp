@@ -18,6 +18,13 @@
 namespace onion::state {
 namespace {
 
+std::int64_t wall_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+
 // The deterministic fold: one record type, one store mutation. Upserts use
 // the highest (hlc, origin) so a replay after a crash is idempotent.
 void upsert_node(store::Db& db, const log::Record& record,
@@ -506,7 +513,8 @@ void StateWriter::rebuild_index() {
   // The RESERVE fold is replayed from the log before this point (replay()
   // folds every record); RESERVE has no store table, so these maps must
   // survive the rebuild — clearing them here erased the fleet budget
-  // accounting on every restart (decision 0014).
+  // accounting on every restart (decision 0014). The same holds for the
+  // join-nonce set (single-use tokens survive restarts).
   // Leaves: settled nodes whose end is not "children". The settles table
   // does not store end (DESIGN schema), so it is re-derived from the log.
   std::error_code ec;
@@ -537,7 +545,16 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   const std::string& type = record.type;
   const std::string origin(batch_origin);
   if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
-  else if (type == "SETTLE") upsert_settle(db_, record, origin, error);
+  else if (type == "SETTLE") {
+    upsert_settle(db_, record, origin, error);
+    // A settle ends any CLAIM and REEXPAND lock on the path.
+    const std::string settle_path = record.payload.value("path", std::string{});
+    if (!settle_path.empty()) {
+      std::unique_lock lock(index_mutex_);
+      claims_.erase(settle_path);
+      reexpand_paths_.erase(settle_path);
+    }
+  }
   else if (type == "ATTEMPT") upsert_attempt(db_, record, origin, error);
   else if (type == "CRITIQUE") upsert_critique(db_, record, origin, error);
   else if (type == "NEEDS_REVIEW") upsert_review(db_, record, origin, error);
@@ -553,7 +570,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       statement->bind(2, payload.value("note", std::string{}), &bind_error);
       statement->step(&bind_error);
     }
-  } else if (type == "TOMBSTONE") {
+} else if (type == "TOMBSTONE") {
     const auto& payload = record.payload;
     auto statement = db_.prepare(
         "UPDATE nodes SET tombstone=1 WHERE path=?1;", error);
@@ -573,6 +590,159 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
       reserved_by_origin_campaign_[origin + "|" + campaign] += attempts;
       reserve_entries_[campaign].push_back(
           ReserveEntry{record.hlc, origin, attempts});
+    }
+  } else if (type == "MEMBER_EVICT") {
+    // M7 eviction (DESIGN › Eviction and retirement): valid when signed
+    // by a majority of the members-table keys, or by the offline admin
+    // key. EVICTED is terminal; the evicted origin's records past
+    // accept_until_seq stop verifying (the per-origin cutoff).
+    if (!record.payload.contains("device_id") ||
+        !record.payload["device_id"].is_string())
+      return;
+    std::vector<std::string> member_keys;
+    {
+      auto statement = db_.prepare(
+          "SELECT pubkey FROM members WHERE state != 'EVICTED';", error);
+      if (!statement) return;
+      std::string step_error;
+      while (statement->step_row(&step_error)) {
+        const std::string pubkey = statement->blob(0);
+        static const char* digits = "0123456789abcdef";
+        std::string hex;
+        for (const unsigned char byte : pubkey) {
+          hex.push_back(digits[byte >> 4]);
+          hex.push_back(digits[byte & 0xf]);
+        }
+        member_keys.push_back(std::move(hex));
+      }
+    }
+    if (!log::eviction_valid(record, member_keys,
+                             options_.admin_public_key_hex))
+      return;  // not a majority, not the admin key: the draft is dropped
+    const std::string device_id =
+        record.payload["device_id"].get<std::string>();
+    const std::int64_t cutoff =
+        record.payload.value("accept_until_seq", std::int64_t{0});
+    auto statement = db_.prepare(
+        "UPDATE members SET state='EVICTED', evict_cutoff=?2 "
+        "WHERE device_id=?1;",
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      statement->bind(2, cutoff, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
+  } else if (type == "CLAIM") {
+    // M7 stealing: a 10-minute lease timed from THIS device's receipt.
+    // Racing claims resolve on the highest (hlc, origin), exactly like
+    // the rest of the fold, so every replica agrees on the holder.
+    const std::string path = record.payload.value("path", std::string{});
+    if (path.empty()) return;
+    const std::int64_t lease_s =
+        std::clamp(record.payload.value("lease_s", std::int64_t{600}),
+                   std::int64_t{1}, std::int64_t{86400});
+    std::unique_lock lock(index_mutex_);
+    const auto existing = claims_.find(path);
+    if (existing == claims_.end() ||
+        record.hlc > existing->second.hlc ||
+        (record.hlc == existing->second.hlc &&
+         origin > existing->second.origin))
+      claims_[path] = ClaimEntry{origin, record.hlc, origin, wall_ms(),
+                                 lease_s};
+  } else if (type == "REEXPAND") {
+    // M7 re-expansion lock: the subtree pauses until the settle.
+    const std::string path = record.payload.value("path", std::string{});
+    if (path.empty()) return;
+    std::unique_lock lock(index_mutex_);
+    reexpand_paths_.insert(path);
+  } else if (type == "MEMBER_LEAVE") {
+    // Valid only from the device itself (DESIGN › Conflict table).
+    const std::string device_id =
+        record.payload.value("device_id", std::string{});
+    if (device_id.empty() || device_id != origin) return;
+    auto statement = db_.prepare(
+        "UPDATE members SET state='LEFT' WHERE device_id=?1;", error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
+  } else if (type == "MEMBER_ADDR") {
+    // M7: a device's reachable addresses, written once per run. The log
+    // is the deterministic channel (gossip refreshes between runs).
+    const std::string device_id =
+        record.payload.value("device_id", std::string{});
+    if (device_id.empty() || device_id != origin) return;
+    const std::string sync_url =
+        record.payload.value("sync", std::string{});
+    const std::string swim_url =
+        record.payload.value("swim", std::string{});
+    auto statement = db_.prepare(
+        "UPDATE members SET sync_url=?2, swim_url=?3 WHERE device_id=?1;",
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, device_id, &bind_error);
+      statement->bind(2, sync_url, &bind_error);
+      statement->bind(3, swim_url, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
+    }
+  } else if (type == "MEMBER_ADD") {
+    // M7 joining (DESIGN › Joining): the inviter's admission record. The
+    // identity is DERIVED from the public key (never trusted from the
+    // payload); the token nonce is single-use; add-wins; a slot that
+    // already belongs to another device is refused deterministically.
+    const auto& payload = record.payload;
+    if (!payload.contains("pubkey") || !payload["pubkey"].is_string() ||
+        !payload.contains("nonce") || !payload["nonce"].is_string())
+      return;
+    const auto identity = log::derive_identity(payload["pubkey"].get<std::string>());
+    if (!identity) return;
+    const std::string nonce = payload["nonce"].get<std::string>();
+    {
+      std::unique_lock lock(index_mutex_);
+      // Deliberately burn BEFORE the slot check: the refusal is
+      // deterministic across replicas, and the slot is fixed by the
+      // pubkey, so retrying the same token could never help.
+      if (!seen_join_nonces_.insert(nonce).second) return;  // replayed token
+    }
+    const std::vector<std::uint8_t> pubkey =
+        log::unhex_bytes(payload["pubkey"].get<std::string>());
+    if (pubkey.size() != 32) return;
+    // Slot collision: first claim wins, the late add is dropped.
+    {
+      auto statement = db_.prepare(
+          "SELECT COUNT(*) FROM members WHERE slot = ?1 AND device_id != ?2;",
+          error);
+      if (statement) {
+        std::string bind_error;
+        statement->bind(1, identity->slot, &bind_error);
+        statement->bind(2, identity->device_id, &bind_error);
+        std::string step_error;
+        if (statement->step_row(&step_error) && statement->integer(0) > 0)
+          return;
+      }
+    }
+    auto statement = db_.prepare(
+        "INSERT INTO members(device_id, pubkey, slot, state, incarnation) "
+        "VALUES (?1, ?2, ?3, 'JOINING', 1) "
+        "ON CONFLICT(device_id) DO NOTHING;",  // add-wins
+        error);
+    if (statement) {
+      std::string bind_error;
+      statement->bind(1, identity->device_id, &bind_error);
+      statement->bind(2,
+                      std::string_view(
+                          reinterpret_cast<const char*>(pubkey.data()),
+                          pubkey.size()),
+                      &bind_error);
+      statement->bind(3, identity->slot, &bind_error);
+      std::string step_error;
+      statement->step(&step_error);
     }
   } else if (type == "MEMBER_PROFILE") {
     const auto& payload = record.payload;
@@ -981,6 +1151,132 @@ std::vector<StateWriter::ReserveEntry> StateWriter::reserve_entries_sorted(
               return a.origin < b.origin;
             });
   return sorted;
+}
+
+bool StateWriter::join_nonce_seen(std::string_view nonce) const {
+  std::shared_lock lock(index_mutex_);
+  return seen_join_nonces_.count(std::string(nonce)) != 0;
+}
+
+bool StateWriter::member_exists(std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT COUNT(*) FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (statement->step_row(&step_error)) return statement->integer(0) > 0;
+  return false;
+}
+
+std::optional<std::vector<std::uint8_t>> StateWriter::member_public_key(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT pubkey FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string blob = statement->blob(0);
+  return std::vector<std::uint8_t>(blob.begin(), blob.end());
+}
+
+std::vector<StateWriter::MemberRow> StateWriter::members_table() const {
+  std::vector<MemberRow> rows;
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT device_id, pubkey, slot, state, sync_url, swim_url "
+      "FROM members ORDER BY device_id;",
+      &error);
+  if (!statement) return rows;
+  std::string step_error;
+  while (statement->step_row(&step_error)) {
+    const std::string pubkey = statement->blob(1);
+    std::string hex;
+    static const char* digits = "0123456789abcdef";
+    for (const unsigned char byte : pubkey) {
+      hex.push_back(digits[byte >> 4]);
+      hex.push_back(digits[byte & 0xf]);
+    }
+    rows.push_back(MemberRow{statement->text(0), hex,
+                             statement->integer(2), statement->text(3),
+                             statement->text(4), statement->text(5)});
+  }
+  return rows;
+}
+
+std::optional<std::string> StateWriter::member_sync_url(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT sync_url FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string url = statement->text(0);
+  if (url.empty()) return std::nullopt;
+  return url;
+}
+
+std::optional<std::string> StateWriter::member_swim_url(
+    std::string_view device_id) const {
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT swim_url FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string url = statement->text(0);
+  if (url.empty()) return std::nullopt;
+  return url;
+}
+
+bool StateWriter::member_slot_collides(std::int64_t slot,
+                                       std::string_view device_id) const {
+  // Fail CLOSED: a database error must not disable the slot protection.
+  std::string error;
+  auto statement = db_.prepare(
+      "SELECT COUNT(*) FROM members WHERE slot = ?1 AND device_id != ?2;",
+      &error);
+  if (!statement) return true;
+  std::string bind_error;
+  statement->bind(1, slot, &bind_error);
+  statement->bind(2, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (statement->step_row(&step_error)) return statement->integer(0) > 0;
+  return true;
+}
+
+std::string StateWriter::claim_holder(std::string_view path,
+                                      std::string_view my_device,
+                                      std::int64_t now_ms) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = claims_.find(std::string(path));
+  if (found == claims_.end()) return {};
+  const ClaimEntry& entry = found->second;
+  if (entry.claimer == my_device) return {};  // our own claim
+  if (now_ms >= entry.received_ms + entry.lease_s * 1000) return {};  // expired
+  return entry.claimer;
+}
+
+bool StateWriter::reexpand_open(std::string_view path) const {
+  std::shared_lock lock(index_mutex_);
+  std::string prefix;
+  for (const char c : path) {
+    prefix.push_back(c);
+    if (c == '-') {
+      if (reexpand_paths_.count(prefix.substr(0, prefix.size() - 1)))
+        return true;
+    }
+  }
+  return reexpand_paths_.count(std::string(path)) != 0;
 }
 
 std::int64_t StateWriter::reserved_total(std::string_view campaign) const {

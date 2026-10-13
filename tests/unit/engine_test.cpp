@@ -386,3 +386,44 @@ TEST_F(EngineTest, StructureReviewDoesNotReprocessTheTicket) {
   // second run added nothing.
   EXPECT_EQ(writer_->db().all_nodes(&error).size(), 4u);
 }
+
+TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
+  seed_root();
+  Budget budget("10");
+  // The static list gives the OTHER device every lane (weight 100 vs
+  // 0.1). This device is work-starved and steals (DESIGN › Stealing):
+  // a CLAIM record guards the stolen ticket.
+  Engine engine(Engine::Options{*writer_, funnel_fake(8), budget, 1,
+                                "dev0000000000000001", "0.001", std::nullopt,
+                                0,
+                                {{"dev0000000000000001", 0.1},
+                                 {"dev0000000000000002", 100.0}},
+                                "dev0000000000000001"});
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  const Engine::RunResult idle = engine.run(campaign, nullptr);
+  EXPECT_EQ(idle.end_reason, "drained");
+  EXPECT_GT(idle.settled, 0);  // stolen tickets got worked
+
+  // The steal was claimed in the log.
+  std::ifstream in(writer_->segments().active_path());
+  std::string line;
+  bool found_claim = false;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    auto batch = json::parse(line, nullptr, false);
+    if (batch.is_discarded()) continue;
+    for (const auto& record_json : batch["recs"])
+      if (record_json.value("t", "") == "CLAIM") found_claim = true;
+  }
+  EXPECT_TRUE(found_claim);
+
+  // After the other device drops out of the live list, the re-hashed
+  // tickets are OWN lane work: no new claims needed (one sync round
+  // re-opens the reservation, per decision 0014).
+  engine.set_lane_members({{"dev0000000000000001", 0.1}});
+  engine.note_sync_round();
+  const Engine::RunResult resumed = engine.run(campaign, nullptr);
+  EXPECT_EQ(resumed.end_reason, "drained");
+  EXPECT_GT(resumed.settled, 0);
+}
