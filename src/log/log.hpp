@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -92,6 +93,18 @@ class Ed25519Signer final : public Signer {
 
 // The previous-hash value of batch 1: BLAKE2b-256 of the public key.
 std::string genesis_prev(const DeviceKey& key);
+
+// Hex <-> bytes helpers (shared by the log, invite and state folds).
+std::vector<std::uint8_t> unhex_bytes(std::string_view hex);
+std::string hex_bytes(const std::vector<std::uint8_t>& raw);
+
+// A device's derived identity from a public key (64 hex): the device id
+// (first 16 hex of the key digest) and its 20-bit slot.
+struct DerivedIdentity {
+  std::string device_id;
+  std::int64_t slot{};
+};
+std::optional<DerivedIdentity> derive_identity(std::string_view pubkey_hex);
 
 // Verification outcome per DESIGN.md › Op log format › Verification on
 // receipt. Ok means the batch may be applied; every other value names the

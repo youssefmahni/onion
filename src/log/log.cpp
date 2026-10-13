@@ -152,7 +152,6 @@ nlohmann::json Batch::to_json() const {
                         {"recs", records}};
 }
 
-namespace {
 std::vector<std::uint8_t> unhex_bytes(std::string_view hex) {
   std::vector<std::uint8_t> raw;
   raw.reserve(hex.size() / 2);
@@ -181,7 +180,7 @@ std::string hex_bytes(const std::uint8_t* bytes, std::size_t size) {
   }
   return hex;
 }
-}  // namespace
+
 
 Batch make_batch(std::string origin, std::uint64_t number,
                  std::string prev_hex, std::vector<Record> records,
@@ -512,6 +511,18 @@ DeviceKey DeviceKey::from_seed(const std::vector<std::uint8_t>& seed) {
   return key;
 }
 
+std::optional<DerivedIdentity> derive_identity(std::string_view pubkey_hex) {
+  const std::vector<std::uint8_t> raw = unhex_bytes(pubkey_hex);
+  if (raw.size() != kPublicKeySize) return std::nullopt;
+  const std::string digest = blake2b_hex(std::string_view(
+      reinterpret_cast<const char*>(raw.data()), raw.size()));
+  DerivedIdentity identity;
+  identity.device_id = digest.substr(0, 16);
+  identity.slot =
+      static_cast<std::int64_t>(std::stoul(digest.substr(0, 5), nullptr, 16));
+  return identity;
+}
+
 DeviceKey DeviceKey::from_seed_hex(std::string_view seed_hex) {
   const std::vector<std::uint8_t> seed = unhex_bytes(seed_hex);
   return from_seed(seed);
@@ -585,8 +596,30 @@ Verify verify(const Batch& batch, const VerifyContext& context) {
   if (public_key.size() != 32) return Verify::BadSig;
   if (crypto_ed25519_check(signature.data(), public_key.data(),
                            reinterpret_cast<const std::uint8_t*>(signed_bytes.data()),
-                           signed_bytes.size()) != 0)
+                           signed_bytes.size()) != 0) {
+    if (std::getenv("ONION_SYNC_DEBUG")) {
+      // Diagnosis aid: the exact hash and signed bytes, so a platform
+      // difference is visible byte-for-byte.
+      std::fprintf(stderr,
+                   "[batch-verify] BADSIG origin=%s n=%llu prev=%s\n"
+                   "  computed-hash=%s stored-hash=%s signed-bytes-hex=%s\n",
+                   batch.origin.c_str(),
+                   static_cast<unsigned long long>(batch.number),
+                   batch.prev.c_str(), hash_records_hex(batch.records).c_str(),
+                   batch.hash.c_str(),
+                   [&]() {
+                     static const char* digits = "0123456789abcdef";
+                     std::string hex;
+                     for (const unsigned char byte : signed_bytes) {
+                       hex.push_back(digits[byte >> 4]);
+                       hex.push_back(digits[byte & 0xf]);
+                     }
+                     return hex;
+                   }()
+                       .c_str());
+    }
     return Verify::BadSig;
+  }
   return Verify::Ok;
 }
 

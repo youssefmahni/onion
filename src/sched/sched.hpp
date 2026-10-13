@@ -31,6 +31,7 @@ struct CampaignSpec {
   std::int64_t chunk{50};                 // RESERVE chunk size
   int light_funnel_from{8};
   bool structure{false};                  // L1..L3 expansion allowed (M3: no)
+  bool spillover{true};  // M7: steal from budget-empty lanes when true
   std::string model{"deepseek-flash"};
   std::string critic_model;               // empty = same as model
   bool auto_accept{false};                // M3: parsed, not acted on
@@ -236,6 +237,13 @@ class Engine {
   // max(50, measured × 1.2)) and re-opens reservations (at most one
   // RESERVE per sync round per device).
   void note_sync_round();
+
+  // M7: the live lane list (the node loop derives it from the SWIM
+  // membership — DEAD members drop out once a majority is visible, so
+  // their tickets re-hash to the survivors). Replaces the static list.
+  void set_lane_members(std::vector<LaneMember> members);
+  // The effective lane list: the live one when set, else the static one.
+  const std::vector<LaneMember>& live_lane_members() const;
 
   // Review decisions as record submissions. `accept` settles the node so its
   // children become tickets; `retry` re-queues it with the note injected;

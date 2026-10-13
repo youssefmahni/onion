@@ -161,7 +161,14 @@ bool AppendFile::open(const std::filesystem::path& path) {
   if (error) return false;
 #ifdef _WIN32
   if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) CloseHandle(static_cast<HANDLE>(handle_));
-  handle_ = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  // Share read/write/delete: the state writer's torn-tail cut resizes
+  // the file while this handle is open, and the resize's open needs the
+  // share permission from every existing handle (Windows semantics).
+  handle_ = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE |
+                            FILE_SHARE_DELETE,
+                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                        nullptr);
   if (handle_ == INVALID_HANDLE_VALUE) return false;
   return true;
 #else
@@ -172,6 +179,9 @@ bool AppendFile::open(const std::filesystem::path& path) {
 #endif
 }
 bool AppendFile::append(std::string_view bytes) {
+  // Chaos tool (M7): ONION_SIM_DISK_FULL makes every append fail, so the
+  // node behaves exactly as on a full disk.
+  if (std::getenv("ONION_SIM_DISK_FULL")) return false;
 #ifdef _WIN32
   if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE) return false;
   std::size_t done = 0;

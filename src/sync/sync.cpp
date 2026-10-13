@@ -1,5 +1,7 @@
 #include "sync.hpp"
 
+#include "log/invite.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -58,6 +60,38 @@ std::string signed_bytes_hex(std::string_view device_id,
     hex.push_back(digits[byte & 0xf]);
   }
   return hex;
+}
+
+
+// Signed request headers for a GET: a fresh random nonce per attempt (the
+// macOS 401 fix — a retry signs new bytes), the device id, the timestamp
+// and the signature.
+httplib::Headers signed_headers(std::string_view device_id,
+                                std::string_view path, std::int64_t ts,
+                                log::Signer& signer) {
+  std::random_device entropy;
+  std::mt19937_64 generator(entropy());
+  std::uniform_int_distribution<std::uint64_t> distribution;
+  std::ostringstream nonce_stream;
+  nonce_stream << std::hex << distribution(generator)
+               << distribution(generator);
+  const std::string nonce = nonce_stream.str();
+  const std::string signature =
+      sign_request(device_id, "GET", path, "", nonce, ts, signer);
+  if (std::getenv("ONION_SYNC_DEBUG"))
+    std::fprintf(stderr,
+                 "[sync-client] device=%s path=%s ts=%lld nonce=%s "
+                 "body-hash=%s sig=%s signed-bytes-hex=%s\n",
+                 std::string(device_id).c_str(),
+                 std::string(path).c_str(), static_cast<long long>(ts),
+                 nonce.c_str(), onion::log::blake2b_hex("").c_str(),
+                 signature.c_str(),
+                 signed_bytes_hex(device_id, "GET", path, "", nonce, ts)
+                     .c_str());
+  return httplib::Headers{{"X-Onion-Device", std::string(device_id)},
+                          {"X-Onion-Time", std::to_string(ts)},
+                          {"X-Onion-Nonce", nonce},
+                          {"X-Onion-Sig", signature}};
 }
 
 }  // namespace
@@ -128,9 +162,131 @@ struct SyncServer::Impl {
   std::atomic<bool> running{false};
   std::atomic<int> port{0};
   NonceCache nonces;
-  std::function<const MemberKey*(const httplib::Request&, httplib::Response&)>
+  // Returns true when the request is authorized (static members.json or
+  // a device admitted through the join endpoint's members-table row).
+  std::function<bool(const httplib::Request&, httplib::Response&)>
       authenticate;
 };
+
+
+std::map<std::string, std::string> signed_post_headers(
+    std::string_view device_id, std::string_view path,
+    std::string_view body, log::Signer& signer) {
+  std::random_device entropy;
+  std::mt19937_64 generator(entropy());
+  std::uniform_int_distribution<std::uint64_t> distribution;
+  std::ostringstream nonce_stream;
+  nonce_stream << std::hex << distribution(generator)
+               << distribution(generator);
+  const std::string nonce = nonce_stream.str();
+  const std::int64_t ts = now_s();
+  const std::string signature =
+      sign_request(device_id, "POST", path, body, nonce, ts, signer);
+  return {{"X-Onion-Device", std::string(device_id)},
+          {"X-Onion-Time", std::to_string(ts)},
+          {"X-Onion-Nonce", nonce},
+          {"X-Onion-Sig", signature}};
+}
+
+std::string clone_checkpoint(std::string_view peer_base_url,
+                             const CloneOptions& options) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(20, 0);
+  client.set_write_timeout(5, 0);
+  // Fresh timestamp per request: a large snapshot can outlive one 60 s
+  // window (the signed-request skew tolerance).
+  const auto fetch = [&](std::string_view path) {
+    return client.Get(std::string(path).c_str(),
+                      signed_headers(options.device_id, path, now_s(),
+                                     options.signer));
+  };
+
+  // Learn the peer's identity from its vector (an authenticated request).
+  auto vector = fetch("/sync/v1/vector");
+  if (!vector || vector->status != 200)
+    return "vector request failed (status " +
+           std::to_string(vector ? vector->status : -1) + ")";
+  auto vector_json = nlohmann::json::parse(vector->body, nullptr, false);
+  if (vector_json.is_discarded())
+    return "malformed vector response: " + vector->body;
+  const std::string peer_id = vector_json.value("device_id", std::string{});
+  const auto peer_entry = options.members.find(peer_id);
+  if (peer_id.empty() || peer_entry == options.members.end())
+    return "unknown peer identity";
+
+  // The manifest: signature over the canonical JSON with the signature
+  // fields emptied.
+  auto manifest_response = fetch("/sync/v1/checkpoint/latest");
+  if (!manifest_response || manifest_response->status != 200)
+    return "checkpoint manifest request failed (status " +
+           std::to_string(manifest_response ? manifest_response->status : -1) +
+           ")";
+  nlohmann::json manifest =
+      nlohmann::json::parse(manifest_response->body, nullptr, false);
+  if (manifest.is_discarded() || !manifest.contains("signature") ||
+      !manifest.contains("snapshot_hash") ||
+      !manifest.contains("merkle_root") || !manifest.contains("hlc"))
+    return "malformed checkpoint manifest";
+  const std::string signature = manifest["signature"].get<std::string>();
+  manifest["signature"] = "";
+  manifest["cosignature"] = "";
+  const std::string canonical = onion::log::canonical_json(manifest);
+  const auto signature_raw = onion::log::unhex_bytes(signature);
+  if (signature_raw.size() != 64 ||
+      crypto_ed25519_check(
+          signature_raw.data(), peer_entry->second.public_key.data(),
+          reinterpret_cast<const std::uint8_t*>(canonical.data()),
+          canonical.size()) != 0)
+    return "checkpoint manifest signature invalid";
+
+  // The snapshot: hash must match the manifest.
+  const std::string snapshot_path =
+      "/sync/v1/checkpoint/" +
+      std::to_string(manifest["hlc"].get<std::uint64_t>()) + ".db";
+  auto snapshot_response = fetch(snapshot_path);
+  if (!snapshot_response || snapshot_response->status != 200)
+    return "checkpoint snapshot request failed (status " +
+           std::to_string(snapshot_response ? snapshot_response->status : -1) +
+           ")";
+  if (onion::log::blake2b_hex(snapshot_response->body) !=
+      manifest["snapshot_hash"].get<std::string>())
+    return "checkpoint snapshot hash mismatch";
+
+  // Install, then verify the Merkle root against the manifest.
+  std::error_code ec;
+  std::filesystem::create_directories(options.destination, ec);
+  const auto tmp = options.destination / "onion.db.clone-tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return "cannot write the snapshot";
+    out.write(snapshot_response->body.data(),
+              static_cast<std::streamsize>(snapshot_response->body.size()));
+  }
+  std::string error;
+  std::string root_check;
+  {
+    store::Db verify_db(tmp);
+    if (!verify_db.open(&error)) {
+      std::filesystem::remove(tmp, ec);
+      return "cannot open the cloned snapshot";
+    }
+    const auto nodes = verify_db.all_nodes(&error);
+    root_check = store::merkle_root(nodes);
+    verify_db.close();  // release the file before the rename (Windows locks)
+  }
+  if (root_check != manifest["merkle_root"].get<std::string>()) {
+    std::filesystem::remove(tmp, ec);
+    return "checkpoint merkle root mismatch";
+  }
+  std::filesystem::remove(options.destination / "onion.db", ec);
+  std::filesystem::rename(tmp, options.destination / "onion.db", ec);
+  if (ec) {
+    std::filesystem::remove(tmp, ec);
+    return "cannot install the snapshot";
+  }
+  return "";
+}
 
 SyncServer::SyncServer(Options options)
     : impl_(new Impl{std::move(options), nullptr, {}, false, 0, {}}) {}
@@ -149,16 +305,19 @@ const MemberKey* find_member(const std::vector<MemberKey>& members,
 
 bool SyncServer::start(std::string* error) {
   impl_->server = std::make_unique<httplib::Server>();
+  // The join endpoint is unauthenticated (the token IS the credential):
+  // cap request bodies so it cannot be used as a cheap amplifier.
+  impl_->server->set_payload_max_length(1 << 16);
 
   // Authentication for every endpoint. The handler lambdas must capture
   // `this` (not stack locals of start(), which dangle once start returns).
   impl_->authenticate = [this](const httplib::Request& request,
-                                httplib::Response& response) -> const MemberKey* {
+                                httplib::Response& response) -> bool {
     const std::string device_id = request.get_header_value("X-Onion-Device");
     const std::string timestamp = request.get_header_value("X-Onion-Time");
     const std::string signature = request.get_header_value("X-Onion-Sig");
     const std::string nonce = request.get_header_value("X-Onion-Nonce");
-    const auto reject = [&](const char* reason) -> const MemberKey* {
+    const auto reject = [&](const char* reason) -> bool {
       if (std::getenv("ONION_SYNC_DEBUG"))
         std::fprintf(stderr,
                      "[sync-auth] REJECT %s: device=%s ts-header=%s "
@@ -177,24 +336,316 @@ bool SyncServer::start(std::string* error) {
       response.set_content(std::string("{\"error\":\"") + reason +
                                "\"}",
                            "application/json");
-      return nullptr;
+      return false;
     };
     if (device_id.empty() || timestamp.empty() || signature.empty() ||
         nonce.empty())
       return reject("missing auth header");
+    // The static members.json first; a device admitted through the join
+    // endpoint resolves from the members TABLE (M7 dynamic membership).
+    std::vector<std::uint8_t> public_key;
     const MemberKey* member = find_member(impl_->options.members, device_id);
-    if (!member) return reject("unknown device");
+    if (member) {
+      public_key = member->public_key;
+    } else if (const auto stored =
+                   impl_->options.writer->member_public_key(device_id)) {
+      public_key = *stored;
+    } else {
+      return reject("unknown device");
+    }
     const std::int64_t ts = std::atoll(timestamp.c_str());
     // The signature covers the full target (path + query); httplib keeps
-    // the query only in request.target.
-    if (!request_signature_valid(device_id, "GET", request.target, request.body,
-                                 nonce, signature, member->public_key, ts,
-                                 now_s()))
+    // the query only in request.target. GETs and the evict POST sign the
+    // same canonical bytes with their own method.
+    const std::string method = request.method == "POST" ? "POST" : "GET";
+    if (!request_signature_valid(device_id, method, request.target,
+                                 request.body, nonce, signature, public_key,
+                                 ts, now_s()))
       return reject("bad signature");
     if (impl_->nonces.seen_and_add(device_id, nonce, now_s()))
       return reject("replayed nonce");
-    return member;
+    return true;
   };
+
+  // M7 joining: the invitation token is the credential (it is signed by a
+  // member); a valid, unused token with a free slot admits the device via
+  // a MEMBER_ADD record in the server's own log.
+  impl_->server->Post("/sync/v1/join", [this](const httplib::Request& request,
+                                               httplib::Response& response) {
+    const nlohmann::json token_json =
+        nlohmann::json::parse(request.body, nullptr, false);
+    const auto reject = [&](int status, std::string reason) {
+      response.status = status;
+      response.set_content(
+          nlohmann::json{{"error", std::move(reason)}}.dump(),
+          "application/json");
+    };
+    if (token_json.is_discarded() || !token_json.contains("inviter") ||
+        !token_json["inviter"].is_string())
+      return reject(400, "malformed token");
+    const std::string inviter = token_json["inviter"].get<std::string>();
+    const MemberKey* inviter_key = find_member(impl_->options.members, inviter);
+    if (!inviter_key) return reject(401, "unknown inviter");
+    std::string token_error;
+    const auto parsed = log::parse_invite(
+        request.body, now_s(), inviter_key->public_key, &token_error);
+    if (!parsed) return reject(401, token_error);
+    if (impl_->options.writer->join_nonce_seen(parsed->nonce))
+      return reject(409, "token already used");
+    const auto identity = log::derive_identity(parsed->pubkey_hex);
+    if (!identity) return reject(400, "bad public key");
+    if (impl_->options.writer->member_slot_collides(identity->slot,
+                                                    identity->device_id))
+      return reject(409, "slot collision");
+    log::Record admission;
+    admission.type = "MEMBER_ADD";
+    admission.payload = {{"pubkey", parsed->pubkey_hex},
+                         {"nonce", parsed->nonce},
+                         {"invited_by", inviter}};
+    impl_->options.writer->submit(
+        state::CommitTerminal{{std::move(admission)}});
+    impl_->options.writer->sync();
+    // The fold is the authority: sync() drained it. Presence means OUR add
+    // (or an earlier add of the same device) won; absence means a
+    // concurrent same-slot admission beat us.
+    if (!impl_->options.writer->member_exists(identity->device_id))
+      return reject(409, "slot collision");
+    // The joiner learns the fleet from this response: the static list
+    // plus every admitted member.
+    nlohmann::json members = nlohmann::json::array();
+    const auto url_of = [&](const std::string& device_id) {
+      const auto found = impl_->options.member_urls.find(device_id);
+      return found == impl_->options.member_urls.end()
+                 ? std::string{}
+                 : found->second;
+    };
+    // The server's own address: the configured self_url when set, else
+    // the bind address plus the REAL bound port (the requested port may
+    // have been 0 = ephemeral).
+    const auto my_url = [&]() {
+      if (!impl_->options.self_url.empty()) return impl_->options.self_url;
+      return impl_->options.bind_address + ":" +
+             std::to_string(impl_->port.load());
+    };
+    const auto swim_url_of = [&](const std::string& device_id) {
+      const auto found = impl_->options.member_swim_urls.find(device_id);
+      return found == impl_->options.member_swim_urls.end()
+                 ? std::string{}
+                 : found->second;
+    };
+    for (const auto& entry : impl_->options.members) {
+      std::string hex;
+      static const char* digits = "0123456789abcdef";
+      for (const std::uint8_t byte : entry.public_key) {
+        hex.push_back(digits[byte >> 4]);
+        hex.push_back(digits[byte & 0xf]);
+      }
+      const std::string url =
+          entry.device_id == impl_->options.key->device_id
+              ? my_url()
+              : url_of(entry.device_id);
+      const std::string swim_url =
+          entry.device_id == impl_->options.key->device_id
+              ? impl_->options.self_swim_url
+              : swim_url_of(entry.device_id);
+      members.push_back({{"device_id", entry.device_id},
+                         {"public_key", hex},
+                         {"url", url},
+                         {"swim", swim_url}});
+    }
+    for (const auto& row : impl_->options.writer->members_table()) {
+      const std::string url =
+          row.device_id == impl_->options.key->device_id
+              ? my_url()
+              : url_of(row.device_id);
+      const std::string swim_url =
+          row.device_id == impl_->options.key->device_id
+              ? impl_->options.self_swim_url
+              : swim_url_of(row.device_id);
+      members.push_back({{"device_id", row.device_id},
+                         {"public_key", row.pubkey_hex},
+                         {"url", url},
+                         {"swim", swim_url}});
+    }
+    response.status = 200;
+    response.set_content(
+        nlohmann::json{{"ok", true},
+                       {"device_id", identity->device_id},
+                       {"slot", identity->slot},
+                       {"members", std::move(members)}}
+            .dump(),
+        "application/json");
+  });
+
+
+  // M7 joining: the newest checkpoint manifest and its snapshot (DESIGN ›
+  // Joining — the new device clones a checkpoint instead of replaying the
+  // whole log, verifies the Merkle root and the signature, then pulls
+  // the tails).
+  impl_->server->Get("/sync/v1/checkpoint/latest",
+                     [this](const httplib::Request& request,
+                            httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const auto dir = impl_->options.writer->data_dir();
+    std::vector<std::filesystem::path> manifests;
+    std::error_code ec;
+    if (std::filesystem::exists(dir))
+      for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("checkpoint-", 0) == 0 &&
+            name.size() > 9 && name.substr(name.size() - 9) == ".manifest")
+          manifests.push_back(entry.path());
+      }
+    if (manifests.empty()) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no checkpoint yet\"}",
+                           "application/json");
+      return;
+    }
+    std::sort(manifests.begin(), manifests.end());
+    std::ifstream in(manifests.back(), std::ios::binary);
+    std::string manifest((std::istreambuf_iterator<char>(in)), {});
+    response.set_content(manifest, "application/json");
+  });
+
+  impl_->server->Get("/sync/v1/checkpoint/([0-9]+).db",
+                     [this](const httplib::Request& request,
+                            httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const std::string name =
+        std::string("checkpoint-") + request.matches[1].str() + ".db";
+    const auto path = impl_->options.writer->data_dir() / name;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no such snapshot\"}",
+                           "application/json");
+      return;
+    }
+    std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    response.set_content(bytes, "application/octet-stream");
+  });
+
+  // M7 eviction: a collected MEMBER_EVICT record, authenticated like
+  // every sync request (the submitter is a member). The fold validates
+  // the majority or the admin key.
+  impl_->server->Post("/sync/v1/evict", [this](const httplib::Request& request,
+                                                httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    const nlohmann::json record =
+        nlohmann::json::parse(request.body, nullptr, false);
+    if (record.is_discarded() || !record.contains("type") ||
+        record["type"] != "MEMBER_EVICT") {
+      response.status = 400;
+      response.set_content("{\"error\":\"not a MEMBER_EVICT record\"}",
+                           "application/json");
+      return;
+    }
+    log::Record parsed;
+    parsed.type = "MEMBER_EVICT";
+    parsed.payload = record.value("payload", nlohmann::json::object());
+    impl_->options.writer->submit(
+        state::CommitTerminal{{std::move(parsed)}});
+    impl_->options.writer->sync();
+    response.status = 200;
+    response.set_content("{\"ok\":true}", "application/json");
+  });
+
+  // M7: a pushed batch (DESIGN › New children / claims are pushed to
+  // every device at once). The sender signs the request; the batch must
+  // verify against this device's local chain for the origin.
+  impl_->server->Post("/sync/v1/push", [this](const httplib::Request& request,
+                                               httplib::Response& response) {
+    if (!impl_->authenticate(request, response)) return;
+    // The push itself delivers the pusher's address (DESIGN › New
+    // children are pushed at once): a peer that never pulled the origin
+    // cannot verify the pushed batch yet, but it CAN learn where to
+    // pull from.
+    const std::string sender =
+        request.get_header_value("X-Onion-Device");
+    const std::string sender_url =
+        request.get_header_value("X-Onion-Sync-Url");
+    if (!sender.empty() && !sender_url.empty()) {
+      if (const auto stored =
+              impl_->options.writer->member_public_key(sender)) {
+        auto statement = [&]() {
+          std::string error;
+          return const_cast<onion::store::Db&>(
+                     impl_->options.writer->db())
+              .prepare(
+                  "UPDATE members SET sync_url=?2 WHERE device_id=?1;",
+                  &error);
+        }();
+        if (statement) {
+          std::string bind_error;
+          statement->bind(1, sender, &bind_error);
+          statement->bind(2, sender_url, &bind_error);
+          std::string step_error;
+          statement->step(&step_error);
+        }
+      }
+    }
+    auto batch_json =
+        nlohmann::json::parse(request.body, nullptr, false);
+    if (batch_json.is_discarded() || !batch_json.contains("recs")) {
+      response.status = 400;
+      response.set_content("{\"error\":\"not a batch\"}",
+                           "application/json");
+      return;
+    }
+    log::Batch batch;
+    batch.version = batch_json.value("v", 0);
+    batch.origin = batch_json.value("o", std::string{});
+    batch.number = batch_json.value("b", std::uint64_t{0});
+    batch.prev = batch_json.value("prev", std::string{});
+    batch.hash = batch_json.value("hash", std::string{});
+    batch.sig = batch_json.value("sig", std::string{});
+    for (const auto& record_json : batch_json["recs"])
+      batch.records.push_back(log::Record::from_json(record_json));
+
+    // The origin's key: the static list or the members table.
+    std::vector<std::uint8_t> origin_public_key;
+    {
+      const MemberKey* member =
+          find_member(impl_->options.members, batch.origin);
+      if (member)
+        origin_public_key = member->public_key;
+      else if (const auto stored = impl_->options.writer->member_public_key(
+                   batch.origin))
+        origin_public_key = *stored;
+    }
+    if (origin_public_key.empty()) {
+      response.status = 401;
+      response.set_content("{\"error\":\"unknown origin\"}",
+                           "application/json");
+      return;
+    }
+    log::VerifyContext context;
+    context.version = 1;
+    context.expected_prev = impl_->options.writer->origin_prev_hash(
+        batch.origin).value_or("");
+    const auto applied = impl_->options.writer->vector();
+    const auto applied_it = applied.find(batch.origin);
+    context.expected_first_seq =
+        applied_it == applied.end() ? 1 : applied_it->second + 1;
+    context.origin_public_key = &origin_public_key;
+    if (context.expected_prev.empty() && batch.number == 1)
+      context.expected_prev = onion::log::blake2b_hex(std::string_view(
+          reinterpret_cast<const char*>(origin_public_key.data()),
+          origin_public_key.size()));
+    if (log::verify(batch, context) != log::Verify::Ok) {
+      response.status = 409;
+      response.set_content("{\"error\":\"batch verify failed\"}",
+                           "application/json");
+      return;
+    }
+    impl_->options.writer->submit(
+        state::AppendForeign{std::move(batch)});
+    impl_->options.writer->sync();
+    response.status = 200;
+    response.set_content("{\"ok\":true}", "application/json");
+  });
 
   impl_->server->Get("/sync/v1/vector", [this](const httplib::Request& request,
                                                 httplib::Response& response) {
@@ -360,6 +811,63 @@ SyncClient::SyncClient(Options options)
     : impl_(new Impl{std::move(options)}) {}
 SyncClient::~SyncClient() = default;
 
+std::int64_t SyncClient::peer_lag(std::string_view peer_base_url,
+                                  std::string* error) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  const std::string self = impl_->options.key->device_id;
+  log::Ed25519Signer signer(*impl_->options.key);
+  auto response = client.Get("/sync/v1/vector",
+                             signed_headers(self, "/sync/v1/vector",
+                                            now_s(), signer));
+  if (!response || response->status != 200) {
+    if (error) *error = "vector request failed";
+    return -1;
+  }
+  auto peer_vector_json = nlohmann::json::parse(response->body, nullptr, false);
+  if (peer_vector_json.is_discarded() || !peer_vector_json.contains("vector")) {
+    if (error) *error = "malformed vector response";
+    return -1;
+  }
+  const auto local = impl_->options.writer.vector();
+  std::int64_t lag = 0;
+  for (const auto& [origin, peer_seq] :
+       peer_vector_json["vector"].items()) {
+    const std::int64_t peer_last = peer_seq.get<std::int64_t>();
+    const auto it = local.find(origin);
+    const std::int64_t local_last = it == local.end() ? 0 : it->second;
+    lag = std::max(lag, peer_last - local_last);
+  }
+  return lag;
+}
+
+void SyncClient::push_batch(std::string_view peer_base_url,
+                            std::string_view batch_json,
+                            std::string* error) {
+  httplib::Client client(std::string(peer_base_url).c_str());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  const std::string self = impl_->options.key->device_id;
+  log::Ed25519Signer signer(*impl_->options.key);
+  httplib::Headers headers;
+  for (const auto& [name, value] : signed_post_headers(
+           self, "/sync/v1/push", batch_json, signer))
+    headers.emplace(name, value);
+  if (!impl_->options.self_url.empty())
+    headers.emplace("X-Onion-Sync-Url", impl_->options.self_url);
+  const auto response = client.Post("/sync/v1/push", headers,
+                                    std::string(batch_json),
+                                    "application/json");
+  if (!response || response->status != 200) {
+    if (error)
+      *error = "push failed (status " +
+               std::to_string(response ? response->status : -1) + ")";
+  }
+}
+
 int SyncClient::run_round(std::string_view peer_base_url,
                           std::map<std::string, std::string>* quarantined,
                           std::string* error) {
@@ -376,31 +884,7 @@ int SyncClient::run_round(std::string_view peer_base_url,
   const std::int64_t ts = now_s();
   log::Ed25519Signer signer(*impl_->options.key);
   auto request_headers = [&](std::string_view path) {
-    // A fresh random nonce per ATTEMPT: a transport retry signs a new
-    // nonce, so the anti-replay cache never rejects a legitimate retry
-    // (the macOS 401 root cause: httplib retried with the same bytes).
-    std::random_device entropy;
-    std::mt19937_64 generator(entropy());
-    std::uniform_int_distribution<std::uint64_t> distribution;
-    std::ostringstream nonce_stream;
-    nonce_stream << std::hex << distribution(generator)
-                 << distribution(generator);
-    const std::string nonce = nonce_stream.str();
-    const std::string signature =
-        sign_request(self, "GET", path, "", nonce, ts, signer);
-    if (std::getenv("ONION_SYNC_DEBUG"))
-      std::fprintf(stderr,
-                   "[sync-client] device=%s path=%s ts=%lld nonce=%s "
-                   "body-hash=%s sig=%s signed-bytes-hex=%s\n",
-                   self.c_str(), std::string(path).c_str(),
-                   static_cast<long long>(ts), nonce.c_str(),
-                   onion::log::blake2b_hex("").c_str(), signature.c_str(),
-                   signed_bytes_hex(self, "GET", path, "", nonce, ts)
-                       .c_str());
-    return httplib::Headers{{"X-Onion-Device", self},
-                            {"X-Onion-Time", std::to_string(ts)},
-                            {"X-Onion-Nonce", nonce},
-                            {"X-Onion-Sig", signature}};
+    return signed_headers(self, path, ts, signer);
   };
   auto response = client.Get("/sync/v1/vector",
                              request_headers("/sync/v1/vector"));
@@ -424,11 +908,23 @@ int SyncClient::run_round(std::string_view peer_base_url,
   // 2. Pull every origin where the peer is ahead.
   const std::string peer_id =
       peer_vector_json.value("device_id", std::string{});
-  if (peer_id.empty() || !impl_->options.members.count(peer_id)) {
+  if (peer_id.empty()) {
     if (error) *error = "unknown peer identity";
     return applied;
   }
-  const auto& peer_key = impl_->options.members.at(peer_id);
+  // The peer's key: the static map, or the members table for devices
+  // admitted through the join endpoint.
+  const auto peer_entry = impl_->options.members.find(peer_id);
+  std::vector<std::uint8_t> peer_public_key;
+  if (peer_entry != impl_->options.members.end())
+    peer_public_key = peer_entry->second.public_key;
+  else if (const auto stored =
+               impl_->options.writer.member_public_key(peer_id))
+    peer_public_key = *stored;
+  if (peer_public_key.empty()) {
+    if (error) *error = "unknown peer identity";
+    return applied;
+  }
   for (const auto& [origin, peer_seq] :
        peer_vector_json["vector"].items()) {
     const std::int64_t peer_last = peer_seq.get<std::int64_t>();
@@ -476,7 +972,25 @@ int SyncClient::run_round(std::string_view peer_base_url,
       context.version = 1;
       context.expected_prev = expected_prev;
       context.expected_first_seq = expected_first;
-      context.origin_public_key = &peer_key.public_key;
+      // The origin of a pulled batch may be a THIRD device — resolve its
+      // key from the static map or, for devices admitted through the
+      // join endpoint, from the members table.
+      const auto origin_key = [&]() -> std::vector<std::uint8_t> {
+        if (batch.origin == peer_id) return peer_public_key;
+        const auto static_entry =
+            impl_->options.members.find(batch.origin);
+        if (static_entry != impl_->options.members.end())
+          return static_entry->second.public_key;
+        if (const auto stored =
+                impl_->options.writer.member_public_key(batch.origin))
+          return *stored;
+        return {};
+      }();
+      if (origin_key.empty()) {
+        if (quarantined) (*quarantined)[origin] = "unknown origin key";
+        break;
+      }
+      context.origin_public_key = &origin_key;
       // The first batch of an origin chains from that origin's public-key
       // hash (the batch's own origin may be a third device).
       if (expected_prev.empty() && batch.number == 1) {
@@ -484,14 +998,23 @@ int SyncClient::run_round(std::string_view peer_base_url,
             [&]() -> std::string {
               if (batch.origin == peer_id)
                 return onion::log::blake2b_hex(std::string_view(
-                    reinterpret_cast<const char*>(peer_key.public_key.data()),
-                    peer_key.public_key.size()));
+                    reinterpret_cast<const char*>(peer_public_key.data()),
+                    peer_public_key.size()));
               const auto member = impl_->options.members.find(batch.origin);
-              if (member == impl_->options.members.end()) return {};
-              const auto& key_bytes = member->second.public_key;
-              return onion::log::blake2b_hex(std::string_view(
-                  reinterpret_cast<const char*>(key_bytes.data()),
-                  key_bytes.size()));
+              if (member != impl_->options.members.end()) {
+                const auto& key_bytes = member->second.public_key;
+                return onion::log::blake2b_hex(std::string_view(
+                    reinterpret_cast<const char*>(key_bytes.data()),
+                    key_bytes.size()));
+              }
+              // A device admitted through the join endpoint resolves
+              // from the members table.
+              if (const auto stored =
+                      impl_->options.writer.member_public_key(batch.origin))
+                return onion::log::blake2b_hex(std::string_view(
+                    reinterpret_cast<const char*>(stored->data()),
+                    stored->size()));
+              return std::string{};
             }();
         if (origin_pubkey.empty()) {
           if (quarantined) (*quarantined)[origin] = "unknown origin key";

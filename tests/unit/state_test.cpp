@@ -980,3 +980,338 @@ TEST_F(StateWriterTest, StaleCampaignRecordDoesNotMoveTheBudget) {
   EXPECT_EQ(writer_->reserved_total("mp1"), 1000);
   EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
 }
+
+namespace {
+
+// A MEMBER_ADD fold helper: the admission record the join endpoint
+// appends. The identity is DERIVED from the public key at fold time.
+onion::log::Record member_add(const std::string& pubkey_hex,
+                              const std::string& nonce) {
+  onion::log::Record record;
+  record.type = "MEMBER_ADD";
+  record.payload = {{"pubkey", pubkey_hex},
+                    {"nonce", nonce},
+                    {"invited_by", "dev0000000000000001"}};
+  return record;
+}
+
+std::string pubkey_hex_of(const onion::log::DeviceKey& key) {
+  std::string hex;
+  for (const std::uint8_t byte : key.public_key) {
+    hex += "0123456789abcdef"[byte >> 4];
+    hex += "0123456789abcdef"[byte & 0x0f];
+  }
+  return hex;
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, MemberAddDerivesIdentityAndBurnsTheNonce) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+
+  // The row exists with the DERIVED device id and slot, state JOINING.
+  auto statement = writer_->db().prepare(
+      "SELECT device_id, slot, state FROM members WHERE device_id = ?1;",
+      &error);
+  ASSERT_TRUE(statement);
+  std::string bind_error;
+  statement->bind(1, key.device_id, &bind_error);
+  std::string step_error;
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->text(0), key.device_id);
+  EXPECT_EQ(statement->integer(1), key.slot);
+  EXPECT_EQ(statement->text(2), "JOINING");
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+
+  // Add-wins: a second add with a DIFFERENT nonce changes nothing.
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "1f2e3d4c5b6a7988a9bacbdcedfe0f10")}});
+  writer_->sync();
+  statement = writer_->db().prepare(
+      "SELECT COUNT(*) FROM members WHERE device_id = ?1;", &error);
+  ASSERT_TRUE(statement);
+  statement->bind(1, key.device_id, &bind_error);
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->integer(0), 1);
+
+  // A replayed nonce adds nothing.
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+  statement = writer_->db().prepare(
+      "SELECT COUNT(*) FROM members;", &error);
+  ASSERT_TRUE(statement);
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->integer(0), 1);
+}
+
+TEST_F(StateWriterTest, JoinNonceSurvivesRestart) {
+  // A burned token nonce must stay burned across a restart (the nonce set
+  // is replay-owned, exactly like the RESERVE fold).
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto key = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(key),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  EXPECT_TRUE(writer_->join_nonce_seen("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+  EXPECT_FALSE(writer_->join_nonce_seen("deadbeefdeadbeefdeadbeefdeadbeef"));
+}
+
+TEST_F(StateWriterTest, MemberAddRefusesACollidingSlot) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto first = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(first),
+                                             "0f1e2d3c4b5a69788796a5b4c3d2e1f0")}});
+  writer_->sync();
+
+  // A DIFFERENT device that shares the second key's slot: seed a member
+  // row under an unrelated device id carrying that slot, then try to
+  // admit the second key through the fold — the collision branch must
+  // drop the add entirely (no row for the second device at all).
+  const auto second = onion::log::DeviceKey::from_seed_hex(
+      "505152535455565758595a5b5c5d5e5f"
+      "606162636465666768696a6b6c6d6e6f");
+  {
+    auto statement = writer_->db().prepare(
+        "INSERT INTO members(device_id, pubkey, slot, state, incarnation) "
+        "VALUES (?1, x'', ?2, 'JOINING', 1);",
+        &error);
+    ASSERT_TRUE(statement);
+    std::string bind_error;
+    statement->bind(1, "dev0000000000000bad", &bind_error);
+    statement->bind(2, second.slot, &bind_error);  // the colliding slot
+    std::string step_error;
+    statement->step(&step_error);
+  }
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex_of(second),
+                                             "2f3e4d5c6b7a8998a9bacbdcedfe0f11")}});
+  writer_->sync();
+  // No member row for the second device: the collision branch fired.
+  EXPECT_FALSE(writer_->member_exists(second.device_id));
+}
+
+namespace {
+
+std::string pubkey_hex(const onion::log::DeviceKey& key) {
+  std::string hex;
+  for (const std::uint8_t byte : key.public_key) {
+    hex += "0123456789abcdef"[byte >> 4];
+    hex += "0123456789abcdef"[byte & 0x0f];
+  }
+  return hex;
+}
+
+// A MEMBER_EVICT draft with the given signatures (hex).
+onion::log::Record member_evict(const std::string& device_id,
+                                std::vector<std::string> sigs,
+                                const std::string& kind = "majority") {
+  onion::log::Record record;
+  record.type = "MEMBER_EVICT";
+  record.payload = {{"device_id", device_id},
+                    {"accept_until_seq", 42},
+                    {"sigs", sigs},
+                    {"kind", kind}};
+  return record;
+}
+
+std::string sign_payload(onion::log::Record record,
+                         const onion::log::DeviceKey& key) {
+  record.payload.erase("sigs");
+  onion::log::Ed25519Signer signer(key);
+  return signer.sign(onion::log::canonical_json(record.payload));
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, MemberEvictNeedsAMajorityOrTheAdminKey) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto admin = onion::log::DeviceKey::from_seed_hex(
+      "101112131415161718191a1b1c1d1e1f"
+      "202122232425262728292a2b2c2d2e2f");
+  const auto victim = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  // Two members: the fold majority is > half of two = 2 signatures.
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex(admin),
+                                             "5a5b5c5d5e5f60616263646566676869")}});
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex(victim),
+                                             "6a6b6c6d6e6f70717273747576777879")}});
+  writer_->sync();
+  EXPECT_TRUE(writer_->member_exists(victim.device_id));
+
+  // One signature: dropped (no majority, no admin key configured).
+  auto draft = member_evict(victim.device_id, {sign_payload(
+      member_evict(victim.device_id, {}), admin)});
+  writer_->submit(CommitTerminal{{draft}});
+  writer_->sync();
+  EXPECT_TRUE(writer_->member_exists(victim.device_id));
+
+  // The admin key (configured on the writer): a single signature evicts.
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  options.admin_public_key_hex = pubkey_hex(admin);
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  draft = member_evict(victim.device_id, {}, "admin");
+  draft.payload["sigs"] = json::array({sign_payload(draft, admin)});
+  writer_->submit(CommitTerminal{{draft}});
+  writer_->sync();
+  // EVICTED is terminal: the row stays, marked EVICTED with the cutoff.
+  EXPECT_TRUE(writer_->member_exists(victim.device_id));
+  auto statement = writer_->db().prepare(
+      "SELECT state, evict_cutoff FROM members WHERE device_id = ?1;",
+      &error);
+  ASSERT_TRUE(statement);
+  std::string bind_error;
+  statement->bind(1, victim.device_id, &bind_error);
+  std::string step_error;
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->text(0), "EVICTED");
+  EXPECT_EQ(statement->integer(1), 42);
+}
+
+TEST_F(StateWriterTest, MemberLeaveIsValidOnlyFromTheDeviceItself) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  const auto device = onion::log::DeviceKey::from_seed_hex(
+      "303132333435363738393a3b3c3d3e3f"
+      "404142434445464748494a4b4c4d4e4f");
+  writer_->submit(CommitTerminal{{member_add(pubkey_hex(device),
+                                             "7a7b7c7d7e7f80818283848586878889")}});
+  writer_->sync();
+
+  // A leave from a DIFFERENT origin is dropped.
+  onion::log::Record forged;
+  forged.type = "MEMBER_LEAVE";
+  forged.payload = {{"device_id", device.device_id}};
+  onion::log::NullSigner forge_signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000ff", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{forged}, forge_signer)});
+  writer_->sync();
+  EXPECT_TRUE(writer_->member_exists(device.device_id));
+
+  // The device's own leave marks it LEFT (its own origin's batch).
+  onion::log::Record leave;
+  leave.type = "MEMBER_LEAVE";
+  leave.payload = {{"device_id", device.device_id}};
+  leave.seq = 1;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      device.device_id, 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{leave}, forge_signer)});
+  writer_->sync();
+  auto statement = writer_->db().prepare(
+      "SELECT state FROM members WHERE device_id = ?1;", &error);
+  ASSERT_TRUE(statement);
+  std::string bind_error;
+  statement->bind(1, device.device_id, &bind_error);
+  std::string step_error;
+  ASSERT_TRUE(statement->step_row(&step_error));
+  EXPECT_EQ(statement->text(0), "LEFT");
+}
+
+namespace {
+
+std::int64_t wall_ms_for_test() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+onion::log::Record claim_record(const std::string& path,
+                                const std::string& origin_note = "") {
+  onion::log::Record record;
+  record.type = "CLAIM";
+  record.payload = {{"campaign", "mp1"}, {"path", path}, {"lease_s", 600}};
+  return record;
+}
+
+}  // namespace
+
+TEST_F(StateWriterTest, ClaimsExpireFromTheReceiversClock) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  // A foreign claim from origin aa on P01-IN01.
+  onion::log::Record claim = claim_record("P01-IN01");
+  claim.seq = 1;
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000aa", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{claim}, signer)});
+  writer_->sync();
+
+  const std::int64_t now = wall_ms_for_test();
+  // Un-expired: the claimer is visible.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001", now),
+            "dev00000000000000aa");
+  // Our own device's view: a claim by someone else holds; our own claims
+  // don't block us.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev00000000000000aa", now),
+            "");
+  // The lease is timed from OUR receipt: +10 minutes (600 s) it expires.
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001",
+                                  now + 600 * 1000),
+            "");
+  // A settle ends the claim outright.
+  writer_->submit(CommitTerminal{{make_record(
+      "SETTLE", {{"path", "P01-IN01"}, {"kept", 0}, {"atomic", 0},
+                 {"attempts", 1}, {"score", "0"}, {"end", "cannot split"},
+                 {"campaign", "mp1"}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001", now),
+            "");
+}
+
+TEST_F(StateWriterTest, ReexpandPausesTheSubtreeUntilTheSettle) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  onion::log::Record lock;
+  lock.type = "REEXPAND";
+  lock.payload = {{"path", "P01"}, {"reason", "retry"}};
+  lock.seq = 1;
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000aa", 1, std::string(64, '0'),
+      std::vector<onion::log::Record>{lock}, signer)});
+  writer_->sync();
+
+  EXPECT_TRUE(writer_->reexpand_open("P01"));
+  EXPECT_TRUE(writer_->reexpand_open("P01-IN01"));
+  EXPECT_TRUE(writer_->reexpand_open("P01-IN01-T01-TK00001"));
+  EXPECT_FALSE(writer_->reexpand_open("P02"));
+
+  // The settle clears the lock for the whole subtree.
+  writer_->submit(CommitTerminal{{make_record(
+      "SETTLE", {{"path", "P01"}, {"kept", 0}, {"atomic", 0},
+                 {"attempts", 1}, {"score", "0"}, {"end", "children"},
+                 {"campaign", "mp1"}})}});
+  writer_->sync();
+  EXPECT_FALSE(writer_->reexpand_open("P01"));
+  EXPECT_FALSE(writer_->reexpand_open("P01-IN01"));
+}

@@ -30,7 +30,7 @@ class Server {
     std::function<bool(std::string, std::string)> review_accept;
     std::function<bool(std::string, std::string)> review_retry;
     std::function<bool(std::string, std::string)> review_reject;
-    std::function<void()> stop_node;
+    std::function<void(bool leave)> stop_node;
   };
 
   explicit Server(Options options);

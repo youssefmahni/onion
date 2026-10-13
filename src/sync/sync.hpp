@@ -38,6 +38,13 @@ bool request_signature_valid(
     std::string_view signature, const std::vector<std::uint8_t>& public_key,
     std::int64_t timestamp_s, std::int64_t now_s);
 
+// Signed POST headers (M7 evict submission): the same scheme with a
+// fresh random nonce per attempt, covering the request body. Returned as
+// a plain map so this header needs no httplib include.
+std::map<std::string, std::string> signed_post_headers(
+    std::string_view device_id, std::string_view path,
+    std::string_view body, log::Signer& signer);
+
 // Sliding nonce cache: a (device_id, nonce) pair is accepted once per
 // 60-second window; older entries are pruned.
 class NonceCache {
@@ -57,6 +64,19 @@ struct MemberKey {
   std::vector<std::uint8_t> public_key;
 };
 
+// M7 joining: clone the peer's newest checkpoint into `destination` (the
+// joiner's data dir): fetch the manifest, verify its signature against
+// the peer's key, download the snapshot, verify its hash and its Merkle
+// root, and install it as onion.db. Returns "" on success or the reason.
+struct CloneOptions {
+  std::string device_id;              // the JOINING device's id
+  log::Ed25519Signer& signer;         // the joining device's key
+  std::map<std::string, MemberKey> members;  // the known fleet (device -> key)
+  std::filesystem::path destination;  // data dir receiving onion.db
+};
+std::string clone_checkpoint(std::string_view peer_base_url,
+                             const CloneOptions& options);
+
 // HTTP sync server on TCP 7947 (DESIGN › Sync protocol). Every endpoint
 // authenticates the caller with the signed-request scheme.
 class SyncServer {
@@ -67,6 +87,12 @@ class SyncServer {
     state::StateWriter* writer{};
     std::shared_ptr<const log::DeviceKey> key;
     std::vector<MemberKey> members;  // device_id -> public key
+    // M7 joining: the fleet's reachable addresses, so the admission
+    // response can tell the joiner where every member syncs and gossips.
+    std::map<std::string, std::string> member_urls;
+    std::string self_url;  // this device's own host:port
+    std::map<std::string, std::string> member_swim_urls;
+    std::string self_swim_url;  // this device's own host:udp_port
   };
 
   explicit SyncServer(Options options);
@@ -93,6 +119,9 @@ class SyncClient {
     state::StateWriter& writer;
     std::shared_ptr<const log::DeviceKey> key;
     std::map<std::string, MemberKey> members;  // by device id
+    // M7: this device's own sync address, carried in the push headers so
+    // the receiver learns where to pull from.
+    std::string self_url;
   };
 
   explicit SyncClient(Options options);
@@ -103,6 +132,12 @@ class SyncClient {
   int run_round(std::string_view peer_base_url,
                 std::map<std::string, std::string>* quarantined,
                 std::string* error);
+  // M7 joining: how far this device lags the peer — the maximum over all
+  // origins of (peer's last seq - our applied seq). -1 on any error.
+  std::int64_t peer_lag(std::string_view peer_base_url, std::string* error);
+  // M7: push one batch (JSON as written in the log) to the peer.
+  void push_batch(std::string_view peer_base_url,
+                  std::string_view batch_json, std::string* error);
 
  private:
   struct Impl;

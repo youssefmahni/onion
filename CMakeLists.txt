@@ -320,6 +320,11 @@ if(BUILD_TESTING)
     TIMEOUT 420
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
     SKIP_RETURN_CODE 77)
+  add_test(NAME m7.dynamic_fleet_scenarios COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dynamic_fleet_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(m7.dynamic_fleet_scenarios PROPERTIES
+    TIMEOUT 420
+    ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    SKIP_RETURN_CODE 77)
   set_tests_properties(llm.reset_connections_1000 llm.timeout_1000 llm.auth_401 llm.balance_402 PROPERTIES TIMEOUT 90)
   set_tests_properties(llm.closed_port_1000 PROPERTIES TIMEOUT 240)
 

@@ -143,6 +143,33 @@ If it fails: collect `node profile` output, the plist, and the node log tail.
 
 ---
 
+### OA-16 · M7 power pull on a Mac · M7 · status: open
+
+Why: the M7 exit criterion "killing a node mid-run loses no committed work" is proven on the CI scenarios and by the fork-based crash tests, but a REAL power cut on a Mac (pull the cord mid-run) is the owner live check.
+
+Steps:
+1. On the Mac Pro: start `data_depot node run` in a fleet, wait for a settle, then pull the power cord.
+2. Boot it back, start the node again, and check `node debug-state`: every committed settle is present, the torn tail was cut, and the node re-joins (JOINING → ACTIVE at lag < 100).
+3. Record the result here.
+
+Pass criteria: nothing committed is lost; the node is ACTIVE again within one sync round of catching up.
+
+Cost / duration: ~10 minutes.
+
+### OA-15 · M7 Linux machine join · M7 · status: open
+
+Why: the join flow is verified on the CI scenarios and a live two-node loopback smoke, but a REAL machine join (a second physical Linux box joining a running fleet over the LAN) is the owner live check.
+
+Steps:
+1. On machine A (running the fleet): `data_depot node invite --pubkey <B's public key> --ttl 24h`.
+2. On machine B: `data_depot node join --token @token.json --seed <A's address>`.
+3. On B: `data_depot node run --members members.json` and watch it reach `joined: ACTIVE (lag N)`.
+4. Record the result here.
+
+Pass criteria: B reaches ACTIVE with lag < 100 and participates in the next campaign.
+
+Cost / duration: ~10 minutes.
+
 ### OA-14 · GitHub Actions billing is blocking CI · all milestones · status: open
 
 Why: all CI jobs fail at start with "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings". First seen on run 38168705416 (2026-10-11T19:4xZ) right after the OA-13 closure commit; the immediately preceding run (38167851946) was fully green.
