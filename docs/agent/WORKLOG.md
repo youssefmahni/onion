@@ -160,3 +160,15 @@ Evidence:
 - Proof so far: 30/30 mp runs under ctest -j8 load; full local suite 318/318 (debug). Final 30-run proof on the frozen binary pending, then the PR.
 
 Next step: re-run the 30-loop on the final binary, open the PR, 3 green CI runs, merge; then Part 1 (0014 majority amendment).
+
+## 2026-10-13 · m8 pre-work · 0014 amendment 2: majority-answered rounds, restart gate closed
+
+Result: in progress
+Evidence:
+- majority_round(answered_peers, total) = (answered+1)*2 > total, in src/sync/sync.hpp; the scheduler thread counts answered peers and totals the KNOWN membership (folded members table + the static list — static fleets never write MEMBER_ADD, so members.json is their only row source); 1-member fleet = 0/1 majority (opens immediately); 2-member fleet needs both (documented consequence; the admin-key eviction is the escape).
+- Restart loophole closed: RoundState.sync_round_complete defaults false; a fresh engine opens only for a <=1-member fleet (EngineTest.ReservationGateStartsClosedAfterRestart, SingleMemberFleetReservesImmediately). Stealing follows the gate: the engine drains before emitting a CLAIM it cannot spend on (a self-claim would strand the ticket — found while fixing EngineTest.IdleFleetEngineStealsFromTheBusiestLane).
+- The engine now folds its own CAMPAIGN record before any drain decision (the closed gate used to return without syncing, leaving the campaign unfoldeed).
+- sync.partition_budget_majority: 5 fixed-seed nodes, budget 400/chunk 50 (200 ms fake latency pins the floor chunk), split 2/3 at a polled near-exhaustion level, relaunched partitioned: minority own-origin reserves freeze exactly with zero completed rounds; majority fills the cap within budget + 3*chunk; a minority node restarted 5x mid-partition reserves nothing each time. 20-consecutive-pass proof on the frozen binary.
+- m7.dynamic_fleet_scenarios scenario C got a Merkle-agreement gate before the winner scan (equal settled counts can momentarily precede the last conflicting settle's propagation — the Windows CI flake); ctest TIMEOUT 420->540 for the fleet suite and the new partition test (540 / deadline 480).
+
+Next step: finish the proofs, both PRs (mp-flake-load #40, 0014-majority-rounds), 3 green CI runs, merge; then M8.

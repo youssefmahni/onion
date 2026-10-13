@@ -274,7 +274,13 @@ struct Engine::Impl {
   // (one Engine runs every campaign, so the round state must not leak
   // between them).
   struct RoundState {
-    bool sync_round_complete{true};  // the first reservation is free
+    // Decision 0014 amendment (2026-10-13): closed by default. The old
+    // "first reservation is free" rule let a device that restarted inside
+    // a partition reserve once without any completed round; now a fleet
+    // device reserves only after a MAJORITY round (the node loop's
+    // majority_round verdict). A fresh RoundState opens immediately ONLY
+    // for a fleet of one (0/1 is a majority).
+    bool sync_round_complete{false};
     std::int64_t attempts_in_window{0};
     std::int64_t last_window_attempts{0};
   };
@@ -405,6 +411,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", campaign_spec_json(spec)},
                    {"state", "running"}})}});
+    // Fold it before any further decision: with the 0014 amendment the
+    // first run can drain on a closed gate WITHOUT reserving, and the
+    // campaign's existence must not depend on that reservation's sync.
+    writer.sync();
   }
 
   gate::FunnelOptions funnel_options;
@@ -638,8 +648,24 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // A lane down to fewer tickets than its workers steals from the far
     // end of the busiest eligible lanes (DESIGN › Stealing). The void
     // check runs FIRST: a budget-capped device must not hold stolen
-    // tickets hostage.
+    // tickets hostage. The reservation gate runs BEFORE the claim too
+    // (0014 amendment): claiming a ticket the device cannot spend on yet
+    // would strand it — the next steal scan skips our own claims.
     if (fleet && tickets.empty() && waiting.empty()) {
+      bool round_complete = true;
+      {
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        auto [it, inserted] = impl_->round_states.try_emplace(spec.id);
+        if (inserted) {
+          it->second.sync_round_complete =
+              (live_lane_members().size() <= 1);
+        }
+        round_complete = it->second.sync_round_complete;
+      }
+      if (!round_complete) {
+        result.end_reason = "drained";
+        break;
+      }
       const auto stolen = pick_stolen_ticket(spec, live_members);
       if (stolen) {
         writer.submit(state::CommitTerminal{{make_record(
@@ -679,9 +705,15 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       std::int64_t window_attempts = 0;
       {
         std::lock_guard pacing(impl_->pacing_mutex_);
-        Impl::RoundState& round_state = impl_->round_states[spec.id];
-        round_complete = round_state.sync_round_complete;
-        window_attempts = round_state.last_window_attempts;
+        auto [it, inserted] = impl_->round_states.try_emplace(spec.id);
+        if (inserted) {
+          // A fresh gate (restart or a brand-new campaign) opens only
+          // for a one-member fleet — 0/1 is a majority (0014 amendment).
+          it->second.sync_round_complete =
+              (live_lane_members().size() <= 1);
+        }
+        round_complete = it->second.sync_round_complete;
+        window_attempts = it->second.last_window_attempts;
       }
       if (fleet && !round_complete) {
         // Decision 0014: at most one reservation per sync round. The node

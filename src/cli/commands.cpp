@@ -1226,7 +1226,7 @@ int node_cmd(int argc, char** argv) {
       urls = member_urls;
       members = sync_members;
     }
-    bool any_peer_answered = false;
+    std::size_t answered_peers = 0;
     // Chaos tool (M7): ONION_PARTITION_FROM=id1,id2 makes this device
     // refuse to talk to the listed peers (a network split).
     std::set<std::string> partitioned;
@@ -1250,7 +1250,7 @@ int node_cmd(int argc, char** argv) {
           {*writer, device_key, std::move(client_members)});
       const int applied =
           client.run_round(peer, &quarantined, &sync_error);
-      if (sync_error.empty()) any_peer_answered = true;
+      if (sync_error.empty()) ++answered_peers;
       if (std::getenv("ONION_SYNC_DEBUG")) {
         std::string quarantine_note;
         for (const auto& [origin, reason] : quarantined)
@@ -1262,10 +1262,33 @@ int node_cmd(int argc, char** argv) {
                      quarantine_note.c_str());
       }
     }
-    // Decision 0014: only a COMPLETED sync round re-opens reservations
-    // and feeds the measured-chunk window — a fully partitioned round
-    // must not unlock more spending.
-    if (any_peer_answered) {
+    // Decision 0014 amendment: a round is COMPLETE only when a majority
+    // of members (counting self) answered within their timeouts — a
+    // minority side of a partition must not unlock more spending, and
+    // the completed round re-opens reservations and feeds the
+    // measured-chunk window.
+    // The denominator is the KNOWN membership: the folded members table
+    // (dynamic joins) and the static list — static fleets never write
+    // MEMBER_ADD records, so their rows live only in members.json.
+    std::size_t total_members =
+        onion::state::StateWriter::current_member_count_on(
+            writer->read_db());
+    total_members = std::max<std::size_t>(total_members, members.size());
+    if (!onion::state::StateWriter::member_is_current_on(
+            writer->read_db(), device_key->device_id) &&
+        std::find_if(members.begin(), members.end(),
+                     [&](const onion::sync::MemberKey& entry) {
+                       return entry.device_id == device_key->device_id;
+                     }) == members.end())
+      ++total_members;  // self answers trivially, row or no row
+    const bool majority =
+        onion::sync::majority_round(answered_peers, total_members);
+    if (std::getenv("ONION_SYNC_DEBUG"))
+      std::fprintf(stderr,
+                   "sync round verdict: answered=%zu/%zu majority=%s\n",
+                   answered_peers + 1, total_members,
+                   majority ? "yes" : "no");
+    if (majority) {
       engine.note_sync_round();
       ++sync_rounds_completed;
     }
@@ -1303,7 +1326,7 @@ int node_cmd(int argc, char** argv) {
                        peer.c_str(), push_error.c_str());
       }
     }
-    return any_peer_answered;
+    return answered_peers > 0;
   };
   if (sync_server && !lane_members.empty()) {
     sync_thread = std::thread([&]() {

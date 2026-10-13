@@ -166,6 +166,21 @@ TEST_F(SyncTest, NonceCacheRejectsReplaysInTheWindow) {
   EXPECT_FALSE(cache.seen_and_add("dev1", "sig1", 2000));   // window moved on
 }
 
+TEST_F(SyncTest, MajorityRoundCountsSelfAndNeedsStrictlyMoreThanHalf) {
+  // Decision 0014 amendment: a round completes only when a majority of
+  // members (counting self) answered. answered_peers excludes self.
+  EXPECT_FALSE(onion::sync::majority_round(0, 5));  // 1 of 5
+  EXPECT_FALSE(onion::sync::majority_round(1, 5));  // 2 of 5 (tie at half)
+  EXPECT_TRUE(onion::sync::majority_round(2, 5));   // 3 of 5
+  EXPECT_FALSE(onion::sync::majority_round(0, 2));  // 1 of 2
+  EXPECT_TRUE(onion::sync::majority_round(1, 2));   // 2 of 2: both must
+  EXPECT_TRUE(onion::sync::majority_round(0, 1));   // 0/1 is a majority
+  EXPECT_FALSE(onion::sync::majority_round(0, 3));  // 1 of 3
+  EXPECT_TRUE(onion::sync::majority_round(1, 3));   // 2 of 3
+  EXPECT_FALSE(onion::sync::majority_round(1, 4));  // 2 of 4: exactly half
+  EXPECT_TRUE(onion::sync::majority_round(2, 4));   // 3 of 4
+}
+
 TEST_F(SyncTest, PushAddressRecordingRequiresACurrentMemberSignature) {
   // B gets a row in A's members table (a dynamic member). The push
   // endpoint records a sync URL only for the device the signature

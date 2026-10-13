@@ -28,3 +28,45 @@ and the round still counts. A fully partitioned round (no peer answered)
 does NOT count, so a device cut off from the fleet cannot unlock more
 spending. Implemented in `src/cli/commands.cpp` (the sync loop sets
 `any_peer_answered` and calls `engine.note_sync_round()` only when true).
+
+## Amendment 2 (owner-asked, 2026-10-13 — supersedes the any-answered rule)
+
+**"Completed sync round" is majority-answered, not any-answered.** A round
+counts only when a MAJORITY of members (counting self) answered within
+their timeouts: `(answered_peers + 1) * 2 > total_members`
+(`onion::sync::majority_round`). The any-answered rule let EACH side of a
+2/3 partition keep reserving and overspend the remaining budget; with
+majority-answered only the majority side spends, so the fleet-wide
+overshoot stays within one chunk per majority-side device.
+
+- **Membership denominator** = the known current members: the folded
+  members table (dynamic joins; EVICTED/LEFT excluded,
+  `StateWriter::current_member_count`) plus the static list — static
+  fleets never write `MEMBER_ADD` records, so their rows live only in
+  members.json. Every replica that sees the same answers makes the same
+  verdict.
+- **1-member fleet** opens immediately: 0/1 is a majority.
+- **2-member fleet** needs BOTH devices (self + 1 = 2 > 1): a slow peer
+  there pauses reservations. Accepted consequence of the rule; the escape
+  hatch is the offline admin key's single-signature eviction (decision
+  0014 pre-work, `MemberEvictNeedsAMajorityOrTheAdminKey`): evicting the
+  missing device shrinks the fleet to 1 and reservations resume.
+- **The restart loophole is closed**: the old "first reservation is
+  free" rule was per-process, so a device that restarted inside a
+  partition reserved one chunk without any completed round. The
+  reservation gate now starts CLOSED (`RoundState.sync_round_complete`
+  defaults false); a fresh engine opens it immediately only for a
+  one-member fleet. A minority node restarted five times during a
+  partition reserves nothing.
+- **Stealing follows the gate**: the engine checks the gate BEFORE
+  emitting a CLAIM, because a claimed ticket the device cannot spend on
+  yet would strand (its own claim blocks the next steal scan).
+
+Tests: `SyncTest.MajorityRoundCountsSelfAndNeedsStrictlyMoreThanHalf`,
+`StateWriterTest.MemberEvictNeedsAMajorityOrTheAdminKey` (count
+assertions), `EngineTest.ReservationGateStartsClosedAfterRestart`,
+`EngineTest.SingleMemberFleetReservesImmediately`,
+`sync.partition_budget_majority` (5-node 2/3 split near budget
+exhaustion: only the majority side reserves, the minority freezes
+exactly, a minority node restarted 5× during the partition reserves
+nothing, fleet-wide spend ≤ budget + one chunk per majority device).

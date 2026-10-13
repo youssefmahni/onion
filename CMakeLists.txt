@@ -334,6 +334,16 @@ if(BUILD_TESTING)
     TIMEOUT 540
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
     SKIP_RETURN_CODE 77)
+  # Decision 0014 amendment: a 5-node fleet split 2/3 near budget
+  # exhaustion — only the majority side may reserve new chunks; the
+  # minority (including one restarted 5x) freezes; total spend stays
+  # within budget + one chunk per majority device. Chaos hooks only
+  # (the split is ONION_PARTITION_FROM).
+  add_test(NAME sync.partition_budget_majority COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/partition_budget_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(sync.partition_budget_majority PROPERTIES
+    TIMEOUT 540
+    ENVIRONMENT "ONION_MP_DEADLINE_S=480"
+    SKIP_RETURN_CODE 77)
   # A hookless (release) build must ignore the chaos env knobs entirely.
   if(NOT ONION_CHAOS_HOOKS)
     add_test(NAME m7.release_ignores_chaos_hooks COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/release_ignores_chaos_test.py" "$<TARGET_FILE:data_depot>")

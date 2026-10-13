@@ -337,6 +337,14 @@ void StateWriter::replay(std::string* error) {
 
   std::vector<std::string> members{options_.origin};
 
+  // Per-origin continuation: the OWN origin's next record seq must come
+  // from the OWN chain only. A single global counter advanced by every
+  // origin's replay let a restart jump the own chain past the foreign
+  // copies' higher seqs — a PERMANENT gap in the own log (peers pulling
+  // across the gap quarantined it forever: "verify 4"). Each origin
+  // tracks its own max here; the own one seeds next_seq_ at the end.
+  std::map<std::string, std::uint64_t> per_origin_next_seq;
+
   // process_line verifies one batch against the per-origin chain. For the
   // own origin the full Ed25519 check applies; foreign origins are
   // chain-checked only (their keys arrive with M7 gossip — the batches
@@ -398,8 +406,9 @@ void StateWriter::replay(std::string* error) {
       }
     }
     for (const log::Record& record : batch.records) {
-      if (record.seq >= static_cast<std::int64_t>(next_seq_))
-        next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
+      per_origin_next_seq[batch.origin] = std::max(
+          per_origin_next_seq[batch.origin],
+          static_cast<std::uint64_t>(record.seq) + 1);
       fold(record, batch.origin, error);
     }
     update_applied(batch.origin, batch.records);
@@ -494,6 +503,10 @@ void StateWriter::replay(std::string* error) {
       }
     }
   }
+  const auto own_chain = per_origin_next_seq.find(options_.origin);
+  next_seq_.store(own_chain == per_origin_next_seq.end()
+                      ? 1
+                      : own_chain->second);
   rebuild_index();
 }
 
@@ -1446,6 +1459,22 @@ bool StateWriter::member_is_current(std::string_view device_id) const {
   if (!statement->step_row(&step_error)) return false;
   const std::string state = statement->text(0);
   return state != "EVICTED" && state != "LEFT";
+}
+
+std::size_t StateWriter::current_member_count() const {
+  return current_member_count_on(db_);
+}
+
+std::size_t StateWriter::current_member_count_on(const store::Db& db) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT COUNT(*) FROM members "
+      "WHERE state != 'EVICTED' AND state != 'LEFT';",
+      &error);
+  if (!statement) return 0;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return 0;
+  return static_cast<std::size_t>(std::max<std::int64_t>(0, statement->integer(0)));
 }
 
 std::vector<StateWriter::MemberRow> StateWriter::members_table() const {  std::vector<MemberRow> rows;

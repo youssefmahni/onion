@@ -161,6 +161,12 @@ class StateWriter {
   // current-member-only decisions use this, not member_public_key,
   // because an evicted member's key stays in the table.
   bool member_is_current(std::string_view device_id) const;
+  // Decision 0014 amendment: the fleet size for the sync-round majority
+  // — current members only (JOINING/ACTIVE count; EVICTED/LEFT do not),
+  // self included via its own row. The fold is the authority, so every
+  // replica counts the same membership.
+  std::size_t current_member_count() const;
+  static std::size_t current_member_count_on(const store::Db& db);
   // M7 stealing: whether another device holds an unexpired CLAIM on the
   // path (timed from THIS device's receipt — never the claimer's clock).
   // Returns the claimer's device id, or empty.
