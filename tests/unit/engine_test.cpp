@@ -202,6 +202,9 @@ TEST_F(EngineTest, StopRuleEndsAnAtomicFrontierCampaign) {
                                 budget, 1, "dev0000000000000001", "0.001"});
   CampaignSpec campaign = spec();
   campaign.structure = true;
+  // DESIGN › Quality gate + DR 0021: only VERIFIED atomic labels count
+  // toward the stop rule, so this campaign runs with verification on.
+  campaign.verify_atomic = true;
   const Engine::RunResult result = engine.run(campaign, nullptr);
   EXPECT_EQ(result.end_reason, "stop rule");
   EXPECT_GT(result.settled, 0);
