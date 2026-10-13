@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/youssef/Desktop/onion-opt/build-asan/_deps/googletest-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/youssef/Desktop/onion-opt/build-asan/_deps/sqlite-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

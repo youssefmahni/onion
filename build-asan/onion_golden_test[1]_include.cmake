@@ -1,0 +1,5 @@
+if(EXISTS "/home/youssef/Desktop/onion-opt/build-asan/onion_golden_test[1]_tests.cmake")
+  include("/home/youssef/Desktop/onion-opt/build-asan/onion_golden_test[1]_tests.cmake")
+else()
+  add_test(onion_golden_test_NOT_BUILT onion_golden_test_NOT_BUILT)
+endif()

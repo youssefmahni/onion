@@ -1,0 +1,82 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/home/youssef/.local/bin/"
+      - "/home/youssef/.kimi-code/bin/"
+      - "/home/youssef/development/android-sdk/cmdline-tools/latest/bin/"
+      - "/home/youssef/development/android-sdk/platform-tools/"
+      - "/home/youssef/development/flutter/bin/"
+      - "/home/youssef/.opencode/bin/"
+      - "/home/youssef/.config/nvm/versions/node/v24.13.0/bin/"
+      - "/home/youssef/.cargo/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/local/games/"
+      - "/usr/games/"
+      - "/home/youssef/.dotnet/tools/"
+    searched_directories:
+      - "/home/youssef/.local/bin/uname"
+      - "/home/youssef/.kimi-code/bin/uname"
+      - "/home/youssef/development/android-sdk/cmdline-tools/latest/bin/uname"
+      - "/home/youssef/development/android-sdk/platform-tools/uname"
+      - "/home/youssef/development/flutter/bin/uname"
+      - "/home/youssef/.opencode/bin/uname"
+      - "/home/youssef/.config/nvm/versions/node/v24.13.0/bin/uname"
+      - "/home/youssef/.cargo/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/sbin/uname"
+      - "/sbin/uname"
+      - "/usr/local/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/home/youssef/.local/bin"
+        - "/home/youssef/.local/bin"
+        - "/home/youssef/.kimi-code/bin"
+        - "/home/youssef/development/android-sdk/cmdline-tools/latest/bin"
+        - "/home/youssef/development/android-sdk/platform-tools"
+        - "/home/youssef/development/flutter/bin"
+        - "/home/youssef/.opencode/bin"
+        - "/home/youssef/.config/nvm/versions/node/v24.13.0/bin"
+        - "/home/youssef/.cargo/bin"
+        - "/home/youssef/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/local/games"
+        - "/usr/games"
+        - "/home/youssef/.dotnet/tools"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 6.18.12+kali-amd64 - x86_64
+...

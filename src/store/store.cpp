@@ -1,6 +1,7 @@
 #include "store.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -239,28 +240,21 @@ bool Db::open(std::string* error) {
       return false;
     }
   }
-  // Migration: reviews.atomic arrived with the W5 gate calibration; add
-  // it when an older database lacks the column.  It runs after the
-  // newer-schema refusal so an unknown-newer database is never mutated.
+  // Migration: reviews.atomic arrived with the W5 gate calibration.  It
+  // runs after the newer-schema refusal so an unknown-newer database is
+  // never mutated.  "duplicate column name" means the database already
+  // has the column — everything else is a real failure.
   {
-    bool has_atomic = false;
-    {
-      std::optional<Statement> check = prepare(
-          "SELECT 1 FROM pragma_table_info('reviews') WHERE name = 'atomic';",
-          error);
-      if (check) {
-        std::string step_error;
-        has_atomic = check->step_row(&step_error);
-      }
-    }
-    if (!has_atomic) {
-      char* errmsg = nullptr;
-      if (sqlite3_exec(handle_,
-                       "ALTER TABLE reviews ADD COLUMN atomic INT NOT NULL "
-                       "DEFAULT 0;",
-                       nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    char* errmsg = nullptr;
+    if (sqlite3_exec(handle_,
+                     "ALTER TABLE reviews ADD COLUMN atomic INT NOT NULL "
+                     "DEFAULT 0;",
+                     nullptr, nullptr, &errmsg) != SQLITE_OK) {
+      const bool duplicate =
+          errmsg != nullptr && strstr(errmsg, "duplicate column") != nullptr;
+      sqlite3_free(errmsg);
+      if (!duplicate) {
         set_error(error, handle_, "cannot migrate reviews.atomic");
-        sqlite3_free(errmsg);
         return false;
       }
     }
