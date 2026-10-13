@@ -146,8 +146,15 @@ def main():
                     devices[index]["swim"] = ports["swim"]
                     return node
                 except AssertionError:
-                    if node.poll() is not None and attempt == 1:
-                        time.sleep(2.0)  # let the stale handles go
+                    # Either the node exited early or hung at startup (a
+                    # stale Windows file lock): kill it, wait, retry once.
+                    if attempt == 1:
+                        node.kill()
+                        try:
+                            node.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        time.sleep(3.0)  # let the stale handles go
                         continue
                     raise
 
