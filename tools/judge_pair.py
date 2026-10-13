@@ -30,15 +30,17 @@ def children_for(db_path, path):
         db.close()
 
 
-def call_api(base_url, model, key, prompt, titles_a, titles_b):
+def call_api(base_url, model, key, prompt, node_title, titles_a, titles_b):
     body = {
         "model": model,
         "temperature": 0.0,
-        "max_tokens": 64,
+        "effort": "low",
+        "max_tokens": 512,
         "messages": [
             {"role": "system", "content": prompt},
             {"role": "user",
-             "content": f"Set A:\n" + "\n".join(f"- {t}" for t in titles_a) +
+             "content": node_title + "\n\nSet A:\n" +
+                        "\n".join(f"- {t}" for t in titles_a) +
                         f"\n\nSet B:\n" +
                         "\n".join(f"- {t}" for t in titles_b)},
         ],
@@ -74,6 +76,15 @@ def main():
         args.baseline_dir) / "onion.db", args.path)
     variant = children_for(__import__("pathlib").Path(
         args.variant_dir) / "onion.db", args.path)
+    db = sqlite3.connect(__import__("pathlib").Path(
+        args.baseline_dir) / "onion.db")
+    try:
+        node_title = db.execute("SELECT title FROM nodes WHERE path = ?",
+                                (args.path,)).fetchone()
+        node_title = node_title[0] if node_title else args.path
+    finally:
+        db.close()
+    node_title = "Node: " + node_title
     if not baseline or not variant:
         print(f"empty set for {args.path} (baseline={len(baseline)} "
               f"variant={len(variant)})", file=sys.stderr)
@@ -82,10 +93,21 @@ def main():
     rng = random.Random(args.seed)
     flipped = rng.random() < 0.5
     first, second = (variant, baseline) if flipped else (baseline, variant)
-    reply = call_api(args.base_url, args.model, key, prompt, first, second)
-    winner_raw = reply["choices"][0]["message"]["content"]
+    reply = call_api(args.base_url, args.model, key, prompt, node_title,
+                     first, second)
+    message = reply["choices"][0]["message"]
+    # DeepSeek flash streams most of its output into reasoning_content;
+    # use it when content is empty.
+    winner_raw = message.get("content") or message.get("reasoning_content", "")
+    import re
+    m = re.search(r'\{\s*"winner"\s*:\s*"(A|B|tie)"', winner_raw)
+    if m:
+        winner_raw = m.group(0).replace('"winner"', '"winner"')
+        # normalise to {"winner": X}
+        winner_raw = '{"winner": "' + m.group(1) + '"}'
     record = {
         "path": args.path,
+        "model": args.model,
         "seed": args.seed,
         "baseline_first": not flipped,
         "baseline_count": len(baseline),
