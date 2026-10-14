@@ -505,3 +505,101 @@ TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
   EXPECT_NE(report.find("cost peak="), std::string::npos);
   EXPECT_NE(report.find("spend/hour peak="), std::string::npos);
 }
+
+TEST(PoolLedger, SingleChainHalvesEveryLevelInEveryOrder) {
+  // Decision 0020: allowance(child) = floor(0.5 x remaining(parent)) at
+  // the child's creation in (hlc, origin) order. A chain of one child
+  // per level therefore halves each level — identical in EVERY delivery
+  // order, because the fold sorts the events itself.
+  const std::map<std::string, std::int64_t> roots{{"P01", 100}};
+  const auto chain = [](std::int64_t base_hlc) {
+    std::vector<onion::sched::PoolEvent> events;
+    const std::string origin = "dev0000000000000001";
+    std::vector<std::string> paths = {"P01-IN01", "P01-IN01-T01",
+                                      "P01-IN01-T01-TK00001",
+                                      "P01-IN01-T01-TK00001-TK00009"};
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+      onion::sched::PoolEvent create;
+      create.kind = onion::sched::PoolEvent::Kind::Create;
+      create.path = paths[i];
+      create.hlc = base_hlc + 2 * static_cast<std::int64_t>(i);
+      create.origin = origin;
+      events.push_back(create);
+      onion::sched::PoolEvent attempt;
+      attempt.kind = onion::sched::PoolEvent::Kind::Attempt;
+      attempt.path = paths[i];
+      attempt.hlc = base_hlc + 2 * static_cast<std::int64_t>(i) + 1;
+      attempt.origin = origin;
+      events.push_back(attempt);
+    }
+    return events;
+  };
+  const std::vector<std::vector<int>> orders = {
+      {0, 1, 2, 3, 4, 5, 6, 7}, {7, 6, 5, 4, 3, 2, 1, 0},
+      {4, 0, 6, 2, 5, 1, 7, 3}, {3, 7, 1, 5, 0, 4, 2, 6}};
+  for (const auto& order : orders) {
+    const auto all = chain(100);
+    std::vector<onion::sched::PoolEvent> shuffled;
+    for (int index : order) shuffled.push_back(all[index]);
+    const auto allowances =
+        onion::sched::fold_pool_allowances(roots, shuffled);
+    // Each level's own attempt precedes the next create in the fold
+    // order, so the child sees the parent's remaining AFTER its spend:
+    // 50, floor(49/2)=24, floor(23/2)=11, floor(10/2)=5 — halving per
+    // level regardless of the delivery order.
+    EXPECT_EQ(allowances.at("P01-IN01"), 50);
+    EXPECT_EQ(allowances.at("P01-IN01-T01"), 24);
+    EXPECT_EQ(allowances.at("P01-IN01-T01-TK00001"), 11);
+    EXPECT_EQ(allowances.at("P01-IN01-T01-TK00001-TK00009"), 5);
+  }
+}
+
+TEST(PoolLedger, BroadTreeSharesTheUnusedPool) {
+  // A short sibling returns its unused share: B's allowance is half of
+  // what remains after A's subtree spent only 10.
+  const std::map<std::string, std::int64_t> roots{{"P01", 100}};
+  std::vector<onion::sched::PoolEvent> events;
+  const auto push = [&](onion::sched::PoolEvent::Kind kind,
+                        std::string path, std::int64_t hlc) {
+    onion::sched::PoolEvent event;
+    event.kind = kind;
+    event.path = std::move(path);
+    event.hlc = hlc;
+    event.origin = "dev0000000000000001";
+    events.push_back(event);
+  };
+  push(onion::sched::PoolEvent::Kind::Create, "P01-IN01", 10);
+  push(onion::sched::PoolEvent::Kind::Create, "P01-IN01-T01", 11);
+  for (int i = 0; i < 10; ++i)
+    push(onion::sched::PoolEvent::Kind::Attempt, "P01-IN01-T01", 12 + i);
+  // The subtree ends (all ten attempts done, no more children); the
+  // sibling is created afterwards and sees the remaining pool.
+  push(onion::sched::PoolEvent::Kind::Create, "P01-IN02", 30);
+  const auto allowances =
+      onion::sched::fold_pool_allowances(roots, events);
+  EXPECT_EQ(allowances.at("P01-IN01"), 50);
+  // 50% of (100 - 10 spent) = 45: the unused 40 is shared onward.
+  EXPECT_EQ(allowances.at("P01-IN02"), 45);
+}
+
+TEST(PoolLedger, ANodeBelowOneAttemptIsALeaf) {
+  // allowance < 1 means the node can pay nothing: it must become a leaf
+  // (end = allowance spent) without spending.
+  const std::map<std::string, std::int64_t> roots{{"P01", 3}};
+  std::vector<onion::sched::PoolEvent> events;
+  const auto push = [&](onion::sched::PoolEvent::Kind kind,
+                        std::string path, std::int64_t hlc) {
+    onion::sched::PoolEvent event;
+    event.kind = kind;
+    event.path = std::move(path);
+    event.hlc = hlc;
+    event.origin = "dev0000000000000001";
+    events.push_back(event);
+  };
+  push(onion::sched::PoolEvent::Kind::Create, "P01-IN01", 1);   // allowance 1
+  push(onion::sched::PoolEvent::Kind::Create, "P01-IN01-T01", 2);  // allowance 0
+  const auto allowances =
+      onion::sched::fold_pool_allowances(roots, events);
+  EXPECT_EQ(allowances.at("P01-IN01"), 1);
+  EXPECT_EQ(allowances.at("P01-IN01-T01"), 0);  // leaf, pays nothing
+}

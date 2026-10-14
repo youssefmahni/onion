@@ -288,4 +288,26 @@ double hrw_score(std::string_view path, std::string_view device_id,
 std::optional<std::string> lane_owner(std::string_view path,
                                       const std::vector<LaneMember>& members);
 
+// ------------------------------------------------------------------ pools
+
+// Decision 0020: the branch-share pool ledger. Events (a child becoming a
+// ticket, an attempt on a node) fold in (hlc, origin) order so every
+// replica computes the same allowance in every delivery order.
+struct PoolEvent {
+  enum class Kind { Create, Attempt } kind;
+  std::string path;
+  log::Hlc hlc{};
+  std::string origin;
+};
+
+// allowance(child) = floor(0.5 x remaining(parent)) at the child's
+// creation point in the folded order, where remaining(parent) =
+// allowance(parent) - attempts spent in the parent's subtree so far.
+// A root's allowance is its pool; an allowance below 1 means the node
+// pays nothing (leaf, end = allowance spent). Pure: the caller supplies
+// the events in ANY order; the fold sorts them.
+std::map<std::string, std::int64_t> fold_pool_allowances(
+    const std::map<std::string, std::int64_t>& root_pools,
+    const std::vector<PoolEvent>& events);
+
 }  // namespace onion::sched

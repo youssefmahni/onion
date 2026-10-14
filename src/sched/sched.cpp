@@ -1328,4 +1328,69 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   return out.str();
 }
 
+std::map<std::string, std::int64_t> fold_pool_allowances(
+    const std::map<std::string, std::int64_t>& root_pools,
+    const std::vector<PoolEvent>& events) {
+  // The fold is order-independent by construction: events sort by
+  // (hlc, origin), and the allowance of a child is frozen at its
+  // creation from the parent's remaining pool AT THAT POINT.
+  std::vector<const PoolEvent*> sorted;
+  sorted.reserve(events.size());
+  for (const PoolEvent& event : events) sorted.push_back(&event);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const PoolEvent* a, const PoolEvent* b) {
+              if (a->hlc != b->hlc) return a->hlc < b->hlc;
+              return a->origin < b->origin;
+            });
+
+  std::map<std::string, std::int64_t> allowances;
+  std::map<std::string, std::int64_t> spent;
+  for (const auto& [root, pool] : root_pools) allowances[root] = pool;
+
+  // remaining(node) = allowance(node) - spent in the node's SUBTREE.
+  const auto subtree_spent = [&](std::string_view path) -> std::int64_t {
+    std::int64_t total = 0;
+    const std::string prefix = std::string(path) + "-";
+    for (const auto& [node, count] : spent)
+      if (node == path || node.rfind(prefix, 0) == 0) total += count;
+    return total;
+  };
+
+  for (const PoolEvent* event : sorted) {
+    switch (event->kind) {
+      case PoolEvent::Kind::Attempt:
+        ++spent[event->path];
+        break;
+      case PoolEvent::Kind::Create: {
+        // The parent: the nearest existing scoped ancestor (every node
+        // in the ledger has one once its ancestors were created; a child
+        // event always follows its ancestors' events in path depth —
+        // fold order keeps the invariant when hlcs are sane; when they
+        // are not, the parent lookup fails and the child keeps 0).
+        std::string parent;
+        {
+          std::string candidate = event->path;
+          while (true) {
+            const std::size_t dash = candidate.rfind('-');
+            if (dash == std::string::npos) break;
+            candidate = candidate.substr(0, dash);
+            if (allowances.count(candidate)) {
+              parent = candidate;
+              break;
+            }
+          }
+        }
+        if (parent.empty()) break;  // the root itself (or unknown): no halving
+        const std::int64_t parent_allowance = allowances.at(parent);
+        const std::int64_t remaining =
+            std::max<std::int64_t>(0, parent_allowance -
+                                      subtree_spent(parent));
+        allowances[event->path] = remaining / 2;
+        break;
+      }
+    }
+  }
+  return allowances;
+}
+
 }  // namespace onion::sched
