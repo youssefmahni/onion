@@ -257,25 +257,61 @@ def main():
         for index in range(1, 6):
             write_members(index, members)
 
-        # One round post-split so every device's own view settles (the
-        # majority's gate opens at its first completed round; the
-        # minority's never does).
+        # The minority's baseline is read AFTER the restart: its own-origin
+        # total is replayed from its log, and from here its gate cannot
+        # reopen (2 of 5 is never a majority). The pre-kill snapshot above
+        # cannot serve as the baseline: a minority device may legitimately
+        # reserve one more chunk between that snapshot and the kill
+        # (Windows CI run 38563545035: "50 -> 100").
+        baseline_own = {}
+        for index in MINORITY:
+            baseline_own[index] = own_reserved_view(
+                devices[index]["api"], devices[index]["device_id"])
+            assert baseline_own[index] >= pre_split[index]["own"], (
+                "minority device %d lost reservations over the restart: "
+                "%d -> %d" % (index, pre_split[index]["own"],
+                              baseline_own[index]))
+
+        # One round post-split so every device's own view settles.
         time.sleep(20)
 
+        # The majority's gate DOES open: each majority device completes at
+        # least one round after the split (3 of 5 answers is a majority).
+        # Without this the minority freeze below could be vacuous (a fleet
+        # that is simply stuck would also look frozen).
+        end = time.time() + 120
+        while time.time() < end and time.time() < deadline:
+            if all(state(devices[i]["api"]).get("sync_rounds_completed", 0)
+                   >= 1 for i in MAJORITY):
+                break
+            time.sleep(2.0)
+        majority_rounds = {
+            i: state(devices[i]["api"]).get("sync_rounds_completed", 0)
+            for i in MAJORITY}
+        assert all(r >= 1 for r in majority_rounds.values()), (
+            "the majority side completed no round after the split: %r"
+            % majority_rounds)
+
         # The minority froze exactly: no NEW RESERVE from its own devices
-        # (only a minority device writes its own origin's records, and
-        # its gate never reopens inside the split).
+        # and no completed round (only a minority device writes its own
+        # origin's records, and its gate never reopens inside the split).
+        # Both properties are collected before failing so one run reports
+        # everything it saw.
+        problems = []
         for index in MINORITY:
             now_own = own_reserved_view(devices[index]["api"],
                                         devices[index]["device_id"])
-            assert now_own == pre_split[index]["own"], (
-                "minority device %d reserved after the split: %d -> %d"
-                % (index, pre_split[index]["own"], now_own))
+            if now_own != baseline_own[index]:
+                problems.append(
+                    "minority device %d reserved after the split: %d -> %d"
+                    % (index, baseline_own[index], now_own))
             rounds = state(devices[index]["api"]).get(
                 "sync_rounds_completed", 0)
-            assert rounds == 0, (
-                "minority device %d completed a round after the split "
-                "(%d)" % (index, rounds))
+            if rounds != 0:
+                problems.append(
+                    "minority device %d completed a round after the split "
+                    "(%d)" % (index, rounds))
+        assert not problems, "; ".join(problems)
 
         # The majority side keeps reserving toward the cap and its fold
         # reaches the budget with at most one chunk per majority device.
@@ -303,7 +339,7 @@ def main():
         # The restart loophole is closed: a minority node restarted five
         # times during the partition reserves nothing each time (the gate
         # starts closed; 2-of-5 answers is never a majority).
-        frozen = pre_split[4]["own"]
+        frozen = baseline_own[4]
         for restart in range(5):
             procs[4].terminate()
             try:
