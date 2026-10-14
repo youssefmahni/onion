@@ -318,8 +318,8 @@ if(BUILD_TESTING)
   set_tests_properties(genesis_import.verify PROPERTIES TIMEOUT 90)
   add_test(NAME sync.multi_process_convergence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/multi_process_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(sync.multi_process_convergence PROPERTIES
-    TIMEOUT 420
-    ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    TIMEOUT 780
+    ENVIRONMENT "ONION_MP_DEADLINE_S=720"
     SKIP_RETURN_CODE 77)
   # The sync scheduler runs on its own thread: a node saturated by 60 s
   # LLM calls must keep completing rounds and its peers must learn the

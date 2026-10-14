@@ -173,4 +173,6 @@ Evidence:
 
 Proof (frozen final binary, 2026-10-13): 30/30 sync.multi_process_convergence under ctest -j8 load; 20/20 sync.partition_budget_majority; full local suite 323/323 (linux-debug); sync.saturation_decoupled PASS under TSan (0 reports); release preset green. PR #40 (mp-flake-load) and PR #41 (0014-majority-rounds) open — merge #40 first (this branch is stacked on it), then #41; 3 green CI runs each per house rules. The root cause of the scenario-C CI flake was ALSO fixed here: the replay's single global next_seq let a restart jump the own chain past the foreign copies' seqs (permanent gap, verify 4) — now per-origin (StateWriterTest.OwnChainSeqContinuesFromOwnMaxAfterRestart).
 
-Next step: CI green on both PRs, merge, then M8.
+CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the slow Linux runner — the fleet's in-flight chunk work (bounded by the budget, not the deadline) drains in ~8 min there while the local 30/30 proof runs in ~90 s. The deadline is the outer safety net, NOT the progress criterion, so it moves to 720 s (ctest TIMEOUT 780); the no-progress criterion (90 s, records-or-rounds) is untouched.
+
+Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
