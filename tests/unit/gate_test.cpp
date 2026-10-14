@@ -405,6 +405,141 @@ TEST(GateFunnel, TruncatedReplyIsAFailedAttempt) {
   EXPECT_FALSE(result.attempts[0].checks_passed);
 }
 
+// F-GATE-2: a provider failure (outage, rate limit, rejected credentials,
+// empty balance) says nothing about the node. It must never end as a leaf:
+// a leaf is a permanent tombstone for the whole subtree.
+TEST(GateFunnel, ProviderFailureNeverBecomesALeaf) {
+  const std::pair<Kind, std::string> kinds[] = {
+      {Kind::Transport, "transient"},   {Kind::Timeout, "transient"},
+      {Kind::ServerError, "transient"}, {Kind::RateLimited, "transient"},
+      {Kind::AuthError, "auth"},        {Kind::BalanceError, "balance"},
+      {Kind::ClientError, "rejected"}};
+  for (const auto& [kind, failure_class] : kinds) {
+    FunnelOptions options;
+    Funnel funnel(options);
+    NodeContext context = ctx();
+    int calls = 0;
+    auto fake = [&](const Request&) -> Result {
+      calls++;
+      Result failure;
+      failure.kind = kind;
+      return failure;
+    };
+    const FunnelResult result = funnel.run(context, fake);
+    EXPECT_NE(result.decision, Decision::Leaf)
+        << "kind " << static_cast<int>(kind);
+    EXPECT_EQ(result.decision, Decision::Defer)
+        << "kind " << static_cast<int>(kind);
+    EXPECT_EQ(result.end_reason, "provider unavailable");
+    EXPECT_EQ(result.provider_failure, failure_class);
+    EXPECT_TRUE(result.attempts.empty());  // nothing was learned or billed
+    EXPECT_LE(calls, 4) << "a dead provider must not be hammered";
+  }
+}
+
+// F-FUN-1: the ATTEMPT row's tokens and cost cover every call of the
+// attempt — planner, workers, critique, synthesizer AND the atomic
+// verification — and nothing from the pre-check.
+TEST(GateFunnel, AttemptTokensCoverEveryCallOfTheAttempt) {
+  FunnelOptions options;
+  onion::llm::PriceSchedule prices;
+  prices.peak.input = "1.0";
+  prices.peak.cached_input = "0.0";
+  prices.peak.output = "2.0";
+  prices.offpeak = prices.peak;
+  options.prices = prices;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int attempt_calls = 0;
+  auto fake = [&](const Request& request) -> Result {
+    Result reply = ok(R"({"items": ["Ops", "Gov", "Risk"]})");
+    reply.cost_usd = "0.001";
+    if (request.user.find("Can this node be split") != std::string::npos) {
+      reply = ok(R"({"splits": true})");
+      reply.in_miss = 1000;  // must not leak into the attempt
+      reply.out = 1000;
+      reply.cost_usd = "9";
+      return reply;
+    }
+    if (request.user.find("Critique this candidate set") != std::string::npos)
+      reply.content = R"({"score": 0.9, "remove": [], "add": [], "issues": ""})";
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      reply.content =
+          R"({"items": [{"title": "One", "atomic": true}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})";
+    if (request.user.find("admits_none") != std::string::npos)
+      reply.content = R"({"admits_none": ["One"]})";
+    attempt_calls++;
+    reply.in_miss = 3;
+    reply.out = 5;
+    return reply;
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  ASSERT_EQ(result.attempts.size(), 1u);
+  EXPECT_GE(attempt_calls, 5);  // planner, workers, critique, synth, verify
+  const std::uint64_t calls = static_cast<std::uint64_t>(attempt_calls);
+  EXPECT_EQ(result.attempts[0].tokens_in, 3 * calls);
+  EXPECT_EQ(result.attempts[0].tokens_out, 5 * calls);
+  // Priced at $1/M input and $2/M output: 3 in + 5 out per call = $13e-6.
+  EXPECT_NEAR(std::stod(result.attempts[0].cost_usd), 13e-6 * attempt_calls,
+              1e-12);
+}
+
+// One transient blip on the pre-check is retried by the funnel itself and
+// is not a deferral; a blip mid-attempt defers the node (never leafs it).
+TEST(GateFunnel, OneTransientBlipOnThePreCheckDoesNotDefer) {
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int precheck_calls = 0;
+  auto fake = [&](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos) {
+      if (++precheck_calls == 1) {
+        Result failure;
+        failure.kind = Kind::Transport;
+        return failure;
+      }
+      return ok(R"({"splits": false})");
+    }
+    return ok(R"({"items": ["A", "B", "C"]})");
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  EXPECT_EQ(result.decision, Decision::Leaf);  // the model said "no split"
+  EXPECT_TRUE(result.precheck_leaf);
+  EXPECT_EQ(precheck_calls, 2);
+}
+
+TEST(GateFunnel, TransientFailureMidAttemptDefersAndKeepsEarlierAttempts) {
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int synthesizer_calls = 0;
+  auto fake = [&](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos)
+      return ok(R"({"splits": true})");
+    if (request.user.find("Critique this candidate set") != std::string::npos)
+      return ok(R"({"score": 0.1, "remove": [], "add": [], "issues": "weak"})");
+    if (request.user.find("select the final children set") !=
+        std::string::npos) {
+      ++synthesizer_calls;
+      if (synthesizer_calls == 2) {  // attempt 2: the provider drops
+        Result failure;
+        failure.kind = Kind::ServerError;
+        return failure;
+      }
+      return ok(
+          R"({"items": [{"title": "One", "atomic": false}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
+    }
+    return ok(R"({"items": ["A", "B", "C", "D"]})");
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  EXPECT_EQ(result.decision, Decision::Defer);
+  EXPECT_EQ(result.provider_failure, "transient");
+  ASSERT_EQ(result.attempts.size(), 1u);  // attempt 1 completed and is kept
+  EXPECT_EQ(result.attempts[0].number, 1);
+}
+
 TEST(GateFunnel, RetryInjectsPreviousIssuesAndCommitsBetterAttempt) {
   FunnelOptions options;
   Funnel funnel(options);

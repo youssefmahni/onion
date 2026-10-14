@@ -781,7 +781,10 @@ int node_cmd(int argc, char** argv) {
   }
   onion::llm::Client client(
       {base_url, key, 120, 10, 1, static_cast<std::size_t>(profile_limit)});
-  onion::llm::Budget budget("1000");
+  // The device's USD budget (F-BUD-1): every ticket's reservation settles
+  // with its real cost, so this cap now binds. Default 1000 keeps the old
+  // headroom for existing deployments.
+  onion::llm::Budget budget(flag(argc, argv, "--budget-usd", "1000"));
   const onion::gate::SyncAsk ask = sync_ask(client);
 
   // Optional per-1M-token prices (USD), peak triplet (decision 0004: no
@@ -1384,7 +1387,8 @@ int node_cmd(int argc, char** argv) {
       // Exhausted and drained lanes are not finished (decision 0010): the
       // loop sleeps instead of spinning until sync brings work or the
       // fleet-wide close arrives.
-      if (result.end_reason == "budget" || result.end_reason == "drained")
+      if (result.end_reason == "budget" || result.end_reason == "drained" ||
+          result.end_reason == "provider unavailable")
         worked = false;
       if (stop_flag.load()) break;
     }

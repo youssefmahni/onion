@@ -36,6 +36,26 @@ bool result_ok(const llm::Result& result) {
   return result.kind == llm::Kind::Ok;
 }
 
+// "" for a reply the funnel can judge (Ok, or a model-quality failure such
+// as Truncated/Malformed); otherwise the provider-failure class.
+std::string provider_failure_class(llm::Kind kind) {
+  switch (kind) {
+    case llm::Kind::Transport:
+    case llm::Kind::Timeout:
+    case llm::Kind::ServerError:
+    case llm::Kind::RateLimited:
+      return "transient";
+    case llm::Kind::AuthError:
+      return "auth";
+    case llm::Kind::BalanceError:
+      return "balance";
+    case llm::Kind::ClientError:
+      return "rejected";
+    default:
+      return "";
+  }
+}
+
 }  // namespace
 
 std::string system_prompt() {
@@ -421,6 +441,33 @@ Funnel::~Funnel() = default;
 Funnel::Funnel(Funnel&&) noexcept = default;
 Funnel& Funnel::operator=(Funnel&&) noexcept = default;
 
+std::string add_usd(const std::string& a_in, const std::string& b_in) {
+  std::string a = a_in;
+  std::string b = b_in;
+    std::size_t a_dot = a.find('.');
+  std::size_t b_dot = b.find('.');
+  const std::string a_int = a.substr(0, a_dot);
+  const std::string b_int = b.substr(0, b_dot);
+  std::string a_frac = a_dot == std::string::npos ? "0" : a.substr(a_dot + 1);
+  std::string b_frac = b_dot == std::string::npos ? "0" : b.substr(b_dot + 1);
+  const std::size_t frac = std::max(a_frac.size(), b_frac.size());
+  a_frac.append(frac - a_frac.size(), '0');
+  b_frac.append(frac - b_frac.size(), '0');
+  const std::int64_t total =
+      std::stoll(a_int + a_frac, nullptr, 10) +
+      std::stoll(b_int + b_frac, nullptr, 10);
+  const std::string text = std::to_string(total);
+  std::string out_text;
+  if (text.size() <= frac)
+    out_text = "0." + std::string(frac - text.size(), '0') + text;
+  else
+    out_text = text.substr(0, text.size() - frac) + "." +
+               text.substr(text.size() - frac);
+  while (out_text.size() > 1 && out_text.back() == '0') out_text.pop_back();
+  if (!out_text.empty() && out_text.back() == '.') out_text.pop_back();
+  return out_text.empty() ? "0" : out_text;
+}
+
 namespace {
 
 llm::Request make_request(const FunnelOptions& options, const NodeContext&,
@@ -444,32 +491,6 @@ struct Meter {
   std::uint64_t in_miss{};
   std::uint64_t out{};
   const llm::PriceSchedule* prices{};
-
-  // Exact decimal-string addition (no floats in audit records).
-  static std::string add_usd(std::string a, std::string b) {
-    std::size_t a_dot = a.find('.');
-    std::size_t b_dot = b.find('.');
-    const std::string a_int = a.substr(0, a_dot);
-    const std::string b_int = b.substr(0, b_dot);
-    std::string a_frac = a_dot == std::string::npos ? "0" : a.substr(a_dot + 1);
-    std::string b_frac = b_dot == std::string::npos ? "0" : b.substr(b_dot + 1);
-    const std::size_t frac = std::max(a_frac.size(), b_frac.size());
-    a_frac.append(frac - a_frac.size(), '0');
-    b_frac.append(frac - b_frac.size(), '0');
-    const std::int64_t total =
-        std::stoll(a_int + a_frac, nullptr, 10) +
-        std::stoll(b_int + b_frac, nullptr, 10);
-    const std::string text = std::to_string(total);
-    std::string out_text;
-    if (text.size() <= frac)
-      out_text = "0." + std::string(frac - text.size(), '0') + text;
-    else
-      out_text = text.substr(0, text.size() - frac) + "." +
-                 text.substr(text.size() - frac);
-    while (out_text.size() > 1 && out_text.back() == '0') out_text.pop_back();
-    if (!out_text.empty() && out_text.back() == '.') out_text.pop_back();
-    return out_text.empty() ? "0" : out_text;
-  }
 
   void add(const llm::Result& result) {
     in_hit += result.in_hit;
@@ -506,17 +527,28 @@ struct Meter {
 
 FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
   FunnelResult result;
+  // The provider-failure class of the most recent call, and the first one
+  // that doomed the current attempt (F-GATE-2).
+  std::string last_failure;
+  std::string doomed_by;
   const SyncAsk counted = [&](const llm::Request& request) -> llm::Result {
     result.calls++;
-    return ask(request);
+    llm::Result reply = ask(request);
+    last_failure = provider_failure_class(reply.kind);
+    return reply;
+  };
+  const auto doom = [&]() {
+    if (doomed_by.empty()) doomed_by = last_failure;
   };
 
   // Pre-check: at most 400 tokens, temperature 0.
   {
     bool tried = false;
+    std::string precheck_failure;
     for (int attempt = 0; attempt < 2; ++attempt) {
       const llm::Result precheck = counted(make_request(
           impl_->options, ctx, precheck_prompt(ctx), 0.0, 400));
+      precheck_failure = last_failure;
       if (result_ok(precheck)) {
         tried = true;
         const auto splits = parse_precheck(precheck.content);
@@ -528,6 +560,14 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         }
         break;
       }
+    }
+    // A pre-check that never got an answer because the provider failed is
+    // not an answer: stop here rather than spend three doomed attempts.
+    if (!tried && !precheck_failure.empty()) {
+      result.decision = Decision::Defer;
+      result.end_reason = "provider unavailable";
+      result.provider_failure = precheck_failure;
+      return result;
     }
     (void)tried;  // a failed pre-check runs the funnel; its checks decide
   }
@@ -545,6 +585,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     const double temperature =
         impl_->options.temperatures[(number - 1) % 3];
     bool failed = false;
+    doomed_by.clear();
 
     // Planner.
     std::vector<std::string> aspects;
@@ -558,6 +599,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       meter.add(reply);
       if (!result_ok(reply)) {
         failed = true;
+        doom();
       } else {
         auto parsed = parse_items(reply.content);
         if (!parsed) failed = true;
@@ -588,6 +630,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
         meter.add(reply);
         if (!result_ok(reply)) {
           failed = true;
+          doom();
           break;
         }
         auto parsed = parse_items(reply.content);
@@ -623,6 +666,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
 
     // Trims: two rounds to 400 and 300; the light funnel runs one round.
     int trim_failures = 0;
+    std::string trim_failure_class;
     auto trim_round = [&](int keep) {
       if (failed || candidates.size() <= static_cast<std::size_t>(keep)) return;
       const llm::Result reply = counted(make_request(
@@ -632,6 +676,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       meter.add(reply);
       if (!result_ok(reply)) {
         trim_failures++;
+        if (trim_failure_class.empty()) trim_failure_class = last_failure;
         return;
       }
       auto parsed = parse_items(reply.content);
@@ -651,7 +696,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     } else {
       for (const int keep : trims) trim_round(keep);
     }
-    if (trim_failures >= max_trim_failures) failed = true;
+    if (trim_failures >= max_trim_failures) {
+      failed = true;
+      if (doomed_by.empty()) doomed_by = trim_failure_class;
+    }
 
     // Critique.
     Critique critique;
@@ -663,17 +711,13 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       meter.add(reply);
       if (!result_ok(reply)) {
         failed = true;
+        doom();
       } else {
         auto parsed = parse_critique(reply.content);
         if (!parsed) failed = true;
         else critique = std::move(*parsed);
       }
     }
-
-    attempt.tokens_in = meter.in_miss;
-    attempt.tokens_cached = meter.in_hit;
-    attempt.tokens_out = meter.out;
-    attempt.cost_usd = meter.cost();
 
     // Synthesizer.
     std::vector<Child> children;
@@ -698,6 +742,7 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       meter.add(reply);
       if (!result_ok(reply)) {
         failed = true;
+        doom();
       } else {
         auto parsed = parse_children(reply.content);
         if (!parsed) failed = true;
@@ -739,6 +784,13 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       }
     }
 
+    // The attempt's metering covers EVERY call it made, the synthesizer
+    // and the verification included (F-FUN-1).
+    attempt.tokens_in = meter.in_miss;
+    attempt.tokens_cached = meter.in_hit;
+    attempt.tokens_out = meter.out;
+    attempt.cost_usd = meter.cost();
+
     attempt.children = children;
     attempt.issues = critique.issues.substr(0, 1000);
     if (!failed && !children.empty()) {
@@ -751,6 +803,17 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       attempt.score = failed ? 0.0 : critique.score;
     }
     if (failed) attempt.issues = "attempt failed: a funnel call did not complete";
+
+    // A provider failure doomed this attempt: it taught nothing about the
+    // node, so it is not an attempt and the node is not judged (F-GATE-2).
+    // Completed earlier attempts stay as audit rows.
+    if (!doomed_by.empty()) {
+      result.decision = Decision::Defer;
+      result.end_reason = "provider unavailable";
+      result.provider_failure = doomed_by;
+      result.attempts = std::move(attempts);
+      return result;
+    }
 
     injected_issues = attempt.issues;
     attempts.push_back(attempt);
