@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS profiles  (device_id TEXT, version INT, prev TEXT, re
                         spec TEXT, rules_version INT, schema INT, hlc INT,
                         PRIMARY KEY (device_id, version));
 CREATE TABLE IF NOT EXISTS applied   (origin TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS batches  (origin TEXT NOT NULL, number INTEGER NOT NULL, hash TEXT NOT NULL,
+                        PRIMARY KEY (origin, number));
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 )sql";
 
@@ -291,6 +293,19 @@ bool Db::open(std::string* error) {
       return false;
     }
   }
+  return true;
+}
+
+bool Db::open_readonly(std::string* error) {
+  if (sqlite3_open_v2(path_.string().c_str(), &handle_,
+                      SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                      nullptr) != SQLITE_OK) {
+    set_error(error, handle_, "cannot open database read-only");
+    sqlite3_close(handle_);
+    handle_ = nullptr;
+    return false;
+  }
+  sqlite3_busy_timeout(handle_, 1000);
   return true;
 }
 

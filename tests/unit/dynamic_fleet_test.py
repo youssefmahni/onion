@@ -211,6 +211,35 @@ def main():
                 time.sleep(2.0)
             raise AssertionError("nodes never converged: %r" % last)
 
+        def wait_vectors(apis, timeout=90):
+            # Equal settled counts can momentarily precede the last
+            # conflicting settle's propagation (a steal lands twice with
+            # different scores and the winner fold resolves it everywhere
+            # only once both records arrived). Equal APPLIED VECTORS are
+            # the record-level gate: the fold is deterministic, so every
+            # device with the same records holds the same settle rows.
+            # (The Merkle root alone covers only the nodes table.) The
+            # devices keep producing records (claim renewals, stray
+            # settles), so a single equal snapshot is not enough — the
+            # vectors must agree AND stay equal across a short window
+            # (the mp test's quiescence property).
+            end = time.time() + timeout
+            last = None
+            while time.time() < end:
+                try:
+                    vs = [tuple(sorted(state(a)["vector"].items()))
+                          for a in apis]
+                    if vs[0] and vs[0] == vs[1] == vs[2]:
+                        if last == vs:
+                            return
+                        last = vs
+                    else:
+                        last = None
+                except Exception:
+                    last = None
+                time.sleep(2.0)
+            raise AssertionError("vectors never reached quiescence")
+
         # ---------------------------------------------------------------
         # Scenario A: node 3 joins mid-run and converges.
         # The campaign starts BEFORE the nodes launch (one writer per
@@ -369,6 +398,10 @@ def main():
             write_members([1, 2, 3], os.path.join(devices[index]["data"],
                                                   "members.json"))
         settled = wait_converged([devices[i]["api"] for i in (1, 2, 3)])
+        # Every device must hold the SAME records before the winner
+        # scan: a stolen ticket settled twice resolves by the winner
+        # fold only once both records reached every replica.
+        wait_vectors([devices[i]["api"] for i in (1, 2, 3)])
         # The steal actually happened: node 3's oplog carries CLAIM
         # records (the fleet works through its own lanes first, then
         # claims from the busy ones).

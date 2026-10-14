@@ -146,3 +146,33 @@ Result: in progress
 Evidence: -
 Lapse: the "record the merge" memory-docs commit landed on main (before branching) — §6.1 says never commit to main. Docs-only and harmless, but recorded. All code commits from here land on m4-signed-log only.
 Next step: DeviceKey + Ed25519Signer in src/log with golden determinism, then verify() with every rejection case.
+
+## 2026-10-13 · m8 pre-work · mp-flake root cause and the sync-scheduler decoupling
+
+Result: in progress
+Evidence:
+- Root cause of the CI flake (`sync.multi_process_convergence`, 3x in runs 38411014186 / 38416803977 / 38420549900): the sync round lived inside the node loop, AFTER engine.run() — a busy engine (13-19 attempts/60 s under load) held the loop thread, so the sync timer never fired (the working node's log had ZERO sync lines). Its peers never learned the campaign and the no-progress window expired. Secondary: the sync-server handlers read SQLite on the single shared writer connection, so handler threads starved behind writer folds (peers saw `status -1`).
+- Fixes: dedicated sync scheduler thread with its own 15 s clock (rounds never overlap; an overrunning round skips the missed ticks with a log line), the members.json reload moved onto the scheduler (a busy engine no longer blocks address discovery), per-handler read-only SQLite connections (store::Db::open_readonly, one per thread via StateWriter::read_db — sync server AND /api/state), push handlers verify on the handler thread and answer 202 without waiting for the fold, and the writer re-checks duplicates/forks as the authority.
+- Push 409 classification by exactly (origin, number) via a new `batches` table: same hash → 200 duplicate (idempotent); different hash → 409 forked log (error log + `/api/state` forks entry, never applied); number beyond latest+1 → 409 gap (pull recovers). Writer-side dedup closes the push/pull race. Tests: `SyncTest.PushDuplicateBatchIsASuccessNotAFork`, `SyncTest.PushForkedBatchIsRejectedAndSurfaced`.
+- `sync.saturation_decoupled`: 2 nodes, node 1 saturated by 60 s-per-call fake-LLM latency (`--delay-ms` added to the funnel fake); node 1 still completes rounds (0→2 in the in-flight window) and node 2 learns the campaign at ~15 s. PASS under TSan with zero reports (SQLite WAL-index races suppressed via tests/tsan_suppressions.txt — fcntl locks invisible to TSan; suppressions wired into the TSan CI job and the test's ctest ENVIRONMENT). The TSan job regex now runs it.
+- mp test hardening: progress = new records anywhere OR a successful sync round anywhere (`sync_rounds_completed` in /api/state), not vector silence alone — timeouts untouched.
+- `EngineTest.StopRuleEndsAnAtomicFrontierCampaign` (4x CI flake): 0/200 reproductions locally under ctest -j8 load; last green main (38408084810 @ 4bfeece) → first failing run (38411014186 @ 92feb5b) differs by a docs-only commit, so it is environmental. Documented in COORDINATION.md; tracked for M9.
+- Proof so far: 30/30 mp runs under ctest -j8 load; full local suite 318/318 (debug). Final 30-run proof on the frozen binary pending, then the PR.
+
+Next step: re-run the 30-loop on the final binary, open the PR, 3 green CI runs, merge; then Part 1 (0014 majority amendment).
+
+## 2026-10-13 · m8 pre-work · 0014 amendment 2: majority-answered rounds, restart gate closed
+
+Result: in progress
+Evidence:
+- majority_round(answered_peers, total) = (answered+1)*2 > total, in src/sync/sync.hpp; the scheduler thread counts answered peers and totals the KNOWN membership (folded members table + the static list — static fleets never write MEMBER_ADD, so members.json is their only row source); 1-member fleet = 0/1 majority (opens immediately); 2-member fleet needs both (documented consequence; the admin-key eviction is the escape).
+- Restart loophole closed: RoundState.sync_round_complete defaults false; a fresh engine opens only for a <=1-member fleet (EngineTest.ReservationGateStartsClosedAfterRestart, SingleMemberFleetReservesImmediately). Stealing follows the gate: the engine drains before emitting a CLAIM it cannot spend on (a self-claim would strand the ticket — found while fixing EngineTest.IdleFleetEngineStealsFromTheBusiestLane).
+- The engine now folds its own CAMPAIGN record before any drain decision (the closed gate used to return without syncing, leaving the campaign unfoldeed).
+- sync.partition_budget_majority: 5 fixed-seed nodes, budget 400/chunk 50 (200 ms fake latency pins the floor chunk), split 2/3 at a polled near-exhaustion level, relaunched partitioned: minority own-origin reserves freeze exactly with zero completed rounds; majority fills the cap within budget + 3*chunk; a minority node restarted 5x mid-partition reserves nothing each time. 20-consecutive-pass proof on the frozen binary.
+- m7.dynamic_fleet_scenarios scenario C got a Merkle-agreement gate before the winner scan (equal settled counts can momentarily precede the last conflicting settle's propagation — the Windows CI flake); ctest TIMEOUT 420->540 for the fleet suite and the new partition test (540 / deadline 480).
+
+Proof (frozen final binary, 2026-10-13): 30/30 sync.multi_process_convergence under ctest -j8 load; 20/20 sync.partition_budget_majority; full local suite 323/323 (linux-debug); sync.saturation_decoupled PASS under TSan (0 reports); release preset green. PR #40 (mp-flake-load) and PR #41 (0014-majority-rounds) open — merge #40 first (this branch is stacked on it), then #41; 3 green CI runs each per house rules. The root cause of the scenario-C CI flake was ALSO fixed here: the replay's single global next_seq let a restart jump the own chain past the foreign copies' seqs (permanent gap, verify 4) — now per-origin (StateWriterTest.OwnChainSeqContinuesFromOwnMaxAfterRestart).
+
+CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the slow Linux runner — the fleet's in-flight chunk work (bounded by the budget, not the deadline) drains in ~8 min there while the local 30/30 proof runs in ~90 s. The deadline is the outer safety net, NOT the progress criterion, so it moves to 720 s (ctest TIMEOUT 780); the no-progress criterion (90 s, records-or-rounds) is untouched.
+
+Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.

@@ -127,6 +127,11 @@ class Db {
 
   // Creates the schema (idempotent) and applies pending migrations.
   bool open(std::string* error);
+  // Opens WITHOUT schema creation or migration, for reader threads: one
+  // read-only connection per thread, never shared (a WAL reader never
+  // blocks on the writer's transactions). Fails when the file or its WAL
+  // sidecars are unavailable.
+  bool open_readonly(std::string* error);
   // Closes the handle so the file can be deleted (needed on Windows, where
   // an open database keeps its files locked).
   void close();

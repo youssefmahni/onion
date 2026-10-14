@@ -1,0 +1,17 @@
+# TSan suppressions for SQLite's WAL shared-memory index.
+#
+# SQLite serializes the WAL-index header and hash-table pages with
+# fcntl/byte-range locks on the -shm file. ThreadSanitizer cannot observe
+# file locks, so concurrent first-use of a WAL database from several
+# connections (the state-writer thread and the sync/API handler threads'
+# read-only connections) is reported as a race inside sqlite3.c's
+# walIndex* functions. The locking is real; the report is not. Suppress
+# the WAL-index family specifically — everything else stays unsuppressed.
+race:walIndexWriteHdr
+race:walIndexReadHdr
+race:walIndexAppend
+race:walIndexRecover
+race:walIndexTryHdr
+race:walTryBeginRead
+race:walCleanupHash
+race:walHash

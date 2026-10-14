@@ -173,17 +173,26 @@ onion::log::Record make_record(std::string type, nlohmann::json payload) {
 }
 
 json state_json(onion::state::StateWriter& writer, int api_port,
-                bool* running) {
+                bool* running, std::uint64_t sync_rounds_completed = 0) {
   std::string error;
   json result;
   result["node"]["running"] = *running;
   result["node"]["api_port"] = api_port;
-  result["spend_usd"] = writer.db().spend_usd(&error);
+  // The sync scheduler thread's successful-round counter (M8 pre-work):
+  // the convergence tests treat "no new records AND no completed rounds"
+  // as the no-progress condition.
+  result["sync_rounds_completed"] = sync_rounds_completed;
+  // All SQLite reads go through the API handler thread's own read-only
+  // connection: a dashboard poll must never serialize behind writer
+  // transactions (and never shares a connection across handler threads).
+  const onion::store::Db& read = writer.read_db();
+  result["spend_usd"] = read.spend_usd(&error);
   // Convergence observables: the applied vector and the Merkle root.
   json vector = json::object();
-  for (const auto& [origin, seq] : writer.vector()) vector[origin] = seq;
+  for (const auto& [origin, seq] : onion::state::StateWriter::vector_on(read))
+    vector[origin] = seq;
   result["vector"] = std::move(vector);
-  const auto all_nodes = writer.db().all_nodes(&error);
+  const auto all_nodes = read.all_nodes(&error);
   result["merkle_root"] = onion::store::merkle_root(all_nodes);
   json campaigns = json::array();
   for (const auto& campaign : writer.campaigns()) {
@@ -213,13 +222,13 @@ json state_json(onion::state::StateWriter& writer, int api_port,
   result["campaigns"] = std::move(campaigns);
   // Membership as the local node sees it (dashboard + M7 scenarios).
   json members = json::array();
-  for (const auto& row : writer.members_table())
+  for (const auto& row : onion::state::StateWriter::members_table_on(read))
     members.push_back({{"device_id", row.device_id},
                        {"state", row.state},
                        {"slot", row.slot}});
   result["members"] = std::move(members);
   json reviews = json::array();
-  for (const auto& review : writer.db().open_reviews(&error)) {
+  for (const auto& review : read.open_reviews(&error)) {
     json entry;
     entry["path"] = review.path;
     entry["reason"] = review.reason;
@@ -228,11 +237,20 @@ json state_json(onion::state::StateWriter& writer, int api_port,
   }
   result["reviews"] = std::move(reviews);
   std::int64_t nodes = 0;
-  for (const auto& settle : writer.db().settles(&error)) {
+  for (const auto& settle : read.settles(&error)) {
     (void)settle;
     nodes++;
   }
   result["settled_nodes"] = nodes;
+  // Forked-log sightings (the push endpoint never applies them; they
+  // surface here for the operator).
+  json forks = json::array();
+  for (const auto& fork : writer.forks())
+    forks.push_back({{"origin", fork.origin},
+                     {"number", fork.number},
+                     {"incoming_hash", fork.incoming_hash},
+                     {"stored_hash", fork.stored_hash}});
+  result["forks"] = std::move(forks);
   result["lanes"] = json::array({"local"});  // M3: one lane
   return result;
 }
@@ -1056,6 +1074,18 @@ int node_cmd(int argc, char** argv) {
     return true;
   };
 
+  // M8 pre-work (the load-starvation fix): the sync round scheduler runs
+  // on its own thread with its own 15 s timer, decoupled from the engine
+  // loop (DESIGN › Everything runs in one process: sync threads serve
+  // and pull while the engine works — a busy device must keep syncing).
+  // fleet_mutex guards the member maps the main loop reloads/gossips
+  // while the scheduler copies them. The state-writer queue stays the
+  // only mutation path.
+  std::mutex fleet_mutex;
+  std::atomic<std::uint64_t> sync_rounds_completed{0};
+  std::atomic<bool> sync_stop{false};
+  std::thread sync_thread;
+
   onion::api::Server server(
       {api_port,
        token,
@@ -1063,7 +1093,8 @@ int node_cmd(int argc, char** argv) {
        writer.get(),
        [&]() {
          bool running = !stop_flag.load();
-         return state_json(*writer, api_port, &running).dump();
+         return state_json(*writer, api_port, &running,
+                           sync_rounds_completed.load()).dump();
        },
        [&](std::string id, std::string) {
          return campaign_action(std::move(id), "paused");
@@ -1131,7 +1162,9 @@ int node_cmd(int argc, char** argv) {
   // Engine loop: run every running campaign until stopped. With a member
   // list, the engine works only its own home-lane tickets.
   const auto reload_members = [&]() {
-    static std::filesystem::file_time_type last_write{};
+    // thread_local: the node loop and the sync scheduler both call this;
+    // each thread tracks the file version it has already parsed.
+    static thread_local std::filesystem::file_time_type last_write{};
     const auto path = std::filesystem::path(members_path);
     std::error_code ec;
     const auto write = std::filesystem::last_write_time(path, ec);
@@ -1161,17 +1194,169 @@ int node_cmd(int argc, char** argv) {
       if (member.contains("swim"))
         new_swim_urls[member_id] = member["swim"].get<std::string>();
     }
-    lane_members = std::move(new_lanes);
-    sync_members = std::move(new_members);
-    member_urls = std::move(new_urls);
-    member_swim_urls = std::move(new_swim_urls);
-    if (std::getenv("ONION_SYNC_DEBUG"))
-      std::fprintf(stderr, "members.json reloaded: %zu members, %zu urls\n",
-                   lane_members.size(), member_urls.size());
+    {
+      std::lock_guard fleet_lock(fleet_mutex);
+      lane_members = std::move(new_lanes);
+      sync_members = std::move(new_members);
+      member_urls = std::move(new_urls);
+      member_swim_urls = std::move(new_swim_urls);
+      // Read inside the lock: the scheduler thread may swap these maps
+      // concurrently (fleet_mutex is the only gate on them).
+      if (std::getenv("ONION_SYNC_DEBUG"))
+        std::fprintf(stderr, "members.json reloaded: %zu members, %zu urls\n",
+                     lane_members.size(), member_urls.size());
+    }
   };
   onion::sched::Engine engine(
       {*writer, ask, budget, 1, device_key->device_id, "0.02", prices,
        device_key->slot, lane_members, device_key->device_id});
+  // The scheduler: one round at a time, anchored on its own 15 s clock.
+  // A round that overruns the interval skips the ticks it missed (logged,
+  // never overlapped); everything it touches either copies shared state
+  // under fleet_mutex or goes through the state-writer queue.
+  const auto run_sync_round = [&]() -> bool {
+    // The address book lives with the scheduler: a busy engine must not
+    // stop the members.json reload (a peer's url arrives in a rewrite
+    // after startup — the two-phase tests and real joins rely on it).
+    if (!members_path.empty()) reload_members();
+    std::map<std::string, std::string> urls;
+    std::vector<onion::sync::MemberKey> members;
+    {
+      std::lock_guard fleet_lock(fleet_mutex);
+      urls = member_urls;
+      members = sync_members;
+    }
+    std::size_t answered_peers = 0;
+    // Chaos tool (M7): ONION_PARTITION_FROM=id1,id2 makes this device
+    // refuse to talk to the listed peers (a network split).
+    std::set<std::string> partitioned;
+#if ONION_CHAOS_HOOKS
+    if (std::getenv("ONION_PARTITION_FROM")) {
+      std::stringstream split(std::getenv("ONION_PARTITION_FROM"));
+      std::string id;
+      while (std::getline(split, id, ','))
+        if (!id.empty()) partitioned.insert(id);
+    }
+#endif  // ONION_CHAOS_HOOKS
+    for (const auto& [peer_id, peer] : urls) {
+      if (peer_id == device_key->device_id) continue;
+      if (partitioned.count(peer_id)) continue;
+      std::map<std::string, std::string> quarantined;
+      std::string sync_error;
+      std::map<std::string, onion::sync::MemberKey> client_members;
+      for (const auto& entry : members)
+        client_members[entry.device_id] = entry;
+      onion::sync::SyncClient client(
+          {*writer, device_key, std::move(client_members)});
+      const int applied =
+          client.run_round(peer, &quarantined, &sync_error);
+      if (sync_error.empty()) ++answered_peers;
+      if (std::getenv("ONION_SYNC_DEBUG")) {
+        std::string quarantine_note;
+        for (const auto& [origin, reason] : quarantined)
+          quarantine_note += " " + origin + "->" + reason;
+        std::fprintf(stderr,
+                     "sync round to %s: applied=%d error=%s%s\n",
+                     peer.c_str(), applied,
+                     sync_error.empty() ? "none" : sync_error.c_str(),
+                     quarantine_note.c_str());
+      }
+    }
+    // Decision 0014 amendment: a round is COMPLETE only when a majority
+    // of members (counting self) answered within their timeouts — a
+    // minority side of a partition must not unlock more spending, and
+    // the completed round re-opens reservations and feeds the
+    // measured-chunk window.
+    // The denominator is the KNOWN membership: the folded members table
+    // (dynamic joins) and the static list — static fleets never write
+    // MEMBER_ADD records, so their rows live only in members.json.
+    std::size_t total_members =
+        onion::state::StateWriter::current_member_count_on(
+            writer->read_db());
+    total_members = std::max<std::size_t>(total_members, members.size());
+    if (!onion::state::StateWriter::member_is_current_on(
+            writer->read_db(), device_key->device_id) &&
+        std::find_if(members.begin(), members.end(),
+                     [&](const onion::sync::MemberKey& entry) {
+                       return entry.device_id == device_key->device_id;
+                     }) == members.end())
+      ++total_members;  // self answers trivially, row or no row
+    const bool majority =
+        onion::sync::majority_round(answered_peers, total_members);
+    if (std::getenv("ONION_SYNC_DEBUG"))
+      std::fprintf(stderr,
+                   "sync round verdict: answered=%zu/%zu majority=%s\n",
+                   answered_peers + 1, total_members,
+                   majority ? "yes" : "no");
+    if (majority) {
+      engine.note_sync_round();
+      ++sync_rounds_completed;
+    }
+    // M7: push this device's newest batch to every peer (DESIGN › New
+    // children and claims are pushed at once). The repeated push also
+    // closes the address-discovery circle under load: a peer cannot pull
+    // before it has our address, so the push carries it.
+    {
+      std::ifstream in(writer->segments().active_path());
+      std::string line;
+      std::string last_line;
+      while (std::getline(in, line))
+        if (!line.empty()) last_line = line;
+      const std::string pushed_batch = std::move(last_line);
+      for (const auto& [peer_id, peer] : urls) {
+        if (peer_id == device_key->device_id || peer.empty())
+          continue;
+        if (partitioned.count(peer_id)) continue;  // the split holds
+        std::map<std::string, onion::sync::MemberKey> client_members;
+        for (const auto& entry : members)
+          client_members[entry.device_id] = entry;
+        onion::sync::SyncClient pusher(
+            {*writer, device_key, std::move(client_members),
+             self_host + ":" +
+                 std::to_string(sync_server ? sync_server->bound_port()
+                                            : self_sync_port)});
+        std::string push_error;
+        if (!member_addr_batch.empty())
+          pusher.push_batch(peer, member_addr_batch, &push_error);
+        if (!pushed_batch.empty() &&
+            pushed_batch != member_addr_batch)
+          pusher.push_batch(peer, pushed_batch, &push_error);
+        if (std::getenv("ONION_SYNC_DEBUG") && !push_error.empty())
+          std::fprintf(stderr, "push to %s failed: %s\n",
+                       peer.c_str(), push_error.c_str());
+      }
+    }
+    return answered_peers > 0;
+  };
+  if (sync_server && !lane_members.empty()) {
+    sync_thread = std::thread([&]() {
+      auto next_round = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(15);
+      while (!sync_stop.load()) {
+        while (!sync_stop.load() &&
+               std::chrono::steady_clock::now() < next_round)
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (sync_stop.load()) break;
+        const auto started = std::chrono::steady_clock::now();
+        if (std::getenv("ONION_SYNC_DEBUG"))
+          std::fprintf(stderr, "sync timer fired, members=%zu\n",
+                       [&]() {
+                         std::lock_guard fleet_lock(fleet_mutex);
+                         return lane_members.size();
+                       }());
+        run_sync_round();
+        // Rounds never overlap: a round that overran its 15 s slot
+        // skips the ticks it missed (each one logged), so the next
+        // round stays anchored on the clock.
+        auto scheduled = started + std::chrono::seconds(15);
+        while (scheduled <= std::chrono::steady_clock::now()) {
+          std::fprintf(stderr, "sync round overran; skipping a tick\n");
+          scheduled += std::chrono::seconds(15);
+        }
+        next_round = scheduled;
+      }
+    });
+  }
   while (!stop_flag.load()) {
     static std::uint64_t loop_visits = 0;
     if (std::getenv("ONION_SYNC_DEBUG") && ++loop_visits % 50 == 0)
@@ -1203,124 +1388,49 @@ int node_cmd(int argc, char** argv) {
         worked = false;
       if (stop_flag.load()) break;
     }
-    // Sync round every 15 s when the member list is present.
-    if (sync_server && !lane_members.empty()) {
-      static auto last_sync = std::chrono::steady_clock::now();
-      static std::uint64_t visits = 0;
-      if (std::getenv("ONION_SYNC_DEBUG") && ++visits % 200 == 0)
-        std::fprintf(stderr, "sync block heartbeat visits=%llu\n",
-                     static_cast<unsigned long long>(visits));
-      if (std::chrono::steady_clock::now() - last_sync >=
+    // M7 joining: a JOINING device turns ACTIVE once its lag behind
+    // every origin is under 100 ops. The sync round itself lives on
+    // the scheduler thread; this check stays on the node loop thread
+    // (it mutates SWIM state) with its own 15 s throttle.
+    if (swim && swim->membership().self().state ==
+                    onion::swim::MemberState::JOINING) {
+      static auto last_join_check = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() - last_join_check >=
           std::chrono::seconds(15)) {
-        if (std::getenv("ONION_SYNC_DEBUG"))
-          std::fprintf(stderr, "sync timer fired, members=%zu\n",
-                       lane_members.size());
-                last_sync = std::chrono::steady_clock::now();
-        bool any_peer_answered = false;
-        // Chaos tool (M7): ONION_PARTITION_FROM=id1,id2 makes this
-        // device refuse to talk to the listed peers (a network split).
-        std::set<std::string> partitioned;
-#if ONION_CHAOS_HOOKS
-        if (std::getenv("ONION_PARTITION_FROM")) {
-          std::stringstream split(std::getenv("ONION_PARTITION_FROM"));
-          std::string id;
-          while (std::getline(split, id, ','))
-            if (!id.empty()) partitioned.insert(id);
-        }
-#endif  // ONION_CHAOS_HOOKS
-        for (const auto& [peer_id, peer] : member_urls) {
-          if (peer_id == device_key->device_id) continue;
-          if (partitioned.count(peer_id)) continue;
-          std::map<std::string, std::string> quarantined;
-          std::string sync_error;
-          std::map<std::string, onion::sync::MemberKey> client_members;
-          for (const auto& entry : sync_members)
-            client_members[entry.device_id] = entry;
-          onion::sync::SyncClient client(
-              {*writer, device_key, std::move(client_members)});
-          const int applied =
-              client.run_round(peer, &quarantined, &sync_error);
-          if (sync_error.empty()) any_peer_answered = true;
-          if (std::getenv("ONION_SYNC_DEBUG")) {
-            std::string quarantine_note;
-            for (const auto& [origin, reason] : quarantined)
-              quarantine_note += " " + origin + "->" + reason;
-            std::fprintf(stderr,
-                         "sync round to %s: applied=%d error=%s%s\n",
-                         peer.c_str(), applied,
-                         sync_error.empty() ? "none" : sync_error.c_str(),
-                         quarantine_note.c_str());
-          }
-        }
-        // Decision 0014: only a COMPLETED sync round re-opens
-        // reservations and feeds the measured-chunk window — a fully
-        // partitioned round must not unlock more spending.
-        if (any_peer_answered) engine.note_sync_round();
-        // M7: push this device's newest batch to every peer (DESIGN ›
-        // New children and claims are pushed at once). The repeated push
-        // also closes the address-discovery circle under load: a peer
-        // cannot pull before it has our address, so the push carries it.
+        last_join_check = std::chrono::steady_clock::now();
+        std::int64_t worst_lag = 0;
+        bool lag_known = false;
+        std::map<std::string, std::string> urls_snapshot;
+        std::vector<onion::sync::MemberKey> members_snapshot;
         {
-          std::ifstream in(writer->segments().active_path());
-          std::string line;
-          std::string last_line;
-          while (std::getline(in, line))
-            if (!line.empty()) last_line = line;
-          const std::string pushed_batch = std::move(last_line);
-          for (const auto& [peer_id, peer] : member_urls) {
-            if (peer_id == device_key->device_id || peer.empty())
-              continue;
-            if (partitioned.count(peer_id)) continue;  // the split holds
-            std::map<std::string, onion::sync::MemberKey> client_members;
-            for (const auto& entry : sync_members)
-              client_members[entry.device_id] = entry;
-            onion::sync::SyncClient pusher(
-                {*writer, device_key, std::move(client_members),
-                 self_host + ":" +
-                     std::to_string(sync_server ? sync_server->bound_port()
-                                                : self_sync_port)});
-            std::string push_error;
-            if (!member_addr_batch.empty())
-              pusher.push_batch(peer, member_addr_batch, &push_error);
-            if (!pushed_batch.empty() &&
-                pushed_batch != member_addr_batch)
-              pusher.push_batch(peer, pushed_batch, &push_error);
-            if (std::getenv("ONION_SYNC_DEBUG") && !push_error.empty())
-              std::fprintf(stderr, "push to %s failed: %s\n",
-                           peer.c_str(), push_error.c_str());
-          }
+          std::lock_guard fleet_lock(fleet_mutex);
+          urls_snapshot = member_urls;
+          members_snapshot = sync_members;
         }
-        // M7 joining: a JOINING device turns ACTIVE once its lag behind
-        // every origin is under 100 ops.
-        if (swim && swim->membership().self().state ==
-                        onion::swim::MemberState::JOINING) {
-          std::int64_t worst_lag = 0;
-          bool lag_known = false;
-          for (const auto& [peer_id, peer] : member_urls) {
-            if (peer_id == device_key->device_id) continue;
-            std::map<std::string, onion::sync::MemberKey> client_members;
-            for (const auto& entry : sync_members)
-              client_members[entry.device_id] = entry;
-            onion::sync::SyncClient lag_client(
-                {*writer, device_key, std::move(client_members),
-                 self_host + ":" +
-                     std::to_string(sync_server ? sync_server->bound_port()
+        for (const auto& [peer_id, peer] : urls_snapshot) {
+          if (peer_id == device_key->device_id) continue;
+          std::map<std::string, onion::sync::MemberKey> client_members;
+          for (const auto& entry : members_snapshot)
+            client_members[entry.device_id] = entry;
+          onion::sync::SyncClient lag_client(
+              {*writer, device_key, std::move(client_members),
+               self_host + ":" +
+                   std::to_string(sync_server ? sync_server->bound_port()
                                                 : self_sync_port)});
-            std::string lag_error;
-            const std::int64_t lag =
-                lag_client.peer_lag(peer, &lag_error);
-            if (lag < 0) continue;
-            lag_known = true;
-            worst_lag = std::max(worst_lag, lag);
-          }
-          if (lag_known && worst_lag < 100) {
-            swim->mutable_membership().set_self_state(
-                onion::swim::MemberState::ACTIVE,
-                swim->membership().self().incarnation + 1);
-            swim->announce();
-            std::fprintf(stderr, "joined: ACTIVE (lag %lld)\n",
-                         static_cast<long long>(worst_lag));
-          }
+          std::string lag_error;
+          const std::int64_t lag =
+              lag_client.peer_lag(peer, &lag_error);
+          if (lag < 0) continue;
+          lag_known = true;
+          worst_lag = std::max(worst_lag, lag);
+        }
+        if (lag_known && worst_lag < 100) {
+          swim->mutable_membership().set_self_state(
+              onion::swim::MemberState::ACTIVE,
+              swim->membership().self().incarnation + 1);
+          swim->announce();
+          std::fprintf(stderr, "joined: ACTIVE (lag %lld)\n",
+                       static_cast<long long>(worst_lag));
         }
       }
     }
@@ -1405,8 +1515,17 @@ if (!members_path.empty()) reload_members();
         }
       }
       // The gossip seeds: the members.json swim addresses (the two-phase
-      // tests and joined fleets learn them after startup).
-      for (const auto& [member_id, swim_url] : member_swim_urls) {
+      // tests and joined fleets learn them after startup). Snapshot
+      // under fleet_mutex — the sync scheduler's reload_members() also
+      // writes these maps.
+      std::map<std::string, std::string> swim_urls_snapshot;
+      std::vector<onion::sched::LaneMember> lanes_snapshot;
+      {
+        std::lock_guard fleet_lock(fleet_mutex);
+        swim_urls_snapshot = member_swim_urls;
+        lanes_snapshot = lane_members;
+      }
+      for (const auto& [member_id, swim_url] : swim_urls_snapshot) {
         if (member_id == device_key->device_id) continue;
         const auto* existing = swim->membership().get(member_id);
         if (existing && existing->address == swim_url) continue;
@@ -1422,22 +1541,25 @@ if (!members_path.empty()) reload_members();
       // members table (MEMBER_ADDR records): the table is the
       // deterministic fallback, so joined devices are reachable even
       // when the gossip channel is blocked.
-      for (const auto& row : writer->members_table()) {
-        if (row.device_id == device_key->device_id) continue;
-        if (!row.sync_url.empty() &&
-            member_urls[row.device_id] != row.sync_url)
-          member_urls[row.device_id] = row.sync_url;
-        if (!row.swim_url.empty() &&
-            member_swim_urls[row.device_id] != row.swim_url)
-          member_swim_urls[row.device_id] = row.swim_url;
-      }
-      for (const auto& member : swim->membership().list()) {
-        if (member.device_id == device_key->device_id) continue;
-        if (member.capabilities.is_object() &&
-            member.capabilities.contains("sync") &&
-            member.capabilities["sync"].is_string())
-          member_urls[member.device_id] =
-              member.capabilities["sync"].get<std::string>();
+      {
+        std::lock_guard fleet_lock(fleet_mutex);
+        for (const auto& row : writer->members_table()) {
+          if (row.device_id == device_key->device_id) continue;
+          if (!row.sync_url.empty() &&
+              member_urls[row.device_id] != row.sync_url)
+            member_urls[row.device_id] = row.sync_url;
+          if (!row.swim_url.empty() &&
+              member_swim_urls[row.device_id] != row.swim_url)
+            member_swim_urls[row.device_id] = row.swim_url;
+        }
+        for (const auto& member : swim->membership().list()) {
+          if (member.device_id == device_key->device_id) continue;
+          if (member.capabilities.is_object() &&
+              member.capabilities.contains("sync") &&
+              member.capabilities["sync"].is_string())
+            member_urls[member.device_id] =
+                member.capabilities["sync"].get<std::string>();
+        }
       }
       // The live lane list INCLUDES this device: lane ownership is the
       // weighted rendezvous over the whole live set, so a device must
@@ -1449,12 +1571,12 @@ if (!members_path.empty()) reload_members();
         if (!alive && majority_visible) continue;  // re-hash to survivors
         if (!alive) continue;  // no majority: keep the dead lanes
         auto it = std::find_if(
-            lane_members.begin(), lane_members.end(),
+            lanes_snapshot.begin(), lanes_snapshot.end(),
             [&](const onion::sched::LaneMember& entry) {
               return entry.device_id == member.device_id;
             });
         const double weight =
-            it == lane_members.end() ? 1.0 : it->weight;
+            it == lanes_snapshot.end() ? 1.0 : it->weight;
         live.push_back({member.device_id, weight});
       }
       engine.set_lane_members(std::move(live));
@@ -1476,6 +1598,8 @@ if (!members_path.empty()) reload_members();
     if (swim) swim->confirm_left();
     std::cout << "left: MEMBER_LEAVE written\n";
   }
+  sync_stop.store(true);
+  if (sync_thread.joinable()) sync_thread.join();
   if (sync_server) sync_server->stop();
   server.stop();
   writer->stop();

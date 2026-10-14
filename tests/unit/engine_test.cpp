@@ -337,17 +337,27 @@ TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
   tiny.mode = "breadth-first";
   tiny.structure = true;  // this test is about the budget, not structure
 
-  // The first (free) reservation takes min(measured chunk, budget) = 2
-  // attempts and settles them; the spent chunk cannot renew until a sync
-  // round, so the run drains (decision 0014) rather than overspending.
-  const Engine::RunResult first = engine.run(tiny, nullptr);
-  EXPECT_EQ(first.end_reason, "drained");
+  // Decision 0014 amendment: the reservation gate starts CLOSED — a
+  // 2-member fleet device reserves only after a completed (majority)
+  // round. The first run therefore drains with no reservation and no
+  // settled work.
+  const Engine::RunResult gated = engine.run(tiny, nullptr);
+  EXPECT_EQ(gated.end_reason, "drained");
+  EXPECT_EQ(gated.settled, 0);
   // Decision 0010: exhaustion never closes the campaign record.
   ASSERT_TRUE(writer_->campaign("c1").has_value());
   EXPECT_EQ(writer_->campaign("c1")->state, "running");
+
+  // After the first completed round the reservation takes min(measured
+  // chunk, budget) = 2 attempts and settles them; the spent chunk cannot
+  // renew until the next round, so the run drains (decision 0014)
+  // rather than overspending.
+  engine.note_sync_round();
+  const Engine::RunResult first = engine.run(tiny, nullptr);
+  EXPECT_EQ(first.end_reason, "drained");
   EXPECT_GT(first.settled, 0);
 
-  // After a sync round the next reservation attempt finds the budget
+  // After the next sync round the reservation attempt finds the budget
   // exhausted: "budget", still not closed.
   engine.note_sync_round();
   const Engine::RunResult exhausted = engine.run(tiny, nullptr);
@@ -374,6 +384,73 @@ TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
   const Engine::RunResult second = engine.run(tiny, nullptr);
   EXPECT_EQ(second.end_reason, "drained");  // the resumed tickets finished
   EXPECT_GT(second.settled, 0);
+}
+
+TEST_F(EngineTest, ReservationGateStartsClosedAfterRestart) {
+  // Decision 0014 amendment: a device that restarts inside a partition
+  // used to get one free reservation ("first reservation is free" was
+  // per-process). A fresh engine over an existing store now starts with
+  // the gate CLOSED: the first run reserves nothing, spends nothing,
+  // writes no RESERVE record — until a completed round opens it.
+  seed_root();
+  Budget budget("10");
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  {
+    // A previous "process": settle the root so the store has history.
+    // The gate is closed at process start; the first run drains, one
+    // completed round opens the gate, the next run works.
+    Engine previous(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                    "dev0000000000000001", "0.001",
+                                    std::nullopt, 0,
+                                    {{"dev0000000000000001", 100.0},
+                                     {"dev0000000000000002", 0.1}},
+                                    "dev0000000000000001"});
+    const Engine::RunResult cold = previous.run(campaign, nullptr);
+    EXPECT_EQ(cold.end_reason, "drained");
+    EXPECT_EQ(cold.settled, 0);
+    previous.note_sync_round();
+    const Engine::RunResult warm = previous.run(campaign, nullptr);
+    ASSERT_GT(warm.settled, 0);
+  }
+  // The restarted process: a brand-new engine over the same store.
+  Engine restarted(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                   "dev0000000000000001", "0.001",
+                                   std::nullopt, 0,
+                                   {{"dev0000000000000001", 100.0},
+                                    {"dev0000000000000002", 0.1}},
+                                   "dev0000000000000001"});
+  const std::int64_t reserved_before = writer_->reserved_total("c1");
+  const Engine::RunResult gated = restarted.run(campaign, nullptr);
+  EXPECT_EQ(gated.end_reason, "drained");
+  EXPECT_EQ(gated.attempts, 0);
+  EXPECT_EQ(gated.settled, 0);
+  // No new RESERVE record: the pre-restart fold is unchanged.
+  EXPECT_EQ(writer_->reserved_total("c1"), reserved_before);
+  // One completed round opens the gate and work resumes.
+  restarted.note_sync_round();
+  const Engine::RunResult resumed = restarted.run(campaign, nullptr);
+  EXPECT_EQ(resumed.end_reason, "drained");
+  EXPECT_GT(resumed.settled, 0);
+  EXPECT_GT(writer_->reserved_total("c1"), reserved_before);
+}
+
+TEST_F(EngineTest, SingleMemberFleetReservesImmediately) {
+  // 0/1 is a majority (0014 amendment): a one-member fleet opens the
+  // gate at once — no round, no wait, no stall.
+  seed_root();
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001",
+                                std::nullopt, 0,
+                                {{"dev0000000000000001", 100.0}},
+                                "dev0000000000000001"});
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  const Engine::RunResult first = engine.run(campaign, nullptr);
+  EXPECT_EQ(first.end_reason, "drained");
+  EXPECT_GT(first.settled, 0);
+  EXPECT_GT(writer_->reserved_total("c1"), 0);
 }
 
 TEST_F(EngineTest, StructureReviewDoesNotReprocessTheTicket) {
@@ -412,6 +489,13 @@ TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
                                 "dev0000000000000001"});
   CampaignSpec campaign = spec();
   campaign.structure = true;
+  // The gate starts closed (0014 amendment): the first run drains with
+  // no reservation and no steals; one completed round opens it and the
+  // idle device then steals from the busy lanes.
+  const Engine::RunResult cold = engine.run(campaign, nullptr);
+  EXPECT_EQ(cold.end_reason, "drained");
+  EXPECT_EQ(cold.settled, 0);
+  engine.note_sync_round();
   const Engine::RunResult idle = engine.run(campaign, nullptr);
   EXPECT_EQ(idle.end_reason, "drained");
   EXPECT_GT(idle.settled, 0);  // stolen tickets got worked

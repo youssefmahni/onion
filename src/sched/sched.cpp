@@ -274,7 +274,13 @@ struct Engine::Impl {
   // (one Engine runs every campaign, so the round state must not leak
   // between them).
   struct RoundState {
-    bool sync_round_complete{true};  // the first reservation is free
+    // Decision 0014 amendment (2026-10-13): closed by default. The old
+    // "first reservation is free" rule let a device that restarted inside
+    // a partition reserve once without any completed round; now a fleet
+    // device reserves only after a MAJORITY round (the node loop's
+    // majority_round verdict). A fresh RoundState opens immediately ONLY
+    // for a fleet of one (0/1 is a majority).
+    bool sync_round_complete{false};
     std::int64_t attempts_in_window{0};
     std::int64_t last_window_attempts{0};
   };
@@ -285,6 +291,13 @@ struct Engine::Impl {
   std::mt19937 rng_{std::random_device{}()};
   std::map<std::string, std::vector<log::Hlc>> own_reserve_hlcs;
   log::HlcClock hlc;
+  // M8 pre-work (the sync scheduler thread): note_sync_round() runs on
+  // the scheduler thread while run() runs on the node loop thread. This
+  // mutex guards round_states and stolen_claims. Lock order (the ONLY
+  // one): pacing_mutex_ is never held while performing LLM I/O; the
+  // writer calls under it are queue submissions and shared-index reads,
+  // which never call back into the engine.
+  std::mutex pacing_mutex_;
 };
 
 Engine::Engine(Options options)
@@ -303,6 +316,7 @@ const std::vector<LaneMember>& Engine::live_lane_members() const {
 }
 
 void Engine::note_sync_round() {
+  std::lock_guard pacing(impl_->pacing_mutex_);
   for (auto& [campaign, state] : impl_->round_states) {
     state.last_window_attempts = state.attempts_in_window;
     state.attempts_in_window = 0;
@@ -397,6 +411,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", campaign_spec_json(spec)},
                    {"state", "running"}})}});
+    // Fold it before any further decision: with the 0014 amendment the
+    // first run can drain on a closed gate WITHOUT reserving, and the
+    // campaign's existence must not depend on that reservation's sync.
+    writer.sync();
   }
 
   gate::FunnelOptions funnel_options;
@@ -535,7 +553,12 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     for (const Ticket& ticket : all_tickets) {
       const auto owner = lane_owner(ticket.path, members);
       if (!owner || *owner == impl_->options.self) continue;
-      if (impl_->stolen_claims.count(ticket.path)) continue;  // ours
+      {
+        // Guarded with the same mutex as note_sync_round() (the sync
+        // scheduler thread renews and prunes claims there).
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        if (impl_->stolen_claims.count(ticket.path)) continue;  // ours
+      }
       if (!writer.claim_holder(ticket.path, impl_->options.self, now_ms)
                .empty())
         continue;
@@ -625,8 +648,24 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     // A lane down to fewer tickets than its workers steals from the far
     // end of the busiest eligible lanes (DESIGN › Stealing). The void
     // check runs FIRST: a budget-capped device must not hold stolen
-    // tickets hostage.
+    // tickets hostage. The reservation gate runs BEFORE the claim too
+    // (0014 amendment): claiming a ticket the device cannot spend on yet
+    // would strand it — the next steal scan skips our own claims.
     if (fleet && tickets.empty() && waiting.empty()) {
+      bool round_complete = true;
+      {
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        auto [it, inserted] = impl_->round_states.try_emplace(spec.id);
+        if (inserted) {
+          it->second.sync_round_complete =
+              (live_lane_members().size() <= 1);
+        }
+        round_complete = it->second.sync_round_complete;
+      }
+      if (!round_complete) {
+        result.end_reason = "drained";
+        break;
+      }
       const auto stolen = pick_stolen_ticket(spec, live_members);
       if (stolen) {
         writer.submit(state::CommitTerminal{{make_record(
@@ -634,7 +673,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                       {"path", stolen->path},
                       {"lease_s", 600}})}});
         writer.sync();
-        impl_->stolen_claims[stolen->path] = {spec.id, now_ms};
+        {
+          std::lock_guard pacing(impl_->pacing_mutex_);
+          impl_->stolen_claims[stolen->path] = {spec.id, now_ms};
+        }
         tickets.push_back(*stolen);
         stole_this_round = true;
       }
@@ -656,8 +698,24 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
     if (used_in_chunk >= current_chunk_size_) {
       const std::int64_t reserved = writer.reserved_total(spec.id);
       const bool fleet = !live_lane_members().empty();
-      auto& round_state = impl_->round_states[spec.id];
-      if (fleet && !round_state.sync_round_complete) {
+      // Round state is shared with the sync scheduler thread
+      // (note_sync_round): copy it out under the mutex, mutate it back
+      // under the mutex, and keep every lock section I/O-free.
+      bool round_complete = true;
+      std::int64_t window_attempts = 0;
+      {
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        auto [it, inserted] = impl_->round_states.try_emplace(spec.id);
+        if (inserted) {
+          // A fresh gate (restart or a brand-new campaign) opens only
+          // for a one-member fleet — 0/1 is a majority (0014 amendment).
+          it->second.sync_round_complete =
+              (live_lane_members().size() <= 1);
+        }
+        round_complete = it->second.sync_round_complete;
+        window_attempts = it->second.last_window_attempts;
+      }
+      if (fleet && !round_complete) {
         // Decision 0014: at most one reservation per sync round. The node
         // loop re-enters run() after the next completed round.
         result.end_reason = "drained";
@@ -668,7 +726,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         // The measured chunk: max(50, attempts in the previous sync-round
         // window × 1.2, ceiling) — fast devices are not throttled.
         const std::int64_t measured = std::max<std::int64_t>(
-            50, (round_state.last_window_attempts * 6 + 4) / 5);
+            50, (window_attempts * 6 + 4) / 5);
         take = std::min(measured, spec.loop_budget - reserved);
       } else {
         take = std::min(spec.chunk, spec.loop_budget - reserved);
@@ -679,7 +737,10 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       }
       current_chunk_size_ = take;
       used_in_chunk = 0;
-      round_state.sync_round_complete = false;
+      {
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        impl_->round_states[spec.id].sync_round_complete = false;
+      }
       log::Record reserve = make_record(
           "RESERVE", {{"campaign", spec.id}, {"attempts", take}});
       // The engine stamps the hlc so it can recognise its own entries for
@@ -752,7 +813,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                       {"campaign", spec.id},
                       {"issues", attempt.issues}})});
       result.attempts++;
-      if (!ticket_stolen) impl_->round_states[spec.id].attempts_in_window++;
+      if (!ticket_stolen) {
+        // Shared with note_sync_round(): short, I/O-free section.
+        std::lock_guard pacing(impl_->pacing_mutex_);
+        impl_->round_states[spec.id].attempts_in_window++;
+      }
     }
 
     used_in_chunk++;

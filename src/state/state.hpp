@@ -42,6 +42,13 @@ struct AppendForeign {
   log::Batch batch;
 };
 
+// M8 pre-work: the push handler learns the pusher's sync address without
+// touching SQLite itself; the writer thread owns the members-table write.
+struct SetMemberSyncUrl {
+  std::string device_id;
+  std::string sync_url;
+};
+
 // Unsigned development import (M3 only; M4 replaces it with the genesis
 // import). Nodes go straight into SQLite, never into the log.
 struct DevImportedNode {
@@ -96,6 +103,7 @@ class StateWriter {
   void submit(CommitTerminal command);
   void submit(DevImport command);
   void submit(AppendForeign command);
+  void submit(SetMemberSyncUrl command);
   // Blocks until every queued command is durable and folded.
   void sync();
   // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
@@ -112,6 +120,15 @@ class StateWriter {
   std::optional<std::string> origin_prev_hash(std::string_view origin) const;
   // Read side (any thread; WAL reads plus a shared index).
   const store::Db& db() const;
+
+  // Per-batch hashes, recorded by the writer thread for every batch it
+  // appends or replays: the authoritative "what is stored for exactly
+  // (origin, number)" answer behind the push endpoint's duplicate /
+  // forked-log / gap classification. Empty when the number was never
+  // stored; the table is rebuilt by replay on every start.
+  std::optional<std::string> stored_batch_hash(std::string_view origin,
+                                               std::uint64_t number) const;
+  std::uint64_t latest_batch_number(std::string_view origin) const;
   log::Segments& segments();
   bool settled(std::string_view path) const;
   bool leaf(std::string_view path) const;         // settled, cannot split
@@ -144,6 +161,12 @@ class StateWriter {
   // current-member-only decisions use this, not member_public_key,
   // because an evicted member's key stays in the table.
   bool member_is_current(std::string_view device_id) const;
+  // Decision 0014 amendment: the fleet size for the sync-round majority
+  // — current members only (JOINING/ACTIVE count; EVICTED/LEFT do not),
+  // self included via its own row. The fold is the authority, so every
+  // replica counts the same membership.
+  std::size_t current_member_count() const;
+  static std::size_t current_member_count_on(const store::Db& db);
   // M7 stealing: whether another device holds an unexpired CLAIM on the
   // path (timed from THIS device's receipt — never the claimer's clock).
   // Returns the claimer's device id, or empty.
@@ -161,6 +184,40 @@ class StateWriter {
     std::string sync_url;
     std::string swim_url;
   };
+  // The same lookups on a caller-supplied connection (the sync server's
+  // per-handler read-only connections — never the writer's handle).
+  static std::optional<std::string> stored_batch_hash_on(
+      const store::Db& db, std::string_view origin, std::uint64_t number);
+  static std::uint64_t latest_batch_number_on(const store::Db& db,
+                                              std::string_view origin);
+  static std::map<std::string, std::int64_t> vector_on(const store::Db& db);
+  static std::vector<MemberRow> members_table_on(const store::Db& db);
+  static std::optional<std::vector<std::uint8_t>> member_public_key_on(
+      const store::Db& db, std::string_view device_id);
+  static bool member_is_current_on(const store::Db& db,
+                                   std::string_view device_id);
+  static bool member_exists_on(const store::Db& db,
+                               std::string_view device_id);
+  static bool member_slot_collides_on(const store::Db& db, std::int64_t slot,
+                                      std::string_view device_id);
+
+  // A per-thread read-only SQLite connection for server handler threads
+  // (WAL readers never block behind the writer's transactions). Falls
+  // back to the shared handle only when the read-only open fails.
+  const store::Db& read_db() const;
+
+  // A forked log (the same (origin, number) carried by two different
+  // hashes) is recorded for /api/state and never applied.
+  struct ForkEvent {
+    std::string origin;
+    std::uint64_t number{};
+    std::string incoming_hash;
+    std::string stored_hash;
+  };
+  void note_fork(ForkEvent fork);
+  std::vector<ForkEvent> forks() const;
+
+  // M7: a member's sync (TCP) address from the durable table, if known.
   std::vector<MemberRow> members_table() const;
   // M7: a member's sync (TCP) address from the durable table, if known.
   std::optional<std::string> member_sync_url(std::string_view device_id) const;
@@ -174,11 +231,20 @@ class StateWriter {
 
  private:
   struct Command {
-    enum class Kind { Attempt, Terminal, Import, Foreign, Sync, Shutdown } kind;
+    enum class Kind {
+      Attempt,
+      Terminal,
+      Import,
+      Foreign,
+      MemberUrl,
+      Sync,
+      Shutdown
+    } kind;
     log::Record attempt;
     std::vector<log::Record> records;
     std::vector<DevImportedNode> nodes;
     log::Batch foreign;
+    SetMemberSyncUrl member_url;
   };
 
   void run();
@@ -191,6 +257,8 @@ class StateWriter {
                     int hook_step_base = 1);
   void update_applied(std::string_view origin,
                       const std::vector<log::Record>& records);
+  void record_batch(std::string_view origin, std::uint64_t number,
+                    std::string_view hash);
   std::map<std::string, std::unique_ptr<log::Segments>> foreign_segments_;
   // Per-origin chain heads (own origin included) for sync continuation.
   mutable std::shared_mutex chain_mutex_;
@@ -260,6 +328,11 @@ class StateWriter {
   std::int64_t campaign_budget(std::string_view campaign) const;
   std::vector<ReserveEntry> reserve_entries_sorted(
       std::string_view campaign) const;  // sorted by (hlc, origin)
+
+  // Forked-log sightings (M8 pre-work): recorded by the push handler or
+  // the writer thread, surfaced by /api/state. Bounded to the latest 64.
+  mutable std::mutex forks_mutex_;
+  std::deque<ForkEvent> forks_;
 };
 
 }  // namespace onion::state

@@ -953,6 +953,56 @@ TEST_F(StateWriterTest, ReserveFoldSurvivesRestart) {
   EXPECT_FALSE(writer_->reservation_void("mp1", "dev00000000000000aa", 200));
 }
 
+TEST_F(StateWriterTest, OwnChainSeqContinuesFromOwnMaxAfterRestart) {
+  // The per-origin seq fix (M8 pre-work): the own origin's next record
+  // seq must come from the OWN chain only. A single global counter
+  // advanced by every origin's replay let a restart jump the own chain
+  // past the foreign copies' higher seqs — a PERMANENT gap in the own
+  // log that peers quarantined forever ("verify 4").
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  // The own chain: one batch, records 1..2.
+  writer_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P01"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+      make_record("SETTLE", {{"path", "P02"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_->sync();
+  EXPECT_EQ(writer_->vector()["dev0000000000000001"], 2);
+
+  // A foreign copy whose records reach seq 90 (fleet mate ahead).
+  std::vector<onion::log::Record> foreign_records;
+  std::int64_t seq = 85;
+  for (int i = 0; i < 6; ++i) {
+    onion::log::Record record = make_record(
+        "RESERVE", {{"campaign", "mp1"}, {"attempts", 1}});
+    record.seq = seq++;
+    foreign_records.push_back(std::move(record));
+  }
+  onion::log::NullSigner signer;
+  writer_->submit(onion::state::AppendForeign{onion::log::make_batch(
+      "dev00000000000000aa", 1, std::string(64, '0'),
+      foreign_records, signer)});
+  writer_->sync();
+
+  // Restart on the same directory: the replay sees the foreign seqs up
+  // to 90, but the own chain must continue at 3 — not 91.
+  writer_->stop();
+  StateWriter::Options options;
+  options.data_dir = dir_;
+  options.origin = "dev0000000000000001";
+  writer_ = std::make_unique<StateWriter>(std::move(options));
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  EXPECT_EQ(writer_->vector()["dev0000000000000001"], 2);
+  writer_->submit(CommitTerminal{{
+      make_record("SETTLE", {{"path", "P03"}, {"kept", 0},
+                             {"end", "cannot split"}}),
+  }});
+  writer_->sync();
+  EXPECT_EQ(writer_->vector()["dev0000000000000001"], 3);
+}
+
 TEST_F(StateWriterTest, StaleCampaignRecordDoesNotMoveTheBudget) {
   // Latest (hlc, origin) wins for the budget too: a stale CAMPAIGN record
   // delivered late must not shrink the cap on any replica.
@@ -1196,6 +1246,9 @@ TEST_F(StateWriterTest, MemberEvictNeedsAMajorityOrTheAdminKey) {
   // (and any ACTIVE row) is.
   EXPECT_FALSE(writer_->member_is_current(victim.device_id));
   EXPECT_TRUE(writer_->member_is_current(admin.device_id));
+  // The round-majority denominator (decision 0014 amendment) counts
+  // current members only: 2 before the eviction, 1 after.
+  EXPECT_EQ(writer_->current_member_count(), 1u);
 }
 
 TEST_F(StateWriterTest, MemberLeaveIsValidOnlyFromTheDeviceItself) {

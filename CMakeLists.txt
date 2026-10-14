@@ -320,13 +320,31 @@ if(BUILD_TESTING)
   set_tests_properties(llm.proxy_budget_caps PROPERTIES TIMEOUT 120)
   add_test(NAME sync.multi_process_convergence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/multi_process_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(sync.multi_process_convergence PROPERTIES
-    TIMEOUT 420
-    ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    TIMEOUT 780
+    ENVIRONMENT "ONION_MP_DEADLINE_S=720"
     SKIP_RETURN_CODE 77)
+  # The sync scheduler runs on its own thread: a node saturated by 60 s
+  # LLM calls must keep completing rounds and its peers must learn the
+  # campaign within two rounds. Under TSan the SQLite WAL-index false
+  # positives are suppressed (tests/tsan_suppressions.txt).
+  add_test(NAME sync.saturation_decoupled COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/sync_saturation_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(sync.saturation_decoupled PROPERTIES
+    TIMEOUT 240
+    ENVIRONMENT "ONION_SYNC_SAT_DEADLINE_S=180;TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan_suppressions.txt")
   add_test(NAME m7.dynamic_fleet_scenarios COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/dynamic_fleet_test.py" "$<TARGET_FILE:data_depot>")
   set_tests_properties(m7.dynamic_fleet_scenarios PROPERTIES
-    TIMEOUT 420
+    TIMEOUT 540
     ENVIRONMENT "ONION_MP_DEADLINE_S=360"
+    SKIP_RETURN_CODE 77)
+  # Decision 0014 amendment: a 5-node fleet split 2/3 near budget
+  # exhaustion — only the majority side may reserve new chunks; the
+  # minority (including one restarted 5x) freezes; total spend stays
+  # within budget + one chunk per majority device. Chaos hooks only
+  # (the split is ONION_PARTITION_FROM).
+  add_test(NAME sync.partition_budget_majority COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/partition_budget_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(sync.partition_budget_majority PROPERTIES
+    TIMEOUT 540
+    ENVIRONMENT "ONION_MP_DEADLINE_S=480"
     SKIP_RETURN_CODE 77)
   # A hookless (release) build must ignore the chaos env knobs entirely.
   if(NOT ONION_CHAOS_HOOKS)

@@ -337,6 +337,14 @@ void StateWriter::replay(std::string* error) {
 
   std::vector<std::string> members{options_.origin};
 
+  // Per-origin continuation: the OWN origin's next record seq must come
+  // from the OWN chain only. A single global counter advanced by every
+  // origin's replay let a restart jump the own chain past the foreign
+  // copies' higher seqs — a PERMANENT gap in the own log (peers pulling
+  // across the gap quarantined it forever: "verify 4"). Each origin
+  // tracks its own max here; the own one seeds next_seq_ at the end.
+  std::map<std::string, std::uint64_t> per_origin_next_seq;
+
   // process_line verifies one batch against the per-origin chain. For the
   // own origin the full Ed25519 check applies; foreign origins are
   // chain-checked only (their keys arrive with M7 gossip — the batches
@@ -398,11 +406,13 @@ void StateWriter::replay(std::string* error) {
       }
     }
     for (const log::Record& record : batch.records) {
-      if (record.seq >= static_cast<std::int64_t>(next_seq_))
-        next_seq_ = static_cast<std::uint64_t>(record.seq) + 1;
+      per_origin_next_seq[batch.origin] = std::max(
+          per_origin_next_seq[batch.origin],
+          static_cast<std::uint64_t>(record.seq) + 1);
       fold(record, batch.origin, error);
     }
     update_applied(batch.origin, batch.records);
+    record_batch(batch.origin, batch.number, batch.hash);
     applied_since_checkpoint_ += batch.records.size();
     if (origin == options_.origin) {
       next_batch_ = batch.number + 1;
@@ -493,6 +503,10 @@ void StateWriter::replay(std::string* error) {
       }
     }
   }
+  const auto own_chain = per_origin_next_seq.find(options_.origin);
+  next_seq_.store(own_chain == per_origin_next_seq.end()
+                      ? 1
+                      : own_chain->second);
   rebuild_index();
 }
 
@@ -845,6 +859,7 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   ++next_batch_;
   if (!segments_->append(batch, error)) return false;
   prev_hash_ = batch.hash;
+  record_batch(batch.origin, batch.number, batch.hash);
   if (options_.crash_hook)
     options_.crash_hook(hook_step_base);  // batch durable, store stale
   for (const log::Record& record : records) fold(record, options_.origin, error);
@@ -871,6 +886,194 @@ void StateWriter::update_applied(std::string_view origin,
     return;
   }
   statement->step(&bind_error);
+}
+
+void StateWriter::record_batch(std::string_view origin, std::uint64_t number,
+                               std::string_view hash) {
+  std::string error;
+  auto statement = db_.prepare(
+      "INSERT OR REPLACE INTO batches(origin, number, hash) "
+      "VALUES (?1, ?2, ?3);",
+      &error);
+  if (!statement) return;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(origin), &bind_error) ||
+      !statement->bind(2, static_cast<std::int64_t>(number), &bind_error) ||
+      !statement->bind(3, std::string(hash), &bind_error)) {
+    return;
+  }
+  statement->step(&bind_error);
+}
+
+std::optional<std::string> StateWriter::stored_batch_hash_on(
+    const store::Db& db, std::string_view origin, std::uint64_t number) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT hash FROM batches WHERE origin = ?1 AND number = ?2;",
+      &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(origin), &bind_error) ||
+      !statement->bind(2, static_cast<std::int64_t>(number), &bind_error))
+    return std::nullopt;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  return statement->text(0);
+}
+
+std::uint64_t StateWriter::latest_batch_number_on(const store::Db& db,
+                                                  std::string_view origin) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT COALESCE(MAX(number), 0) FROM batches WHERE origin = ?1;",
+      &error);
+  if (!statement) return 0;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(origin), &bind_error)) return 0;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return 0;
+  return static_cast<std::uint64_t>(statement->integer(0));
+}
+
+std::map<std::string, std::int64_t> StateWriter::vector_on(
+    const store::Db& db) {
+  std::map<std::string, std::int64_t> result;
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT origin, seq FROM applied ORDER BY origin;", &error);
+  if (!statement) return result;
+  std::string step_error;
+  while (statement->step_row(&step_error))
+    result[statement->text(0)] = statement->integer(1);
+  return result;
+}
+
+std::vector<StateWriter::MemberRow> StateWriter::members_table_on(
+    const store::Db& db) {
+  std::vector<MemberRow> rows;
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT device_id, pubkey, slot, state, sync_url, swim_url "
+      "FROM members ORDER BY device_id;",
+      &error);
+  if (!statement) return rows;
+  std::string step_error;
+  while (statement->step_row(&step_error)) {
+    const std::string pubkey = statement->blob(1);
+    std::string hex;
+    static const char* digits = "0123456789abcdef";
+    for (const unsigned char byte : pubkey) {
+      hex.push_back(digits[byte >> 4]);
+      hex.push_back(digits[byte & 0xf]);
+    }
+    rows.push_back(MemberRow{statement->text(0), hex,
+                             statement->integer(2), statement->text(3),
+                             statement->text(4), statement->text(5)});
+  }
+  return rows;
+}
+
+std::optional<std::vector<std::uint8_t>> StateWriter::member_public_key_on(
+    const store::Db& db, std::string_view device_id) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT pubkey FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(device_id), &bind_error))
+    return std::nullopt;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  const std::string blob = statement->blob(0);
+  return std::vector<std::uint8_t>(blob.begin(), blob.end());
+}
+
+bool StateWriter::member_is_current_on(const store::Db& db,
+                                       std::string_view device_id) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT state FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(device_id), &bind_error)) return false;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return false;
+  const std::string state = statement->text(0);
+  return state != "EVICTED" && state != "LEFT";
+}
+
+bool StateWriter::member_exists_on(const store::Db& db,
+                                   std::string_view device_id) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT 1 FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(device_id), &bind_error)) return false;
+  std::string step_error;
+  return statement->step_row(&step_error);
+}
+
+bool StateWriter::member_slot_collides_on(const store::Db& db,
+                                          std::int64_t slot,
+                                          std::string_view device_id) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT 1 FROM members WHERE slot = ?1 AND device_id != ?2 LIMIT 1;",
+      &error);
+  if (!statement) return false;
+  std::string bind_error;
+  if (!statement->bind(1, slot, &bind_error) ||
+      !statement->bind(2, std::string(device_id), &bind_error))
+    return false;
+  std::string step_error;
+  return statement->step_row(&step_error);
+}
+
+std::optional<std::string> StateWriter::stored_batch_hash(
+    std::string_view origin, std::uint64_t number) const {
+  return stored_batch_hash_on(db_, origin, number);
+}
+
+std::uint64_t StateWriter::latest_batch_number(
+    std::string_view origin) const {
+  return latest_batch_number_on(db_, origin);
+}
+
+const store::Db& StateWriter::read_db() const {
+  // One read-only connection per handler thread: WAL readers never
+  // serialize behind the writer's transactions. A failed open (the
+  // database is mid-migration or the WAL is missing) falls back to the
+  // shared handle for that call only.
+  static thread_local std::unordered_map<
+      std::string, std::unique_ptr<store::Db>>
+      connections;
+  const std::string key = options_.data_dir.string();
+  auto& slot = connections[key];
+  if (!slot) {
+    slot = std::make_unique<store::Db>(options_.data_dir / "onion.db");
+    std::string error;
+    if (!slot->open_readonly(&error)) {
+      std::fprintf(stderr,
+                   "state: read-only connection failed (%s); falling back "
+                   "to the shared handle\n",
+                   error.c_str());
+      slot.reset();
+      return db_;
+    }
+  }
+  return *slot;
+}
+
+void StateWriter::note_fork(ForkEvent fork) {
+  std::lock_guard lock(forks_mutex_);
+  forks_.push_back(std::move(fork));
+  while (forks_.size() > 64) forks_.pop_front();
+}
+
+std::vector<StateWriter::ForkEvent> StateWriter::forks() const {
+  std::lock_guard lock(forks_mutex_);
+  return {forks_.begin(), forks_.end()};
 }
 
 std::map<std::string, std::int64_t> StateWriter::vector() const {
@@ -935,7 +1138,35 @@ void StateWriter::run() {
         break;
       case Command::Kind::Foreign: {
         // Append the verified foreign batch to the origin's local log and
-        // fold it. The batch was verified by the sync client.
+        // fold it. The batch was verified by the sync client — but the
+        // push endpoint now answers 202 before the fold, so the writer
+        // re-checks the chain state as the authority: a duplicate (same
+        // hash for this number) is a no-op; a DIFFERENT hash for an
+        // already-stored number is a forked log and is dropped, never
+        // applied.
+        const auto stored =
+            stored_batch_hash(command.foreign.origin, command.foreign.number);
+        if (stored) {
+          if (*stored == command.foreign.hash) {
+            if (std::getenv("ONION_SYNC_DEBUG"))
+              std::fprintf(stderr,
+                           "state: duplicate batch %s#%llu ignored\n",
+                           command.foreign.origin.c_str(),
+                           static_cast<unsigned long long>(
+                               command.foreign.number));
+            break;
+          }
+          note_fork(ForkEvent{command.foreign.origin, command.foreign.number,
+                              command.foreign.hash, *stored});
+          std::fprintf(
+              stderr,
+              "ERROR forked log: origin=%s number=%llu incoming-hash=%s "
+              "stored-hash=%s\n",
+              command.foreign.origin.c_str(),
+              static_cast<unsigned long long>(command.foreign.number),
+              command.foreign.hash.c_str(), stored->c_str());
+          break;
+        }
         flush_pending_attempts(&error);
         if (!error.empty()) break;
         // Append to the foreign origin's segments (a separate Segments).
@@ -959,10 +1190,26 @@ void StateWriter::run() {
         for (const log::Record& record : command.foreign.records)
           fold(record, command.foreign.origin, &error);
         update_applied(command.foreign.origin, command.foreign.records);
+        record_batch(command.foreign.origin, command.foreign.number,
+                     command.foreign.hash);
         {
           std::unique_lock chain_lock(chain_mutex_);
           origin_prev_hashes_[command.foreign.origin] = command.foreign.hash;
         }
+        break;
+      }
+      case Command::Kind::MemberUrl: {
+        auto statement = db_.prepare(
+            "UPDATE members SET sync_url=?2 WHERE device_id=?1;", &error);
+        if (!statement) break;
+        std::string bind_error;
+        if (!statement->bind(1, command.member_url.device_id, &bind_error) ||
+            !statement->bind(2, command.member_url.sync_url, &bind_error)) {
+          error = "member url bind failed: " + bind_error;
+          break;
+        }
+        statement->step(&bind_error);
+        if (!bind_error.empty()) error = "member url step failed: " + bind_error;
         break;
       }
       case Command::Kind::Import: {
@@ -1068,6 +1315,15 @@ void StateWriter::submit(AppendForeign command) {
   Command queued;
   queued.kind = Command::Kind::Foreign;
   queued.foreign = std::move(command.batch);
+  queue_.push_back(std::move(queued));
+  queue_cv_.notify_one();
+}
+
+void StateWriter::submit(SetMemberSyncUrl command) {
+  std::lock_guard lock(queue_mutex_);
+  Command queued;
+  queued.kind = Command::Kind::MemberUrl;
+  queued.member_url = std::move(command);
   queue_.push_back(std::move(queued));
   queue_cv_.notify_one();
 }
@@ -1203,6 +1459,22 @@ bool StateWriter::member_is_current(std::string_view device_id) const {
   if (!statement->step_row(&step_error)) return false;
   const std::string state = statement->text(0);
   return state != "EVICTED" && state != "LEFT";
+}
+
+std::size_t StateWriter::current_member_count() const {
+  return current_member_count_on(db_);
+}
+
+std::size_t StateWriter::current_member_count_on(const store::Db& db) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT COUNT(*) FROM members "
+      "WHERE state != 'EVICTED' AND state != 'LEFT';",
+      &error);
+  if (!statement) return 0;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return 0;
+  return static_cast<std::size_t>(std::max<std::int64_t>(0, statement->integer(0)));
 }
 
 std::vector<StateWriter::MemberRow> StateWriter::members_table() const {  std::vector<MemberRow> rows;

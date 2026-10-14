@@ -59,6 +59,20 @@ class NonceCache {
   std::map<std::string, Entry> seen_;
 };
 
+// Decision 0014 (amendment 2026-10-13): a sync round is COMPLETE only
+// when a MAJORITY of members (counting self) answered within their
+// timeouts. `answered_peers` excludes self; the rule adds it:
+//   (answered_peers + 1) * 2 > total_members
+// A 1-member fleet therefore completes every round (0/1 is a majority),
+// and a 2-member fleet needs BOTH devices — a slow peer there pauses
+// reservations (documented consequence; the admin-key eviction shrinks
+// a stuck 2-fleet to 1). Pure and deterministic, so replicas that see
+// the same answers make the same verdict.
+inline bool majority_round(std::size_t answered_peers,
+                           std::size_t total_members) {
+  return (answered_peers + 1) * 2 > total_members;
+}
+
 struct MemberKey {
   std::string device_id;
   std::vector<std::uint8_t> public_key;
