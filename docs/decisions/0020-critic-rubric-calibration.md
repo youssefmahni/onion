@@ -1,6 +1,7 @@
 # 0020 — Critic rubric calibration (Proposed)
 
-Status: **Proposed** (owner decision required). Claimed by the OPT track;
+Status: **Superseded by 0024** (2026-10-14: the rubric was measured and failed;
+the gate is now deterministic and the critic no longer gates). Was Proposed Claimed by the OPT track;
 next free number at claim time. (The earlier OPT draft "gate
 recalibration" carried 0018; Agent M took 0018/0019 on main, so this
 record is 0020.)
