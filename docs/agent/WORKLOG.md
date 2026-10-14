@@ -1,4 +1,15 @@
 # Worklog (append-only, newest at top)
+## 2026-10-14 · docs · OA-14 withdrawn by the owner
+
+Result: done. The owner confirmed the repo is public and there is no GitHub
+Actions billing problem, so OA-14 (billing blocking CI) was removed:
+OWNER_ACTIONS.md entry deleted; PROGRESS.md, TRACEABILITY.md and
+gates/M8.md updated to the real state (M8 merged as PR #49 `f21d23d`,
+tagged `m8-rc`; recent CI runs green incl. the PR #48 main merge). The
+earlier OA-14 wording in old WORKLOG entries and REVIEW.md F-CI-1 remains
+as historical record.
+Next step: finish B3 on `b3-gate-funnel`, then B2/B5 and B6 from REVIEW.md.
+
 ## 2026-10-14 · M8 · local implementation complete
 
 Result: all planned implementation areas are in place locally: branch shares
@@ -187,3 +198,16 @@ Proof (frozen final binary, 2026-10-13): 30/30 sync.multi_process_convergence un
 CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the slow Linux runner — the fleet's in-flight chunk work (bounded by the budget, not the deadline) drains in ~8 min there while the local 30/30 proof runs in ~90 s. The deadline is the outer safety net, NOT the progress criterion, so it moves to 720 s (ctest TIMEOUT 780); the no-progress criterion (90 s, records-or-rounds) is untouched.
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
+
+## 2026-10-14 · Mac Pro deployment — first machine live (mac@192.168.1.63)
+
+Result: deployed
+Evidence:
+- Intel Xeon E5-1650 v2, macOS 12.7.6 (matches the CI Intel/macOS-12 build). cmake 3.29.3 + ninja 1.11.1 installed in ~/bin (PATH in .zshrc/.bash_profile). Source at ~/onion (origin/main @ 7f7889c, m8-rc + b3 audit).
+- Release binary built: macos-release preset, -DCMAKE_OSX_ARCHITECTURES=x86_64 -DONION_ENABLE_OPENCL=OFF. NOTE: test targets fail to build with Apple clang 14 (gate_test.cpp:441 — C++20 structured-binding capture; CI's newer Xcode accepts it). App target builds clean. Recorded for a follow-up patch on main.
+- Corpus imported: 316,133 nodes from the owner's PlanningProcess CSVs (131 duplicated paths resolved via the propose/approve flow), Merkle VERIFIED. Data dir ~/Library/Application Support/Onion (~220 MB).
+- Node RUNNING: nohup + node run with --price-in 0.30 --price-cache 0.006 --price-out 1.20 --budget-usd 100, API serving /api/state (lanes, claims, disk growth, merkle). Profile chose SERVER rules (base_weight 1, ceiling 2000) — correct for a Mac Pro; OA-12's "laptop rules" text predates server-class hardware.
+- launchd: user-agent plist written at ~/Library/LaunchAgents/com.onion.node.plist, but the headless SSH user has no GUI domain (bootstrap gui/uid → 125), so it does not auto-load. Owner step: sudo LaunchDaemon (UserName=mac) or a GUI login + launchctl load.
+- Owner manual steps remaining: (1) node key set deepseek-key <key> + restart, (2) sudo LaunchDaemon for reboot persistence, (3) first campaign plan/start, (4) firewall allow for 7946/7947 when the fleet joins.
+
+Next step: owner's three manual steps above; then the first real campaign (one phase, small budget).
