@@ -7,7 +7,6 @@
 #include "log/log.hpp"
 #include "store/store.hpp"
 #include "store/checkpoint.hpp"
-#include "store/checkpoint.hpp"
 
 namespace {
 
@@ -140,6 +139,22 @@ TEST_F(StoreTest, SettlesAndSpendQueries) {
   EXPECT_EQ(db().spend_usd(&error), "0.0012");
 }
 
+TEST_F(StoreTest, ReportsRecentSpendRateFromHlcWallTime) {
+  const std::int64_t now_hlc =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count()
+      << 16;
+  std::string error;
+  ASSERT_TRUE(db().exec(
+      "INSERT INTO attempts(path,n,score,passed,tokens_in,tokens_cached,"
+      "tokens_out,cost,campaign,hlc,origin) VALUES "
+      "('P01',1,'0.8',1,0,0,0,'1.5','c'," +
+          std::to_string(now_hlc) + ",'dev');",
+      &error)) << error;
+  EXPECT_EQ(db().spend_rate_usd_per_hour(3600, &error), "1.5");
+}
+
 }  // namespace
 
 // ------------------------------------------------------------- checkpoints
@@ -210,5 +225,80 @@ TEST(CheckpointTest, WritesSnapshotManifestAndKeepsThree) {
   EXPECT_EQ(json["merkle_root"].get<std::string>().size(), 64u);
   EXPECT_EQ(json["vector"]["dev0000000000000001"].get<int>(), 17);
   EXPECT_FALSE(json["signature"].get<std::string>().empty());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(CheckpointTest, CompactsOldAuditRowsIntoSummaryWithoutChangingTotals) {
+  // M8: a checkpoint retains audit totals but replaces raw ATTEMPT and
+  // CRITIQUE rows older than 30 days in its *snapshot*.  The live SQLite
+  // view stays replayable from the signed log; the compacted checkpoint is
+  // what a storage-constrained joiner can retain.
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("onion_compaction_test_" +
+                    std::to_string(std::chrono::steady_clock::now()
+                                       .time_since_epoch()
+                                       .count()));
+  std::filesystem::create_directories(dir);
+  std::string error;
+  {
+    Db db(dir / "onion.db");
+    ASSERT_TRUE(db.open(&error)) << error;
+    const std::int64_t fresh_hlc =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count()
+        << 16;
+    ASSERT_TRUE(db.exec(
+        "INSERT INTO attempts(path,n,score,passed,tokens_in,tokens_cached,"
+        "tokens_out,cost,campaign,hlc,origin) VALUES "
+        "('P01',1,'0.8',1,100,20,30,'0.0012','c1',1,'dev'),"
+        "('P02',1,'0.7',1,40,0,10,'0.0004','c1'," +
+            std::to_string(fresh_hlc) + ",'dev');",
+        &error)) << error;
+    ASSERT_TRUE(db.exec(
+        "INSERT INTO critiques(path,score,issues,remove,add_,hlc,origin) VALUES "
+        "('P01','0.8','','','',2,'dev'),"
+        "('P02','0.7','','',''," + std::to_string(fresh_hlc) + ",'dev');",
+        &error)) << error;
+  }
+
+  onion::store::CheckpointWriter writer(dir, [](std::string_view bytes) {
+    return onion::log::blake2b_hex(bytes);
+  });
+  ASSERT_TRUE(writer.write(5005, {{"dev", 4}}, &error)) << error;
+
+  {
+    Db snapshot(dir / "checkpoint-5005.db");
+    ASSERT_TRUE(snapshot.open(&error)) << error;
+    auto count = [&](std::string_view table) {
+      auto statement = snapshot.prepare("SELECT COUNT(*) FROM " + std::string(table),
+                                        &error);
+      EXPECT_TRUE(statement.has_value()) << error;
+      EXPECT_TRUE(statement->step_row(&error)) << error;
+      return statement->integer_int(0);
+    };
+    EXPECT_EQ(count("attempts"), 1);   // only the fresh P02 row remains raw
+    EXPECT_EQ(count("critiques"), 1);  // only the fresh P02 row remains raw
+
+    auto summary = snapshot.prepare(
+        "SELECT attempts, critiques, passed, tokens_in, tokens_cached, "
+        "tokens_out, cost_nanos FROM checkpoint_summaries WHERE path='P01';",
+        &error);
+    ASSERT_TRUE(summary.has_value()) << error;
+    ASSERT_TRUE(summary->step_row(&error)) << error;
+    EXPECT_EQ(summary->integer_int(0), 1);
+    EXPECT_EQ(summary->integer_int(1), 1);
+    EXPECT_EQ(summary->integer_int(2), 1);
+    EXPECT_EQ(summary->integer(3), 100);
+    EXPECT_EQ(summary->integer(4), 20);
+    EXPECT_EQ(summary->integer(5), 30);
+    EXPECT_EQ(summary->integer(6), 1200000);  // exact USD nanounits
+    EXPECT_EQ(snapshot.spend_usd(&error), "0.0016");
+  }  // Close SQLite before Windows removes the temporary directory.
+
+  const auto manifest = nlohmann::json::parse(
+      std::ifstream(dir / "checkpoint-5005.db.manifest"));
+  EXPECT_EQ(manifest["compacted_attempts"], 1);
+  EXPECT_EQ(manifest["compacted_critiques"], 1);
   std::filesystem::remove_all(dir);
 }

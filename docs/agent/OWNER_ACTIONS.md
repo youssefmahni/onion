@@ -71,6 +71,18 @@ Cost / duration: ~30 minutes, no money.
 
 - None yet.
 
+### OA-17 · Approve or decline a DuckDB/Parquet export · M8 · status: open
+
+Why: M8 deliberately keeps Parquet export out because DuckDB is a substantial
+new dependency. Checkpoint summaries and the JSON dashboard provide the
+implemented scale/audit path without it.
+
+Steps: reply with either "keep Parquet out" or "approve DuckDB/Parquet",
+including any preferred export directory, retention and schema requirements.
+
+Cost / duration: none to decline; approval needs a follow-up implementation
+and dependency review.
+
 ---
 
 ### OA-8 · Decide review-children storage (decision 0008 §3) · M3 · status: open

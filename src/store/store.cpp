@@ -1,5 +1,7 @@
 #include "store.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -65,6 +67,19 @@ void set_error(std::string* error, sqlite3* handle, std::string_view prefix) {
   std::ostringstream out;
   out << prefix << ": " << (handle ? sqlite3_errmsg(handle) : "no database");
   *error = out.str();
+}
+
+bool has_checkpoint_summaries(sqlite3* handle) {
+  sqlite3_stmt* statement = nullptr;
+  if (sqlite3_prepare_v2(
+          handle,
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+          "name='checkpoint_summaries';",
+          -1, &statement, nullptr) != SQLITE_OK)
+    return false;
+  const bool exists = sqlite3_step(statement) == SQLITE_ROW;
+  sqlite3_finalize(statement);
+  return exists;
 }
 
 }  // namespace
@@ -440,6 +455,18 @@ std::vector<Node> Db::nodes_with_path_prefix(std::string_view prefix,
   return nodes;
 }
 
+std::optional<std::string> Db::review_state(std::string_view path,
+                                            std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT state FROM reviews WHERE path = ?1;", error);
+  if (!stmt) return std::nullopt;
+  std::string bind_error;
+  stmt->bind(1, std::string(path), &bind_error);
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return std::nullopt;
+  return stmt->text(0);
+}
+
 std::vector<Review> Db::open_reviews(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT path, reason, state, note, atomic, hlc, origin FROM reviews "
@@ -532,9 +559,52 @@ std::string Db::spend_usd(std::string* error) const {
   if (!stmt) return "0";
   std::string step_error;
   if (!stmt->step_row(&step_error)) return "0";
-  const double value = sqlite3_column_double(stmt->handle(), 0);
+  double value = sqlite3_column_double(stmt->handle(), 0);
+  // A cloned checkpoint has the older raw rows folded into exact integer
+  // nanounit totals. Include them so it retains lifetime spend accounting.
+  if (has_checkpoint_summaries(handle_)) {
+    std::optional<Statement> summary = prepare(
+        "SELECT COALESCE(SUM(CAST(cost_nanos AS REAL)), 0.0) "
+        "FROM checkpoint_summaries;",
+        error);
+    if (!summary || !summary->step_row(&step_error)) return "0";
+    value += sqlite3_column_double(summary->handle(), 0) / 1000000000.0;
+  }
   char buffer[40];
   std::snprintf(buffer, sizeof(buffer), "%.10f", value);
+  std::string text(buffer);
+  while (!text.empty() && text.back() == '0') text.pop_back();
+  if (!text.empty() && text.back() == '.') text.pop_back();
+  return text.empty() ? "0" : text;
+}
+
+std::string Db::spend_rate_usd_per_hour(std::int64_t window_seconds,
+                                        std::string* error) const {
+  if (window_seconds <= 0) {
+    if (error) *error = "spend-rate window must be positive";
+    return "0";
+  }
+  const std::int64_t now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  const std::int64_t window_ms = window_seconds * 1000;
+  const std::int64_t cutoff_ms = std::max<std::int64_t>(0, now_ms - window_ms);
+  const std::int64_t cutoff_hlc = cutoff_ms << 16;
+  std::optional<Statement> stmt = prepare(
+      "SELECT COALESCE(SUM(CAST(cost AS REAL)), 0.0) FROM attempts "
+      "WHERE hlc >= ?1;",
+      error);
+  if (!stmt) return "0";
+  std::string step_error;
+  if (!stmt->bind(1, cutoff_hlc, &step_error) || !stmt->step_row(&step_error)) {
+    if (!step_error.empty()) set_error(error, handle_, "spend-rate query failed");
+    return "0";
+  }
+  const double total = sqlite3_column_double(stmt->handle(), 0);
+  const double hourly = total * 3600.0 / static_cast<double>(window_seconds);
+  char buffer[40];
+  std::snprintf(buffer, sizeof(buffer), "%.10f", hourly);
   std::string text(buffer);
   while (!text.empty() && text.back() == '0') text.pop_back();
   if (!text.empty() && text.back() == '.') text.pop_back();

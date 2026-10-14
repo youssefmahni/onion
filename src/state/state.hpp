@@ -172,6 +172,15 @@ class StateWriter {
   // Returns the claimer's device id, or empty.
   std::string claim_holder(std::string_view path, std::string_view my_device,
                            std::int64_t now_ms) const;
+  struct ClaimInfo {
+    std::string path;
+    std::string holder;
+    std::int64_t expires_in_ms{};
+  };
+  // Snapshot of active leases for /api/state.  Expiry is expressed against
+  // this receiver's monotonic clock, never the claimer's clock.
+  std::vector<ClaimInfo> active_claims(std::int64_t now_ms) const;
+  const std::string& own_origin() const { return options_.origin; }
   // M7 re-expansion lock: whether any ancestor of the path has an open
   // REEXPAND (its subtree pauses until the re-expansion settles).
   bool reexpand_open(std::string_view path) const;
@@ -260,6 +269,7 @@ class StateWriter {
   // uses base 3, so the fork tests can kill at every commit-order step (C4).
   bool append_batch(std::vector<log::Record> records, std::string* error,
                     int hook_step_base = 1);
+  void maybe_write_checkpoint();
   void update_applied(std::string_view origin,
                       const std::vector<log::Record>& records);
   void record_batch(std::string_view origin, std::uint64_t number,

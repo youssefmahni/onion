@@ -1,5 +1,19 @@
 # Traceability — DESIGN.md rules → tests
 
+## M8 scope: DESIGN.md › Depth without a cap, Storage, Campaign planning, dashboard state
+
+| Rule | Test(s) | Status |
+|---|---|---|
+| 50% branch share and proportional starting pools end a single chain; no L9 ceiling | `EngineTest.SingleChainUnderAFiftyPercentShareTerminates`, `EngineTest.FunnelCampaignPastL9EndsWithinItsPools`, `PoolLedger.*` | ✅ local |
+| A depth checkpoint is a no-spend `NEEDS_REVIEW`; accept/retry releases the ticket | `EngineTest.DepthCheckpointSpendsNothingAndReleasesOnAccept` | ✅ local |
+| A model that never reports atomic still terminates | `EngineTest.FakeModelThatNeverSaysAtomicStillTerminates` | ✅ local |
+| Checkpoint snapshot compacts >30-day ATTEMPT/CRITIQUE rows while retaining exact totals | `CheckpointTest.CompactsOldAuditRowsIntoSummaryWithoutChangingTotals` | ✅ local |
+| Cost and oplog growth use measurements; observed growth must be within ±25% | `MeasureParams.ReadsCompressedAndActiveLogFootprintPerSettledNode`, `PlanLogGrowth.*` | ✅ local |
+| `/api/state` exposes lanes, claims/steals, review backlog, spend rate, disk use and quality guard; dashboard renders them | `m8.observability_state`, `ApiTest.*` | ✅ local |
+| Light funnel starts at L6 | `ParseCampaign.AcceptsAValidFile`, decision 0017 | ✅ local |
+
+CI status is pending OA-14; see `docs/agent/gates/M8.md`.
+
 ## M7 scope: DESIGN.md › Membership, Joining, Eviction, Stealing, Eligibility
 
 | Rule | Test(s) | Status |
