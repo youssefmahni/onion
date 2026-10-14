@@ -722,6 +722,8 @@ TEST_F(EngineTest, AuditSamplesCommittedNodesWithoutBlocking) {
   engine.review_accept(open[0].path, campaign);
   EXPECT_EQ(writer_->audits_open("c1"), result.settled - 1);
   EXPECT_FALSE(writer_->leaf(open[0].path));
+}
+
 TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {
   // M8 agent-exit criterion (decision 0020): a single chain halves its
   // pool per level, so it ends in an allowance-spent leaf — even though

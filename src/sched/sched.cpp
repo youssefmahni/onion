@@ -908,7 +908,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                          {"end", "allowance spent"},
                          {"campaign", spec.id}})}});
           writer.sync();
-          settled_samples.push_back(SettledSample{0, 0.0});
+          settled_samples.push_back(SettledSample{0, 0});
           result.leaves++;  // the allowance leaf counts like cannot-split
           it = tickets.erase(it);
           continue;
@@ -1694,6 +1694,8 @@ bool audit_sampled(std::string_view campaign, std::string_view path,
   const std::int64_t threshold =
       static_cast<std::int64_t>(audit_rate * 1000000.0);
   return static_cast<std::int64_t>(bucket) < threshold;
+}
+
 std::map<std::string, std::int64_t> compute_starting_pools(
     state::StateWriter& writer, const CampaignSpec& spec,
     std::string* error) {

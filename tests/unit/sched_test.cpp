@@ -593,6 +593,8 @@ TEST(AuditSampling, DeterministicAndRateMonotonic) {
   // Roughly the advertised rate (within a generous band).
   EXPECT_LT(low_hits, 80);
   EXPECT_GT(low_hits, 4);
+}
+
 TEST(PlanLogGrowth, ProjectsMeasuredBytesPerSettledNodeWithinTolerance) {
   // M8: the projection is derived from the actual on-disk log footprint,
   // not an assumed record size.  Two settled nodes consumed 1,000 bytes, so
