@@ -1326,6 +1326,11 @@ TEST_F(StateWriterTest, ClaimsExpireFromTheReceiversClock) {
   // Un-expired: the claimer is visible.
   EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev0000000000000001", now),
             "dev00000000000000aa");
+  const auto claims = writer_->active_claims(now);
+  ASSERT_EQ(claims.size(), 1u);
+  EXPECT_EQ(claims[0].path, "P01-IN01");
+  EXPECT_EQ(claims[0].holder, "dev00000000000000aa");
+  EXPECT_GT(claims[0].expires_in_ms, 0);
   // Our own device's view: a claim by someone else holds; our own claims
   // don't block us.
   EXPECT_EQ(writer_->claim_holder("P01-IN01", "dev00000000000000aa", now),

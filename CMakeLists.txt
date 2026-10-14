@@ -293,6 +293,8 @@ if(BUILD_TESTING)
   gtest_discover_tests(onion_llm_test)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME m8.observability_state COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/m8_observability_test.py" "$<TARGET_FILE:data_depot>")
+  set_tests_properties(m8.observability_state PROPERTIES TIMEOUT 45)
   add_test(NAME fake_deepseek.smoke COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/fake_deepseek_test.py")
   add_test(NAME fake_deepseek.concurrent_1000 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/fake_deepseek_load_test.py")
   set_tests_properties(fake_deepseek.concurrent_1000 PROPERTIES TIMEOUT 90)

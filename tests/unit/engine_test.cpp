@@ -75,9 +75,11 @@ SyncAsk chain_fake(int max_depth) {
     // similarity, so "Chain Link 1" vs "Chain Link 2" (0.92) would be
     // rejected as a repeated ancestor.
     static const char* kChainNames[] = {
-        "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"};
+        "Alpha",   "Beta",  "Gamma", "Delta", "Epsilon", "Zeta",  "Eta",
+        "Theta",   "Iota",  "Kappa", "Lambda", "Mu",     "Nu",    "Xi",
+        "Omicron", "Pi"};
     const auto chain_title = [](int level) {
-      return "Chain Link " + std::string(kChainNames[level % 7]);
+      return "Chain Link " + std::string(kChainNames[level % 16]);
     };
     if (prompt.find("Can this node be split") != std::string::npos) {
       const bool splittable =
@@ -630,4 +632,98 @@ TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {
   EXPECT_EQ(chain_leaf_count, 1);
   EXPECT_EQ(chain_leaf_layer, 3);
   EXPECT_GE(result.leaves, 5);  // dead-end siblings + the allowance leaf
+}
+
+TEST_F(EngineTest, DepthCheckpointSpendsNothingAndReleasesOnAccept) {
+  // M8 exit criterion: a depth checkpoint is written as NEEDS_REVIEW
+  // (reason depth checkpoint) WITHOUT spending an attempt; accepting it
+  // releases the ticket until the next checkpoint. Checkpoints every 2
+  // levels from layer 1, so the tree pauses at L1 before any child is
+  // attempted.
+  seed_root();
+  Budget budget("10");
+  // Fleet mode: a drained single-device run CLOSES the campaign (0010);
+  // the fleet drain keeps it running between the accept and the second
+  // run. The device owns everything (huge weight).
+  Engine engine(Engine::Options{*writer_, funnel_fake(8), budget, 1,
+                                "dev0000000000000001", "0.001",
+                                std::nullopt, 0,
+                                {{"dev0000000000000001", 100.0},
+                                 {"dev0000000000000002", 0.1}},
+                                "dev0000000000000001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 10000;
+  campaign.structure = true;
+  campaign.depth_checkpoint_from = 1;
+  campaign.depth_checkpoint_every = 2;
+  // The gate starts closed (0014 amendment): the first run drains cold,
+  // one completed round opens it, the next run does the work.
+  const Engine::RunResult cold = engine.run(campaign, nullptr);
+  EXPECT_EQ(cold.end_reason, "drained");
+  engine.note_sync_round();
+  const Engine::RunResult first = engine.run(campaign, nullptr);
+  // The root settles (attempts=1); its L1 children hit the checkpoint
+  // and are paused un-attempted: exactly 3 open checkpoint reviews, no
+  // attempts beyond the root's.
+  EXPECT_EQ(first.attempts, 1);
+  EXPECT_EQ(first.settled, 1);
+  EXPECT_EQ(first.reviews, 3);
+  std::string error;
+  const auto open = writer_->db().open_reviews(&error);
+  ASSERT_EQ(open.size(), 3u);
+  for (const onion::store::Review& review : open)
+    EXPECT_EQ(review.reason, "depth checkpoint");
+
+  // Accept one: it becomes a normal ticket (attempted, settled) and its
+  // children hit the NEXT checkpoint (L3 — every 2 from 1).
+  engine.review_accept(open[0].path, campaign);
+  engine.note_sync_round();
+  const Engine::RunResult second = engine.run(campaign, nullptr);
+  EXPECT_GT(second.attempts, 1);
+  EXPECT_GT(second.settled, 1);
+  EXPECT_FALSE(writer_->needs_review(open[0].path));
+}
+
+TEST_F(EngineTest, FakeModelThatNeverSaysAtomicStillTerminates) {
+  // M8 exit criterion: no "atomic" ever leaves the funnel; the branch
+  // shares must end the tree anyway (each level halves its pool).
+  seed_root();
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(12, nullptr, 0.9, 999),
+                                budget, 1, "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 16;
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  // The tree ends by itself (allowance spent or cannot-split) with
+  // nothing atomic and a bounded amount of work.
+  EXPECT_EQ(result.end_reason, "drained");
+  EXPECT_EQ(result.atomic, 0);
+  EXPECT_GT(result.settled, 0);
+  EXPECT_LE(result.attempts, campaign.loop_budget);
+}
+
+TEST_F(EngineTest, FunnelCampaignPastL9EndsWithinItsPools) {
+  // M8 exit criterion: a funnel campaign growing past L9 (the old cap)
+  // ends within its pools — the branch shares replace the depth limit.
+  seed_root();
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, chain_fake(13), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  // A pool of 1024 halves per level (1024 -> 511 -> 255 -> ... -> 1 ->
+  // 0): the single chain carries past the old L9 cap and ends on its
+  // own allowance, not on a depth limit.
+  campaign.loop_budget = 1024;
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_EQ(result.end_reason, "drained");
+  // Nodes past the old L9 cap exist...
+  std::string error;
+  int max_layer = 0;
+  for (const onion::store::Node& node : writer_->db().all_nodes(&error))
+    max_layer = std::max(max_layer, node.layer);
+  EXPECT_GT(max_layer, 9);
+  // ...and the spend stayed within the pools (attempts <= budget).
+  EXPECT_LE(result.attempts, campaign.loop_budget);
 }

@@ -34,10 +34,29 @@
   <table>
     <tr><td>running</td><td id="node-running"></td></tr>
     <tr><td>spend (USD)</td><td id="spend"></td></tr>
+    <tr><td>spend rate (USD/hour)</td><td id="spend-rate"></td></tr>
     <tr><td>settled nodes</td><td id="settled"></td></tr>
-    <tr><td>lanes</td><td id="lanes"></td></tr>
+    <tr><td>review backlog</td><td id="review-backlog"></td></tr>
+    <tr><td>quality guard</td><td id="quality-guard"></td></tr>
+    <tr><td>local data footprint</td><td id="data-bytes"></td></tr>
   </table>
   <p><button id="stop">stop node</button></p>
+</section>
+
+<section>
+  <h2>Lanes</h2>
+  <table id="lanes"><tr><th>device</th><th>open tickets</th></tr></table>
+</section>
+
+<section>
+  <h2>Claims and steals</h2>
+  <p id="steals-active"></p>
+  <table id="claims"><tr><th>path</th><th>holder</th><th>lease remaining</th></tr></table>
+</section>
+
+<section>
+  <h2>Log footprint by device</h2>
+  <table id="disk"><tr><th>origin</th><th>bytes</th></tr></table>
 </section>
 
 <script>
@@ -112,8 +131,49 @@ function render(state) {
   document.getElementById("node-running").textContent =
     state.node && state.node.running ? "yes" : "no";
   document.getElementById("spend").textContent = state.spend_usd || "0";
+  document.getElementById("spend-rate").textContent =
+    state.spend_rate_usd_per_hour || "0";
   document.getElementById("settled").textContent = state.settled_nodes || 0;
-  document.getElementById("lanes").textContent = (state.lanes || []).join(", ");
+  document.getElementById("review-backlog").textContent = state.review_backlog || 0;
+  const quality = state.quality_guard || {};
+  document.getElementById("quality-guard").textContent =
+    quality.samples ? `${quality.flagged ? "flagged" : "healthy"}; score ${Number(quality.rolling_score || 0).toFixed(2)}, failures ${(100 * Number(quality.failure_rate || 0)).toFixed(0)}%` : "no attempts yet";
+  document.getElementById("data-bytes").textContent = formatBytes(state.data_dir_bytes || 0);
+
+  const lanes = document.getElementById("lanes");
+  lanes.innerHTML = "<tr><th>device</th><th>open tickets</th></tr>";
+  for (const lane of state.lanes || []) {
+    const row = lanes.insertRow();
+    row.insertCell().textContent = lane.device_id;
+    row.insertCell().textContent = lane.open_tickets;
+  }
+
+  document.getElementById("steals-active").textContent =
+    `active steals owned by this node: ${state.steals_active || 0}`;
+  const claims = document.getElementById("claims");
+  claims.innerHTML = "<tr><th>path</th><th>holder</th><th>lease remaining</th></tr>";
+  for (const claim of state.claims || []) {
+    const row = claims.insertRow();
+    row.insertCell().textContent = claim.path;
+    row.insertCell().textContent = claim.holder;
+    row.insertCell().textContent = `${Math.ceil(Number(claim.expires_in_ms || 0) / 1000)} s`;
+  }
+
+  const disk = document.getElementById("disk");
+  disk.innerHTML = "<tr><th>origin</th><th>bytes</th></tr>";
+  for (const [origin, bytes] of Object.entries(state.log_bytes_by_device || {})) {
+    const row = disk.insertRow();
+    row.insertCell().textContent = origin;
+    row.insertCell().textContent = formatBytes(bytes);
+  }
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
 async function refresh() {

@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -46,6 +49,7 @@ TEST(ParseCampaign, AcceptsAValidFile) {
   EXPECT_EQ(spec->scope.size(), 1u);
   EXPECT_EQ(spec->loop_budget, 200);
   EXPECT_EQ(spec->chunk, 50);
+  EXPECT_EQ(spec->light_funnel_from, 6);  // decision 0017
 }
 
 TEST(ParseCampaign, AcceptsTheW5VariantFields) {
@@ -504,6 +508,63 @@ TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
   EXPECT_NE(report.find("total new_nodes=6"), std::string::npos);
   EXPECT_NE(report.find("cost peak="), std::string::npos);
   EXPECT_NE(report.find("spend/hour peak="), std::string::npos);
+}
+
+TEST(PlanLogGrowth, ProjectsMeasuredBytesPerSettledNodeWithinTolerance) {
+  // M8: the projection is derived from the actual on-disk log footprint,
+  // not an assumed record size.  Two settled nodes consumed 1,000 bytes, so
+  // a two-node campaign projects 1,000 bytes and a 1,200-byte run passes
+  // the documented ±25% acceptance band.
+  onion::sched::PlanParams params;
+  params.children_kept = 0.0;
+  params.atomic_share = 0.0;
+  params.attempts_avg = 1.0;
+  params.calls_per_attempt = 1.0;
+  params.precheck_calls = 0.0;
+  params.log_bytes_per_node = 500.0;
+  const auto plan = onion::sched::plan_campaign({2}, 0, params);
+  EXPECT_EQ(plan.expected_log_growth_bytes, 1000);
+  EXPECT_TRUE(onion::sched::log_growth_matches_projection(1200, plan));
+  EXPECT_FALSE(onion::sched::log_growth_matches_projection(1300, plan));
+}
+
+TEST(PlanLogGrowth, DoesNotDoubleCountRetriesAsNewNodes) {
+  onion::sched::PlanParams params;
+  params.children_kept = 0.0;
+  params.atomic_share = 0.0;
+  params.attempts_avg = 3.0;
+  params.calls_per_attempt = 1.0;
+  params.precheck_calls = 0.0;
+  params.log_bytes_per_node = 500.0;
+  const auto plan = onion::sched::plan_campaign({2}, 0, params);
+  EXPECT_EQ(plan.total_expanded_nodes, 2);
+  EXPECT_EQ(plan.total_attempts, 6);
+  EXPECT_EQ(plan.expected_log_growth_bytes, 1000);
+}
+
+TEST(MeasureParams, ReadsCompressedAndActiveLogFootprintPerSettledNode) {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("onion_log_growth_test_" +
+                    std::to_string(std::chrono::steady_clock::now()
+                                       .time_since_epoch()
+                                       .count()));
+  std::filesystem::create_directories(dir / "oplog" / "dev");
+  onion::store::Db db(dir / "onion.db");
+  std::string error;
+  ASSERT_TRUE(db.open(&error)) << error;
+  ASSERT_TRUE(db.exec(
+      "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, hlc, origin) VALUES "
+      "('P01', 1, 0, 1, '0.8', 'c', 1, 'dev'),"
+      "('P02', 1, 0, 1, '0.8', 'c', 2, 'dev');",
+      &error)) << error;
+  {
+    std::ofstream log(dir / "oplog" / "dev" / "1.log", std::ios::binary);
+    log << std::string(1000, 'x');
+  }
+  const auto params = onion::sched::measure_params(db, &error);
+  EXPECT_EQ(error, "");
+  EXPECT_DOUBLE_EQ(params.log_bytes_per_node, 500.0);
+  std::filesystem::remove_all(dir);
 }
 
 TEST(PoolLedger, SingleChainHalvesEveryLevelInEveryOrder) {

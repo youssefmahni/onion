@@ -152,6 +152,11 @@ class Db {
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
                                            std::string* error) const;
   std::vector<Review> open_reviews(std::string* error) const;
+  // The review row's state for one path ("open" | "decided"), empty when
+  // the path never had a review (M8 depth checkpoints: a decided review
+  // means the pause was released and the node must be attempted).
+  std::optional<std::string> review_state(std::string_view path,
+                                          std::string* error) const;
   std::vector<Campaign> campaigns(std::string* error) const;
   std::vector<Settle> settles(std::string* error) const;
   // All ATTEMPT audit rows, for measured cost parameters (decision 0016).
@@ -160,6 +165,11 @@ class Db {
   // The largest numeric TK id value (TK<digits>) in nodes.
   std::int64_t max_tk_value(std::string* error) const;
   std::string spend_usd(std::string* error) const;
+  // Recent observed spend extrapolated to USD/hour.  The HLC physical
+  // component is the wall-clock millisecond timestamp, so this remains
+  // portable across platforms and replay order.
+  std::string spend_rate_usd_per_hour(std::int64_t window_seconds,
+                                      std::string* error) const;
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,
                   std::string* error) const;

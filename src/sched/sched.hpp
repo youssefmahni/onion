@@ -53,6 +53,12 @@ struct CampaignSpec {
   // off (pre-M8 campaigns).
   double branch_share{0.5};
   std::map<std::string, std::int64_t> pools;
+  // M8 depth checkpoint (DESIGN › Depth checkpoint): a ticket at every
+  // `depth_checkpoint_every` levels past `depth_checkpoint_from` is not
+  // started — the scheduler writes NEEDS_REVIEW (reason depth
+  // checkpoint) without spending an attempt. Both 0 = off.
+  int depth_checkpoint_from{0};
+  int depth_checkpoint_every{0};
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
@@ -140,6 +146,9 @@ struct PlanParams {
   // from this rate, not from answers/s, because the funnel's calls average
   // about 1,400 output tokens while the probe's tiny answers were about 365.
   double output_tokens_per_s{60000.0};
+  // Current oplog footprint divided by settled nodes.  Empty/new stores use
+  // this conservative fallback until enough real records exist to measure it.
+  double log_bytes_per_node{2048.0};
 };
 
 struct LevelPlan {
@@ -159,6 +168,9 @@ struct LevelPlan {
 struct CampaignPlan {
   std::vector<LevelPlan> levels;
   std::int64_t total_new_nodes{};
+  // The number of work nodes the plan will expand.  This is distinct from
+  // total_attempts because retries produce more attempts, not more nodes.
+  std::int64_t total_expanded_nodes{};
   std::int64_t total_attempts{};
   std::int64_t total_calls{};
   std::int64_t tokens_in_miss{};
@@ -170,6 +182,7 @@ struct CampaignPlan {
   bool saturated{false};  // int64 clamped at some level
   double spend_per_hour_peak{};
   double spend_per_hour_offpeak{};
+  std::int64_t expected_log_growth_bytes{};
 };
 
 // Projects a campaign over `target_depth` levels (levels 0..target_depth are
@@ -197,6 +210,12 @@ CampaignPlan plan_grow_levels(std::int64_t expandable_total, int levels,
 // with no measured data keeps its clearly-labelled default.  Prices, the
 // rate and the cache-hit ratio always keep their configured values.
 PlanParams measure_params(const store::Db& db, std::string* error);
+
+// M8 gate: actual log growth must stay within ±25% of the projection.  A
+// zero projection only matches zero observed growth.
+bool log_growth_matches_projection(std::int64_t observed_bytes,
+                                   const CampaignPlan& plan,
+                                   double tolerance = 0.25);
 
 // Renders a plan as a compact text table (for `campaign plan` and the
 // `campaign start` confirmation).

@@ -270,7 +270,7 @@ Scores and weights are stored as the exact decimal text from the op, so every OS
 SELECT * FROM nodes WHERE path = :p OR (path >= :p || '-' AND path < :p || '.');
 ```
 
-**Checkpoints.** `VACUUM INTO 'checkpoint-<hlc>.db'` produces a compact snapshot. Its manifest holds the version vector, a Merkle root over `nodes` sorted by path, and two signatures: the device that made it, and a second device that rebuilt the same root independently.
+**Checkpoints.** `VACUUM INTO 'checkpoint-<hlc>.db'` produces a compact snapshot. Its manifest holds the version vector, a Merkle root over `nodes` sorted by path, and two signatures: the device that made it, and a second device that rebuilt the same root independently. Before signing, a checkpoint copy folds ATTEMPT and CRITIQUE rows older than 30 days into exact per-path summary totals; the live store and signed segments stay replayable. See decision 0022.
 
 ## Op log format
 
@@ -501,7 +501,7 @@ The tree has no fixed depth limit. Four rules end every branch, so it always sto
 | No repeating an ancestor | A child is rejected if its canonical title matches its parent at similarity ≥ 0.85, or any higher ancestor at ≥ 0.95. The stricter threshold higher up avoids rejecting legitimately narrower children that share words | Cycles become impossible |
 | Cannot split, then leaf | The pre-check says no, or no attempt yields at least 3 distinct valid children: the node becomes a leaf (`SETTLE` with end = cannot split) | Decomposition stops where the ideas run out |
 | Branch share | Each scope root has a pool of attempts. A child branch may spend at most 50% of what its parent's pool has left when it starts; what leaves and short branches do not use stays in the pool for their siblings. A node whose share cannot pay one attempt becomes a leaf (end = allowance spent) | A single chain can only halve its pool per level, so it ends; broad trees share the pool instead of dividing it |
-| Depth checkpoint (optional) | A ticket at every Nth level past L9 (L14, L19, … with N = 5) is not started; the scheduler writes `NEEDS_REVIEW` (reason depth checkpoint) without spending an attempt, and accepting it releases that subtree until the next checkpoint | You decide on very deep branches |
+| Depth checkpoint (optional) | A campaign that sets `depth_checkpoint_from: 14` and `depth_checkpoint_every: 5` pauses tickets at L14, L19, …; it writes `NEEDS_REVIEW` (reason depth checkpoint) without spending an attempt, and accepting or retrying releases that ticket until the next checkpoint. Omitted/zero fields mean off for compatibility with pre-M8 campaign records. | You decide on very deep branches |
 
 - **Why a share, not an even split.** Dividing a pool evenly among 20 to 100 children shrinks it by that factor at each level, which would end most branches about 3 levels down, shallower than the old L9 cap. A 50% share lets a 10,000-attempt pool support a single chain about 13 levels deep while still guaranteeing an end.
 - **Starting pools.** A campaign splits its loop budget across its scope roots in proportion to each root's open tickets, so roots that already exist in the corpus get a pool too.
@@ -637,7 +637,7 @@ Sync is pull-only and incremental: devices compare version vectors, the DNS SOA-
 
 **Anti-entropy (every 10 min).** Compare per-origin Merkle roots with one peer. A mismatch at the same `seq` range means local corruption: descend the tree to the bad leaves and re-fetch only those records.
 
-**Checkpoints.** Each device writes one every 6 hours or every 100,000 applied ops, whichever comes first, and keeps the last 3. New and long-absent devices clone from one instead of replaying every log from record 1.
+**Checkpoints.** Each device writes one every 6 hours or every 100,000 applied ops, whichever comes first, and keeps the last 3. New and long-absent devices clone from one instead of replaying every log from record 1. A failed checkpoint remains due and is retried; compacted audit summaries preserve lifetime totals on a clone (decision 0022).
 
 **Push-before-settle (off by default).** A sudden shutdown keeps the disk, so committed records survive and sync after restart. Only a dead disk loses the last 15 s; turn this on if even that is unacceptable, at the cost of one sync round per node.
 
@@ -706,7 +706,7 @@ Everything runs in one process, `data_depot node run`: workers, sync, gossip and
 | `vision.py` | Removed: image understanding is dropped |
 | rebuild_json.py, gen_onion_html.py | Replaced by SQLite queries; the review page loads subtrees lazily |
 | gen_funnel_report.py, demo_preview.cpp | Removed (they carry stale paths and model ids) |
-| dashboard.html, tui.py | Kept; read the new `/api/state` with campaigns, reviews, profiles, lanes and spend |
+| dashboard.html, tui.py | Kept; read the new `/api/state` with campaigns, reviews, profiles, lanes, claims, steals, spend rate, disk footprint and quality guard |
 | onion_gl | Optional, Linux with X11 only; not ported |
 
 ## Security model

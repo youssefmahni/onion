@@ -9,10 +9,12 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
 #include <memory>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -172,8 +174,32 @@ onion::log::Record make_record(std::string type, nlohmann::json payload) {
   return record;
 }
 
+std::int64_t monotonic_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::uintmax_t directory_bytes(const std::filesystem::path& root) {
+  std::error_code error;
+  std::uintmax_t total = 0;
+  if (!std::filesystem::exists(root, error)) return 0;
+  for (std::filesystem::recursive_directory_iterator it(root, error), end;
+       !error && it != end; it.increment(error)) {
+    if (!it->is_regular_file(error)) continue;
+    const std::uintmax_t size = it->file_size(error);
+    if (error) break;
+    if (size > std::numeric_limits<std::uintmax_t>::max() - total)
+      return std::numeric_limits<std::uintmax_t>::max();
+    total += size;
+  }
+  return total;
+}
+
 json state_json(onion::state::StateWriter& writer, int api_port,
-                bool* running, std::uint64_t sync_rounds_completed = 0) {
+                bool* running,
+                const std::vector<onion::sched::LaneMember>& lane_members,
+                std::uint64_t sync_rounds_completed = 0) {
   std::string error;
   json result;
   result["node"]["running"] = *running;
@@ -187,6 +213,8 @@ json state_json(onion::state::StateWriter& writer, int api_port,
   // transactions (and never shares a connection across handler threads).
   const onion::store::Db& read = writer.read_db();
   result["spend_usd"] = read.spend_usd(&error);
+  result["spend_rate_usd_per_hour"] =
+      read.spend_rate_usd_per_hour(3600, &error);
   // Convergence observables: the applied vector and the Merkle root.
   json vector = json::object();
   for (const auto& [origin, seq] : onion::state::StateWriter::vector_on(read))
@@ -236,6 +264,7 @@ json state_json(onion::state::StateWriter& writer, int api_port,
     reviews.push_back(std::move(entry));
   }
   result["reviews"] = std::move(reviews);
+  result["review_backlog"] = result["reviews"].size();
   std::int64_t nodes = 0;
   for (const auto& settle : read.settles(&error)) {
     (void)settle;
@@ -251,7 +280,91 @@ json state_json(onion::state::StateWriter& writer, int api_port,
                      {"incoming_hash", fork.incoming_hash},
                      {"stored_hash", fork.stored_hash}});
   result["forks"] = std::move(forks);
-  result["lanes"] = json::array({"local"});  // M3: one lane
+
+  // M8 observability: current active claims are receiver-clock leases.
+  // An operator sees both the holder and the remaining local lease instead
+  // of trying to compare unsynchronised wall clocks across devices.
+  json claims = json::array();
+  std::size_t steals_active = 0;
+  for (const auto& claim : writer.active_claims(monotonic_ms())) {
+    claims.push_back({{"path", claim.path},
+                      {"holder", claim.holder},
+                      {"expires_in_ms", claim.expires_in_ms}});
+    if (claim.holder == writer.own_origin()) ++steals_active;
+  }
+  result["claims"] = std::move(claims);
+  result["steals_active"] = steals_active;
+
+  // Count the current open work per live rendezvous lane.  A missing live
+  // member list is the single-node case, not an error.
+  std::vector<onion::sched::LaneMember> lanes = lane_members;
+  if (lanes.empty()) lanes.push_back({writer.own_origin(), 1.0});
+  std::map<std::string, std::int64_t> lane_counts;
+  for (const auto& member : lanes) lane_counts.emplace(member.device_id, 0);
+  std::vector<std::string> review_paths;
+  for (const auto& review : read.open_reviews(&error))
+    if (review.state == "open" || review.state.empty())
+      review_paths.push_back(review.path);
+  for (const auto& campaign : writer.campaigns()) {
+    if (campaign.state != "running") continue;
+    const auto raw_spec = json::parse(campaign.spec, nullptr, false);
+    std::string parse_error;
+    const auto spec = onion::sched::parse_campaign(raw_spec, &parse_error);
+    if (!spec) continue;  // a malformed historic spec must not break state
+    std::vector<onion::store::Node> scoped_nodes;
+    if (spec->scope.empty()) {
+      scoped_nodes = all_nodes;
+    } else {
+      std::set<std::string> seen_paths;
+      for (const std::string& scope : spec->scope) {
+        const auto nodes = read.nodes_with_path_prefix(scope, &error);
+        for (const auto& node : nodes)
+          if (seen_paths.insert(node.path).second)
+            scoped_nodes.push_back(node);
+      }
+    }
+    const auto tickets = onion::sched::order_tickets(
+        scoped_nodes,
+        [&](std::string_view path) { return writer.settled(path); },
+        [&](std::string_view path) { return writer.leaf(path); },
+        review_paths, *spec);
+    for (const auto& ticket : tickets) {
+      const auto owner = onion::sched::lane_owner(ticket.path, lanes);
+      if (owner) ++lane_counts[*owner];
+    }
+  }
+  result["lanes"] = json::array();
+  for (const auto& [device_id, open_tickets] : lane_counts)
+    result["lanes"].push_back(
+        {{"device_id", device_id}, {"open_tickets", open_tickets}});
+
+  // Disk usage is reported per origin directory because a replica retains
+  // both its own log and compacted/synchronised copies from peers.
+  json disk_by_device = json::object();
+  const auto oplog = writer.data_dir() / "oplog";
+  std::error_code directory_error;
+  if (std::filesystem::exists(oplog, directory_error))
+    for (const auto& entry : std::filesystem::directory_iterator(oplog,
+                                                                    directory_error))
+      if (entry.is_directory(directory_error))
+        disk_by_device[entry.path().filename().string()] =
+            directory_bytes(entry.path());
+  result["log_bytes_by_device"] = std::move(disk_by_device);
+  result["data_dir_bytes"] = directory_bytes(writer.data_dir());
+
+  onion::gate::QualityGuard quality_guard;
+  const auto attempts = read.attempts(&error);
+  for (const auto& attempt : attempts) {
+    try {
+      quality_guard.observe(std::stod(attempt.score), attempt.passed == 0);
+    } catch (const std::exception&) {
+      quality_guard.observe(0.0, true);
+    }
+  }
+  result["quality_guard"] = {{"samples", attempts.size()},
+                             {"rolling_score", quality_guard.rolling_score()},
+                             {"failure_rate", quality_guard.failure_rate()},
+                             {"flagged", quality_guard.flagged()}};
   return result;
 }
 
@@ -1093,7 +1206,12 @@ int node_cmd(int argc, char** argv) {
        writer.get(),
        [&]() {
          bool running = !stop_flag.load();
-         return state_json(*writer, api_port, &running,
+         std::vector<onion::sched::LaneMember> lanes;
+         {
+           std::lock_guard fleet_lock(fleet_mutex);
+           lanes = lane_members;
+         }
+         return state_json(*writer, api_port, &running, lanes,
                            sync_rounds_completed.load()).dump();
        },
        [&](std::string id, std::string) {

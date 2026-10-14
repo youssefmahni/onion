@@ -269,9 +269,28 @@ bool StateWriter::write_checkpoint(std::string* error) {
                                               : std::string{};
       });
   const bool ok = writer.write(hlc_.now(), vector, error);
-  applied_since_checkpoint_.store(0);
-  last_checkpoint_ = std::chrono::steady_clock::now();
+  // A failed checkpoint must remain due: otherwise a transient disk error
+  // would discard the 100k-record trigger and delay the next attempt for
+  // another six hours.
+  if (ok) {
+    applied_since_checkpoint_.store(0);
+    last_checkpoint_ = std::chrono::steady_clock::now();
+  }
   return ok;
+}
+
+void StateWriter::maybe_write_checkpoint() {
+  // DESIGN › checkpoints: write at least every six hours or after 100,000
+  // applied records.  This runs on the single writer thread, so the VACUUM
+  // snapshot observes a durable, fully folded state.
+  const bool record_threshold = applied_since_checkpoint_.load() >= 100000;
+  const bool time_threshold =
+      std::chrono::steady_clock::now() - last_checkpoint_ >=
+      std::chrono::hours(6);
+  if (!record_threshold && !time_threshold) return;
+  std::string error;
+  if (!write_checkpoint(&error))
+    std::fprintf(stderr, "state writer: checkpoint failed: %s\n", error.c_str());
 }
 
 namespace {
@@ -1120,6 +1139,7 @@ void StateWriter::run() {
                 std::chrono::seconds(1) &&
             !pending_attempts_.empty())
           flush_pending_attempts(&error);
+        if (error.empty()) maybe_write_checkpoint();
         continue;
       }
       command = std::move(queue_.front());
@@ -1192,6 +1212,7 @@ void StateWriter::run() {
         update_applied(command.foreign.origin, command.foreign.records);
         record_batch(command.foreign.origin, command.foreign.number,
                      command.foreign.hash);
+        applied_since_checkpoint_ += command.foreign.records.size();
         {
           std::unique_lock chain_lock(chain_mutex_);
           origin_prev_hashes_[command.foreign.origin] = command.foreign.hash;
@@ -1279,6 +1300,8 @@ void StateWriter::run() {
     if (!error.empty()) {
       // A fold or append failure must not be silent.
       std::fprintf(stderr, "state writer error: %s\n", error.c_str());
+    } else {
+      maybe_write_checkpoint();
     }
   }
 }
@@ -1556,6 +1579,18 @@ std::string StateWriter::claim_holder(std::string_view path,
   if (entry.claimer == my_device) return {};  // our own claim
   if (now_ms >= entry.received_ms + entry.lease_s * 1000) return {};  // expired
   return entry.claimer;
+}
+
+std::vector<StateWriter::ClaimInfo> StateWriter::active_claims(
+    std::int64_t now_ms) const {
+  std::vector<ClaimInfo> result;
+  std::shared_lock lock(index_mutex_);
+  for (const auto& [path, entry] : claims_) {
+    const std::int64_t expires_at = entry.received_ms + entry.lease_s * 1000;
+    if (now_ms >= expires_at) continue;
+    result.push_back({path, entry.claimer, expires_at - now_ms});
+  }
+  return result;
 }
 
 bool StateWriter::reexpand_open(std::string_view path) const {
