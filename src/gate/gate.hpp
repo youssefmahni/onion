@@ -95,7 +95,10 @@ struct Checks {
 Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
                   int max_children = 100);
 
-enum class Decision { Commit, Retry, Leaf, NeedsReview };
+// Defer: the provider failed (outage, rate limit, rejected credentials,
+// empty balance). Nothing about the node was learned, so nothing is
+// committed — a Leaf would be a permanent tombstone for the subtree.
+enum class Decision { Commit, Retry, Leaf, NeedsReview, Defer };
 
 struct GateParams {
   double pass_score{0.7};
@@ -109,6 +112,10 @@ struct Outcome {
   std::string end_reason;  // children | cannot split | below floor
 };
 
+// Exact decimal-string addition of two non-negative USD amounts (no floats
+// in audit records, decision 0003).
+std::string add_usd(const std::string& a, const std::string& b);
+
 // Best-of-3 per DESIGN.md › Quality gate and retries, pure.
 Outcome decide(const std::vector<Attempt>& attempts, const GateParams& params);
 
@@ -121,6 +128,9 @@ struct FunnelResult {
   std::vector<Attempt> attempts;  // audit records, child-free
   int chosen{-1};
   bool precheck_leaf{false};
+  // Decision::Defer only: "transient" (transport, timeout, 5xx, 429),
+  // "auth", "balance" or "rejected" (other 4xx).
+  std::string provider_failure;
   int calls{};  // LLM completions made (the pre-check + every funnel call)
 };
 

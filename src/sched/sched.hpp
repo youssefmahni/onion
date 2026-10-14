@@ -253,6 +253,12 @@ class Engine {
     std::vector<LaneMember> members;
     // M6: this device's id (for lane ownership). Empty = single-device mode.
     std::string self;
+    // F-GATE-2: after the provider fails (outage, 401/402, 429...) the
+    // engine settles nothing for the node and pauses work: the first
+    // retry waits `provider_backoff_initial`, doubling per consecutive
+    // failure up to `provider_backoff_max`.
+    std::chrono::milliseconds provider_backoff_initial{5000};
+    std::chrono::milliseconds provider_backoff_max{300000};
   };
 
   Engine(Options options);

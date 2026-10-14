@@ -333,6 +333,10 @@ struct Engine::Impl {
   // writer calls under it are queue submissions and shared-index reads,
   // which never call back into the engine.
   std::mutex pacing_mutex_;
+  // F-GATE-2: consecutive provider failures and the time before which the
+  // engine starts no new ticket (node loop thread only).
+  int provider_failures{0};
+  std::chrono::steady_clock::time_point provider_backoff_until{};
 };
 
 Engine::Engine(Options options)
@@ -701,6 +705,12 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       result.end_reason = "stop rule";
       break;
     }
+    // F-GATE-2: the provider failed recently; start nothing until the
+    // backoff elapses (the node loop re-enters run() on its own clock).
+    if (std::chrono::steady_clock::now() < impl_->provider_backoff_until) {
+      result.end_reason = "provider unavailable";
+      break;
+    }
     std::vector<Ticket> tickets = refresh_tickets();
     // M6: only the tickets whose home lane is this device are worked; the
     // rest stay for their owners.
@@ -973,6 +983,9 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     const gate::NodeContext context = build_context(writer, *node, &error);
     gate::FunnelResult funnel_result = funnel.run(context, impl_->options.ask);
     result.calls += funnel_result.calls;
+    bool provider_down = false;
+    if (funnel_result.decision != gate::Decision::Defer)
+      impl_->provider_failures = 0;
 
     for (const gate::Attempt& attempt : funnel_result.attempts) {
       writer.submit(state::AppendAttempt{make_record(
@@ -994,7 +1007,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       }
     }
 
-    used_in_chunk++;
+    // A deferred node consumed no attempt of the chunk (nothing was learned).
+    if (funnel_result.decision != gate::Decision::Defer) used_in_chunk++;
     // Children are stored with the review so accept can settle without
     // spending more (decision 0008). The caches must update too: an open
     // review filters the path out of the ticket stream, and the children
@@ -1161,11 +1175,41 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         result.reviews++;
         break;
       }
+      case gate::Decision::Defer: {
+        // F-GATE-2: the provider failed, so nothing is settled — the node
+        // stays an open ticket and a later run works it again. A leaf here
+        // would tombstone the whole subtree for a network blip.
+        impl_->provider_failures++;
+        const std::chrono::milliseconds delay = std::min(
+            impl_->options.provider_backoff_max,
+            std::chrono::milliseconds(
+                impl_->options.provider_backoff_initial.count() *
+                (std::int64_t{1}
+                 << std::min(impl_->provider_failures - 1, 20))));
+        impl_->provider_backoff_until =
+            std::chrono::steady_clock::now() + delay;
+        std::fprintf(stderr,
+                     "provider unavailable (%s): %s deferred, retry in %lld "
+                     "ms\n",
+                     funnel_result.provider_failure.c_str(),
+                     ticket.path.c_str(),
+                     static_cast<long long>(delay.count()));
+        provider_down = true;
+        break;
+      }
       case gate::Decision::Retry:
         break;  // unreachable: the funnel resolves internally
     }
     writer.sync();
-    impl_->options.budget.settle(*reservation, "0");
+    // Settle the reservation with what the ticket really cost (F-BUD-1).
+    std::string actual_cost = "0";
+    for (const gate::Attempt& attempt : funnel_result.attempts)
+      actual_cost = gate::add_usd(actual_cost, attempt.cost_usd);
+    impl_->options.budget.settle(*reservation, actual_cost);
+    if (provider_down) {
+      result.end_reason = "provider unavailable";
+      break;
+    }
   }
 
   // Only a real finish closes the campaign record (decision 0010): the

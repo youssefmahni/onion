@@ -649,15 +649,8 @@ int node_cmd(int argc, char** argv) {
     }
     std::string nonce = flag(argc, argv, "--nonce", "");
     if (nonce.empty()) {
-      // 32 fixed hex chars: two zero-padded 64-bit draws.
-      std::random_device entropy;
-      std::mt19937_64 generator(entropy());
-      std::uniform_int_distribution<std::uint64_t> distribution;
-      std::ostringstream out;
-      out << std::hex << std::setfill('0') << std::setw(16)
-          << distribution(generator) << std::setw(16)
-          << distribution(generator);
-      nonce = out.str();
+      // 32 fixed hex chars (128 bits) from the random device.
+      nonce = onion::sync::fresh_nonce();
     }
     const std::int64_t now_s = static_cast<std::int64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -894,7 +887,10 @@ int node_cmd(int argc, char** argv) {
   }
   onion::llm::Client client(
       {base_url, key, 120, 10, 1, static_cast<std::size_t>(profile_limit)});
-  onion::llm::Budget budget("1000");
+  // The device's USD budget (F-BUD-1): every ticket's reservation settles
+  // with its real cost, so this cap now binds. Default 1000 keeps the old
+  // headroom for existing deployments.
+  onion::llm::Budget budget(flag(argc, argv, "--budget-usd", "1000"));
   const onion::gate::SyncAsk ask = sync_ask(client);
 
   // Optional per-1M-token prices (USD), peak triplet (decision 0004: no
@@ -1356,9 +1352,12 @@ int node_cmd(int argc, char** argv) {
         if (!id.empty()) partitioned.insert(id);
     }
 #endif  // ONION_CHAOS_HOOKS
+    const std::set<std::string> retired = onion::sync::retired_member_ids(
+        onion::state::StateWriter::members_table_on(writer->read_db()));
     for (const auto& [peer_id, peer] : urls) {
       if (peer_id == device_key->device_id) continue;
       if (partitioned.count(peer_id)) continue;
+      if (retired.count(peer_id)) continue;  // evicted or departed
       std::map<std::string, std::string> quarantined;
       std::string sync_error;
       std::map<std::string, onion::sync::MemberKey> client_members;
@@ -1385,20 +1384,16 @@ int node_cmd(int argc, char** argv) {
     // minority side of a partition must not unlock more spending, and
     // the completed round re-opens reservations and feeds the
     // measured-chunk window.
-    // The denominator is the KNOWN membership: the folded members table
+    // The denominator is the CURRENT membership: the folded members table
     // (dynamic joins) and the static list — static fleets never write
-    // MEMBER_ADD records, so their rows live only in members.json.
-    std::size_t total_members =
-        onion::state::StateWriter::current_member_count_on(
-            writer->read_db());
-    total_members = std::max<std::size_t>(total_members, members.size());
-    if (!onion::state::StateWriter::member_is_current_on(
-            writer->read_db(), device_key->device_id) &&
-        std::find_if(members.begin(), members.end(),
-                     [&](const onion::sync::MemberKey& entry) {
-                       return entry.device_id == device_key->device_id;
-                     }) == members.end())
-      ++total_members;  // self answers trivially, row or no row
+    // MEMBER_ADD records, so their rows live only in members.json — minus
+    // every device the table marks EVICTED or LEFT, plus self.
+    std::vector<std::string> listed_ids;
+    for (const auto& entry : members) listed_ids.push_back(entry.device_id);
+    const std::size_t total_members = onion::sync::majority_denominator(
+        listed_ids,
+        onion::state::StateWriter::members_table_on(writer->read_db()),
+        device_key->device_id);
     const bool majority =
         onion::sync::majority_round(answered_peers, total_members);
     if (std::getenv("ONION_SYNC_DEBUG"))
@@ -1425,6 +1420,7 @@ int node_cmd(int argc, char** argv) {
         if (peer_id == device_key->device_id || peer.empty())
           continue;
         if (partitioned.count(peer_id)) continue;  // the split holds
+        if (retired.count(peer_id)) continue;  // evicted or departed
         std::map<std::string, onion::sync::MemberKey> client_members;
         for (const auto& entry : members)
           client_members[entry.device_id] = entry;
@@ -1502,7 +1498,8 @@ int node_cmd(int argc, char** argv) {
       // Exhausted and drained lanes are not finished (decision 0010): the
       // loop sleeps instead of spinning until sync brings work or the
       // fleet-wide close arrives.
-      if (result.end_reason == "budget" || result.end_reason == "drained")
+      if (result.end_reason == "budget" || result.end_reason == "drained" ||
+          result.end_reason == "provider unavailable")
         worked = false;
       if (stop_flag.load()) break;
     }

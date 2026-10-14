@@ -203,6 +203,11 @@ class StateWriter {
   static std::vector<MemberRow> members_table_on(const store::Db& db);
   static std::optional<std::vector<std::uint8_t>> member_public_key_on(
       const store::Db& db, std::string_view device_id);
+  // True when the members table has a row for the device and its state is
+  // EVICTED or LEFT. A device with no row (a static members.json entry) is
+  // not retired.
+  static bool member_retired_on(const store::Db& db,
+                                std::string_view device_id);
   static bool member_is_current_on(const store::Db& db,
                                    std::string_view device_id);
   static bool member_exists_on(const store::Db& db,

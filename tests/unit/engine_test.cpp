@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <thread>
 #include <chrono>
 #include <fstream>
 #include <memory>
@@ -217,6 +218,87 @@ class EngineTest : public ::testing::Test {
   std::filesystem::path dir_;
   std::unique_ptr<StateWriter> writer_;
 };
+
+// F-GATE-2 at the engine: while the provider is down nothing is settled and
+// no node becomes a leaf; when it recovers the very same node is worked.
+TEST_F(EngineTest, ProviderOutageLeavesNothingSettledAndRecovers) {
+  seed_root();
+  Budget budget("10");
+  bool down = true;
+  const SyncAsk healthy = funnel_fake(2);
+  const SyncAsk ask = [&](const Request& request) -> Result {
+    if (down) {
+      Result failure;
+      failure.kind = Kind::Transport;
+      return failure;
+    }
+    return healthy(request);
+  };
+  Engine::Options options{*writer_, ask, budget, 1, "dev0000000000000001",
+                          "0.001"};
+  options.provider_backoff_initial = std::chrono::milliseconds(150);
+  Engine engine(std::move(options));
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+
+  const Engine::RunResult outage = engine.run(campaign, nullptr);
+  EXPECT_EQ(outage.settled, 0);
+  EXPECT_EQ(outage.leaves, 0);
+  EXPECT_EQ(outage.end_reason, "provider unavailable");
+  EXPECT_FALSE(writer_->settled("P01"));
+  EXPECT_FALSE(writer_->leaf("P01"));
+
+  // Inside the backoff window the engine makes no call at all.
+  down = false;
+  const Engine::RunResult waiting = engine.run(campaign, nullptr);
+  EXPECT_EQ(waiting.end_reason, "provider unavailable");
+  EXPECT_EQ(waiting.calls, 0);
+  EXPECT_FALSE(writer_->settled("P01"));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const Engine::RunResult recovered = engine.run(campaign, nullptr);
+  EXPECT_GT(recovered.settled, 0);
+  EXPECT_TRUE(writer_->settled("P01"));
+  EXPECT_FALSE(writer_->leaf("P01"));
+}
+
+// F-BUD-1: the device's USD budget decrements by what the attempts really
+// cost (it used to settle every reservation at "0", so no cap could bind).
+TEST_F(EngineTest, DeviceBudgetSpendsTheRealAttemptCost) {
+  seed_root();
+  Budget budget("10");
+  const SyncAsk base = funnel_fake(2);
+  const SyncAsk ask = [&](const Request& request) -> Result {
+    Result reply = base(request);
+    reply.in_miss = 1000;  // 1,000 in + 500 out per call
+    reply.out = 500;
+    return reply;
+  };
+  Engine::Options options{*writer_, ask, budget, 1, "dev0000000000000001",
+                          "1.0"};
+  onion::llm::PriceSchedule prices;
+  prices.peak.input = "1.0";  // USD per 1M tokens
+  prices.peak.cached_input = "0.0";
+  prices.peak.output = "2.0";
+  prices.offpeak = prices.peak;
+  options.prices = prices;
+  Engine engine(std::move(options));
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  campaign.loop_budget = 6;
+  const Engine::RunResult run = engine.run(campaign, nullptr);
+  ASSERT_GT(run.attempts, 0);
+
+  std::string error;
+  long double recorded = 0;
+  for (const onion::store::Attempt& attempt : writer_->db().attempts(&error))
+    recorded += std::stold(attempt.cost);
+  EXPECT_GT(recorded, 0.0L);
+  // The budget spent exactly what the ATTEMPT rows recorded.
+  EXPECT_NEAR(static_cast<double>(std::stold(budget.spent_usd())),
+              static_cast<double>(recorded), 1e-9);
+  EXPECT_EQ(budget.reserved_usd(), "0");  // every reservation settled
+}
 
 TEST_F(EngineTest, RunsAThreeHundredNodeCampaignOffline) {
   seed_root();

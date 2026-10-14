@@ -1007,6 +1007,20 @@ std::optional<std::vector<std::uint8_t>> StateWriter::member_public_key_on(
   return std::vector<std::uint8_t>(blob.begin(), blob.end());
 }
 
+bool StateWriter::member_retired_on(const store::Db& db,
+                                    std::string_view device_id) {
+  std::string error;
+  auto statement = db.prepare(
+      "SELECT state FROM members WHERE device_id = ?1;", &error);
+  if (!statement) return false;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(device_id), &bind_error)) return false;
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return false;
+  const std::string state = statement->text(0);
+  return state == "EVICTED" || state == "LEFT";
+}
+
 bool StateWriter::member_is_current_on(const store::Db& db,
                                        std::string_view device_id) {
   std::string error;
@@ -1420,6 +1434,7 @@ std::vector<CampaignInfo> StateWriter::campaigns() const {
 }
 
 std::int64_t StateWriter::campaign_budget(std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
   const auto found = campaign_budgets_.find(std::string(campaign));
   return found == campaign_budgets_.end()
              ? std::numeric_limits<std::int64_t>::max()
