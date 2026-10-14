@@ -4,7 +4,7 @@ Status: **Accepted in principle** (owner, 2026-10-13), with one
 amendment: the synthesizer respects a **target of 8–20 children with a
 hard maximum of 30 and no padding** (implemented as the default
 configuration). The defaults switch ships in the accompanying PR;
-the gate defaults are NOT part of this decision (see DR 0020).
+the gate defaults are NOT part of this decision (settled by DR 0024).
 
 ## Context
 

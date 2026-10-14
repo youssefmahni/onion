@@ -306,7 +306,8 @@ Every state change is a record. All records of one commit go into one signed, ha
 | `CRITIQUE` | path, score, issues, remove[], add[] | Commit of the accepted attempt |
 | `ATOMIC` | path, verified | Commit of the accepted attempt |
 | `SETTLE` | path, kept, atomic, attempts, score, end (children, cannot split, allowance spent), campaign | Commit, always last in its batch |
-| `NEEDS_REVIEW` | path, reason (below floor, structure work, depth checkpoint) | A worker or the scheduler, instead of `SETTLE` |
+| `NEEDS_REVIEW` | path, reason (structure disallowed, depth checkpoint), children | A worker or the scheduler, instead of `SETTLE` |
+| `AUDIT` | path, campaign | The worker that committed a sampled node (decision 0024); never blocks the subtree |
 | `REVIEW` | path, decision (accept, retry, reject), note | You, from any device |
 | `RETITLE` | path, title | `llm` sweep (lane owner), ingest merges |
 | `TOMBSTONE` | path, reason, merged_into? | Dedup merges, rejected reviews, reverts |
@@ -399,13 +400,15 @@ You tell the whole fleet what to build with a signed `CAMPAIGN` record, created 
 | Scope | One or more path prefixes | `P06` |
 | Loop budget | Attempts allowed across the whole fleet | 10,000 |
 | Mode | Breadth-first (root down) or depth-first (finish branches) | depth-first |
-| Gate | Minimum score, maximum attempts, floor | 0.7, 3, 0.5 |
-| Stop rule | When a branch counts as done | last 50 settled nodes ≥ 90% atomic and average score ≥ 0.8 |
+| Gate | The deterministic checks (decision 0024); maximum attempts, child-count target | 3 attempts, 8 to 20 children (max 30) |
+| Stop rule | When a campaign counts as done | the verified-atomic share of the last 50 settled expansion nodes ≥ 90% (decision 0024) |
 | Starting pools | How the loop budget is split across scope roots | in proportion to each root's open tickets |
 | Branch share | The most a child branch may spend of its parent's remaining pool | 50% |
 | Depth checkpoint | Review pause every N levels past L9 (optional) | 5 |
-| Light funnel | Depth from which a lighter funnel runs (2 to 3 aspects, one trim) | L8 |
-| Critic model | Model for the critique agent | same as Model |
+| Light funnel | Depth from which a lighter funnel runs (2 to 3 aspects, one trim) | L6 (decision 0017) |
+| Critic | Whether the critique agent runs (it never gates a commit) | off |
+| Critic model | Model for the critique call only | same as Model |
+| Audit rate | Share of committed nodes sampled into the non-blocking audit queue | 2% |
 | Auto-accept reviews | Accept review items left untouched for N days (optional) | off |
 | Structure | Whether nodes at L1 to L3 may be expanded (always reviewed) | no |
 | Spillover | Whether devices with budget take over tickets of devices without | allowed |
@@ -466,27 +469,30 @@ The `+ 0.5` keeps `h` strictly between 0 and 1, so the logarithm is always defin
 
 ## Quality gate and retries
 
-A node's children are kept only after they pass a gate. A worker tries up to 3 times, keeps the best attempt, and sends the node to review if even the best is poor.
+A node's children are kept only after they pass the deterministic checks (decision 0024; decision 0020's critic gate was measured and removed). A worker tries up to 3 times and commits the first attempt whose checks pass.
 
 1. **Pre-check.** A short call (at most 400 tokens) asks whether the node splits into at least 3 distinct parts. A clear no makes it a leaf at once (end = cannot split), without running the funnel. This keeps leaves cheap; without it, every leaf would cost 3 full attempts.
-2. **Attempt.** Run the funnel for the node: planner, workers, dedup, trims, critique, synthesizer. From the campaign's light-funnel depth onward, a lighter funnel runs (2 to 3 aspects, one trim). Its durable `ATTEMPT` audit record contains no children; children are committed only in the terminal batch after the gate decides.
-3. **Checks that do not depend on the model's judgement.** The reply is complete (`finish_reason` = `stop`) and valid JSON; 3 to 100 children; no child repeats the node, an ancestor, a sibling or an existing child (canonical title); every title passes the style gates.
-4. **Score.** The critique score of the attempt, from the campaign's critic model.
-5. **Decide.**
-   - Checks pass and score ≥ 0.7: commit this attempt.
-   - Otherwise, if fewer than 3 attempts: retry with the previous critique issues injected and the temperature raised (0, then 0.3, then 0.5), so the new attempt actually differs.
-   - After 3 attempts, if no attempt produced at least 3 distinct valid children: the node becomes a leaf (end = cannot split).
-   - Otherwise: commit the best attempt that passed the checks if its score ≥ 0.5; else write `NEEDS_REVIEW` and spend nothing more on this node.
+2. **Attempt.** Run the funnel for the node: planner, workers, dedup, one trim to the target (skipped when the pool is already at or below it), then the synthesizer. The critique runs before the synthesizer only when the campaign turns the critic on; its score is recorded and its text feeds the synthesizer, but it never gates. From the campaign's light-funnel depth onward, a lighter funnel runs (2 to 3 aspects, one trim). Its durable `ATTEMPT` audit record contains no children; children are committed only in the terminal batch after the gate decides.
+3. **Checks that do not depend on the model's judgement.** The reply is complete (`finish_reason` = `stop`) and valid JSON; the child count is within the campaign target (at least 8, at most 30 — the prompt asks for 8 to 20, no padding); no child repeats the node, an ancestor, a sibling, an existing child or another child of the reply (canonical title), none is too similar to the parent (≥ 0.85) or a higher ancestor (≥ 0.95); every title passes the style gates.
+4. **Decide.**
+   - All checks pass: commit this attempt.
+   - Otherwise, if fewer than 3 attempts: retry at a higher temperature (0, then 0.3, then 0.5). The failed checks, by name and offending title, are injected into the next planner and synthesizer prompts, so the new attempt actually differs.
+   - After 3 attempts, if no attempt produced at least 3 valid children (a valid child passes the per-title checks): the node becomes a leaf (end = cannot split).
+   - Otherwise: commit the valid children of the attempt with the most of them (ties: the later attempt); the settle is flagged below target when there are fewer than 8.
+   - A provider failure (outage, 429, 401, 402) is never a leaf: the node is deferred, nothing is settled, and the engine backs off.
+5. **Atomic verification.** One batched call (decision 0021) on the chosen attempt only (see below).
 
-*(Diagram in the original doc: quality gate · one node, up to 3 attempts.)*
+A failed attempt loops back with its failed checks and a higher temperature; nothing is spent on a rejected attempt beyond its own calls.
 
-A failed attempt loops back with the critique's issues and a higher temperature; after the third, the best attempt is kept only if it clears the 0.5 floor.
+**Atomic is never a goal.** The model that writes children also labels them atomic, so rewarding atomic labels would teach it to stop decomposing. Atomic % is used only for reports and the stop rule. A child labelled atomic is treated as a leaf only after one short batched check on the chosen attempt (decision 0021: every labelled title in one call; the reply names those that admit no further decomposition) agrees; otherwise it stays a task. A failed verification call keeps every child a task.
 
-**Atomic is never a goal.** The model that writes children also labels them atomic, so rewarding atomic labels would teach it to stop decomposing. Atomic % is used only for reports and the stop rule. A child labelled atomic is treated as a leaf only after a short separate check (the `llm` sweep's `admits_children` verdict) agrees; otherwise it stays a task.
+**Stop rule.** Over the last 50 settled expansion nodes of the campaign (settles with children; leaves and reviews do not count) the pooled verified-atomic share, Σ atomic children / Σ children, is computed from the store, so it survives restarts and is identical on every replica. At 50 nodes and a share of at least 90% the campaign stops. There is no score clause.
 
-**Quality guard.** Each device's rolling average score and failure rate are compared with the fleet median. A clear outlier gets weight 0 and an alert on the dashboard; this catches a wrong model id, an exhausted key or a bad config within minutes.
+**Audit sampling.** Each committed node is sampled deterministically (the BLAKE2b hash of campaign and path, modulo 10⁶, below the campaign's audit rate × 10⁶; default 2%). A sampled node gets an `AUDIT` record: a non-blocking item in the review queue (reason audit) that does not pause its subtree. The dashboard and `/api/state` show open and sampled counts. Resolving an item records only the verdict (looks fine, looks wrong).
 
-**Review queue.** `NEEDS_REVIEW` nodes, structure results and depth checkpoints appear on the dashboard. You accept (the node settles and its children become tickets), retry with a note (injected into the next attempt), or reject (tombstoned). Each decision is a `REVIEW` record.
+**Quality guard.** Each device's rolling failure rate (and, when the critic is on, its average score) is compared with the fleet median. A clear outlier gets weight 0 and an alert on the dashboard; this catches a wrong model id, an exhausted key or a bad config within minutes.
+
+**Review queue.** `NEEDS_REVIEW` nodes, structure results, depth checkpoints and audit items appear on the dashboard. You accept (the node settles and its children become tickets), retry with a note (injected into the next attempt), or reject (tombstoned). Each decision is a `REVIEW` record.
 
 - **Batch actions:** accept or reject everything in a branch at once.
 - **Priority:** items are sorted by how much their branch has already spent, so expensive branches are decided first.
@@ -679,7 +685,7 @@ Everything runs in one process, `data_depot node run`: workers, sync, gossip and
 | `depot_platform` | Every OS call: durable write, atomic rename, sampling, key storage, data directory, service hooks |
 | `depot_profile` | Hardware scan, derived settings, overrides, `MEMBER_PROFILE` records |
 | `depot_llm` | Async DeepSeek client on libcurl multi: adaptive request limit, metering, reservations, backoff, circuit breaker |
-| `depot_gate` | Pre-check, attempt loop, deterministic checks, best-of-3, leaf rules, `NEEDS_REVIEW`, atomic verification |
+| `depot_gate` | Pre-check, attempt loop, deterministic checks (the gate), leaf and deferral rules, atomic verification |
 | `depot_sched` | Campaigns, home lanes, stealing, claims and leases, re-expansion locks, branch shares, loop-budget chunks, CPU pool |
 | `depot_state` | The state writer: ticket index and every SQLite write, fed through one queue |
 | `depot_log` | Records, batches, canonical bytes, signing, admin-key checks, segments, torn-tail repair |
@@ -778,7 +784,7 @@ The acceptance test is convergence: after any mix of joins, leaves, power cuts a
 - Home lanes: same view gives the same lane; adding a device moves about its weight share; the majority rule blocks takeover in a 2-and-2 split; `h` never reaches 0 or 1.
 - Stealing: claims are honoured; two simultaneous claims resolve to one owner; leases time out on the receiver's clock; no stealing from a DEAD lane without a majority or from a budget-empty lane without spillover; stolen work does not raise the speed factor.
 - Re-expansion lock: no subtree ticket starts while it is held; in-flight tickets finish.
-- Quality gate: pre-check leaf; each deterministic check; best-of-3 selection; the 0.5 floor sending a node to review; a truncated reply counted as a failed attempt; nothing committed before the decision (P7 regression).
+- Quality gate: pre-check leaf; each deterministic check; the first passing attempt commits; retry only on a failed check with the reasons injected; the below-target fallback and the three-valid-children leaf rule; the critic off by default and never gating; the trim skipped at or below the target; verification only on the chosen attempt; a provider failure deferring instead of leafing; a truncated reply counted as a failed attempt; nothing committed before the decision (P7 regression).
 - Termination: a child similar to an ancestor is rejected at the right threshold; a single chain under a 50% share ends; a fake model that never says atomic still ends.
 - Budgets: reservations never let concurrent tickets overspend; campaign chunks keep overshoot within one chunk per device.
 - Admin key: an eviction signed by one ordinary device is rejected; one signed by the admin key is accepted.
@@ -819,9 +825,9 @@ The design is delivered as a rebuild in ten milestones; the rebuild plan (`docs/
 
 The design picks defaults for each of these; confirm or change them.
 
-- [ ] Gate defaults: minimum score 0.7, 3 attempts, floor 0.5?
-- [ ] Atomic verification costs one short extra call per child labelled atomic. On by default?
-- [ ] Default stop rule: a branch is done when its last 50 settled nodes are at least 90% atomic with an average score of at least 0.8?
+- [x] Gate defaults: resolved by decision 0024 (deterministic checks, 3 attempts, no score gate).
+- [x] Atomic verification: resolved by decision 0021 (one batched call per chosen attempt, on by default).
+- [x] Default stop rule: resolved by decision 0024 (verified-atomic share ≥ 90% over the last 50 expansion nodes).
 - [ ] Who may start and stop campaigns: any device, or only the ones you name?
 - [ ] Branch share of 50% per level, or smaller for cheaper, shallower trees?
 - [ ] Depth checkpoint every 5 levels past L9 by default, or off unless a campaign turns it on?
