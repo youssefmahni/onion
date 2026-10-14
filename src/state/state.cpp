@@ -599,6 +599,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   else if (type == "ATTEMPT") upsert_attempt(db_, record, origin, error);
   else if (type == "CRITIQUE") upsert_critique(db_, record, origin, error);
   else if (type == "NEEDS_REVIEW") upsert_review(db_, record, origin, error);
+  else if (type == "AUDIT") upsert_review(db_, record, origin, error);
   else if (type == "CAMPAIGN") upsert_campaign(db_, record, origin, error);
   // REVIEW decisions update the reviews row:
   else if (type == "REVIEW") {
@@ -830,9 +831,33 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   } else if (type == "NEEDS_REVIEW") {
     const std::string path = record.payload.at("path").get<std::string>();
     review_paths_.insert(path);
+  } else if (type == "AUDIT") {
+    // A NON-blocking review item (decision 0024): the review row is open
+    // (shown in the queue) but the subtree keeps expanding — the path
+    // never enters review_paths_.
+    const std::string path = record.payload.at("path").get<std::string>();
+    const std::string campaign =
+        record.payload.value("campaign", std::string{});
+    open_audit_paths_.insert(path);
+    audit_campaign_by_path_[path] = campaign;
+    if (!campaign.empty()) {
+      ++audit_open_by_campaign_[campaign];
+      ++audit_sampled_by_campaign_[campaign];
+    }
   } else if (type == "REVIEW") {
     const std::string path = record.payload.at("path").get<std::string>();
     review_paths_.erase(path);
+    // An audit's verdict closes the audit item (verdict only — the
+    // subtree was never blocked and the node stays as it is).
+    if (open_audit_paths_.erase(path) > 0) {
+      const auto campaign = audit_campaign_by_path_.find(path);
+      if (campaign != audit_campaign_by_path_.end()) {
+        auto open = audit_open_by_campaign_.find(campaign->second);
+        if (open != audit_open_by_campaign_.end() && open->second > 0)
+          --open->second;
+        audit_campaign_by_path_.erase(campaign);
+      }
+    }
   } else if (type == "CAMPAIGN") {
     const auto& payload = record.payload;
     const std::string id = payload.at("id").get<std::string>();
@@ -1107,6 +1132,18 @@ void StateWriter::note_fork(ForkEvent fork) {
 std::vector<StateWriter::ForkEvent> StateWriter::forks() const {
   std::lock_guard lock(forks_mutex_);
   return {forks_.begin(), forks_.end()};
+}
+
+std::int64_t StateWriter::audits_open(std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = audit_open_by_campaign_.find(std::string(campaign));
+  return found == audit_open_by_campaign_.end() ? 0 : found->second;
+}
+
+std::int64_t StateWriter::audits_sampled(std::string_view campaign) const {
+  std::shared_lock lock(index_mutex_);
+  const auto found = audit_sampled_by_campaign_.find(std::string(campaign));
+  return found == audit_sampled_by_campaign_.end() ? 0 : found->second;
 }
 
 std::map<std::string, std::int64_t> StateWriter::vector() const {

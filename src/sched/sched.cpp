@@ -81,6 +81,53 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  // Decision 0024. critic: "on" | "off" (a boolean is accepted too).
+  if (value.contains("critic")) {
+    if (value["critic"].is_boolean())
+      spec.critic = value["critic"].get<bool>();
+    else if (value["critic"].is_string() &&
+             (value["critic"].get<std::string>() == "on" ||
+              value["critic"].get<std::string>() == "off"))
+      spec.critic = value["critic"].get<std::string>() == "on";
+    else
+      return fail("critic must be \"on\" or \"off\"");
+  }
+  if (value.contains("children_min")) {
+    if (!value["children_min"].is_number_integer())
+      return fail("children_min must be an integer");
+    const std::int64_t v = value["children_min"].get<std::int64_t>();
+    if (v < 3 || v > 30) return fail("children_min out of range 3..30");
+    spec.children_min = static_cast<int>(v);
+  }
+  try {
+    spec.audit_rate = parse_score("audit_rate", 0.02);
+    spec.stop_atomic_share = parse_score("stop_atomic_share", 0.90);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.audit_rate < 0.0 || spec.audit_rate > 1.0)
+    return fail("audit_rate out of range 0..1");
+  if (spec.stop_atomic_share <= 0.0 || spec.stop_atomic_share > 1.0)
+    return fail("stop_atomic_share out of range (0, 1]");
+  // M8 branch share (decision 0020): a number or an exact decimal string
+  // (decision 0003 — no floats in records).
+  try {
+    spec.branch_share = parse_score("branch_share", 0.5);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.branch_share <= 0.0 || spec.branch_share > 1.0)
+    return fail("branch_share must be in (0, 1]");
+  if (value.contains("pools") && value["pools"].is_object())
+    for (const auto& [path, attempts] : value["pools"].items())
+      if (attempts.is_number_integer())
+        spec.pools[path] = attempts.get<std::int64_t>();
+  spec.depth_checkpoint_from = value.value("depth_checkpoint_from", 0);
+  spec.depth_checkpoint_every = value.value("depth_checkpoint_every", 0);
+  if (spec.depth_checkpoint_from < 0 || spec.depth_checkpoint_every < 0)
+    return fail("depth checkpoint fields must be non-negative");
+  if ((spec.depth_checkpoint_from == 0) != (spec.depth_checkpoint_every == 0))
+    return fail("depth checkpoint needs both from and every (or neither)");
   // M8 branch share (decision 0020): a number or an exact decimal string
   // (decision 0003 — no floats in records).
   try {
@@ -163,7 +210,11 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
       {"spillover", spec.spillover},
       {"model", spec.model},
       {"critic_model", spec.critic_model},
-      {"auto_accept", spec.auto_accept}};
+      {"auto_accept", spec.auto_accept},
+      {"critic", spec.critic ? "on" : "off"},
+      {"children_min", spec.children_min},
+      {"audit_rate", std::to_string(spec.audit_rate)},
+      {"stop_atomic_share", std::to_string(spec.stop_atomic_share)}};
   if (spec.worker_candidates)
     out["worker_candidates"] = *spec.worker_candidates;
   if (spec.aspects_min) out["aspects_min"] = *spec.aspects_min;
@@ -222,17 +273,17 @@ std::vector<Ticket> order_tickets(
 }
 
 bool stop_rule_met(const std::vector<SettledSample>& settled_in_order,
-                   std::size_t window) {
+                   std::size_t window, double share) {
   if (settled_in_order.size() < window) return false;
   const std::size_t begin = settled_in_order.size() - window;
-  int atomic = 0;
-  double score_sum = 0.0;
+  std::int64_t kept = 0;
+  std::int64_t atomic = 0;
   for (std::size_t i = begin; i < settled_in_order.size(); ++i) {
+    kept += settled_in_order[i].kept;
     atomic += settled_in_order[i].atomic;
-    score_sum += settled_in_order[i].score;
   }
-  return static_cast<double>(atomic) / static_cast<double>(window) >= 0.9 &&
-         score_sum / static_cast<double>(window) >= 0.8;
+  if (kept <= 0) return false;
+  return static_cast<double>(atomic) / static_cast<double>(kept) >= share;
 }
 
 std::string project_cost_usd(std::int64_t loop_budget,
@@ -466,11 +517,11 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   }
 
   gate::FunnelOptions funnel_options;
-  funnel_options.params.pass_score = spec.gate;
-  funnel_options.params.floor_score = spec.floor;
   funnel_options.params.max_attempts = spec.max_attempts;
-  funnel_options.model = spec.critic_model.empty() ? spec.model
-                                                   : spec.critic_model;
+  funnel_options.params.children_min = spec.children_min;
+  funnel_options.critic = spec.critic;
+  funnel_options.model = spec.model;
+  funnel_options.critic_model = spec.critic_model;  // the critique call only
   funnel_options.prices = impl_->options.prices;
   // W5 funnel variants (absent spec fields keep the FunnelOptions default).
   if (spec.worker_candidates)
@@ -701,7 +752,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       result.end_reason = "stopped";
       break;
     }
-    if (stop_rule_met(settled_samples)) {
+    if (stop_rule_met(settled_samples, 50, spec.stop_atomic_share)) {
       result.end_reason = "stop rule";
       break;
     }
@@ -857,7 +908,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                          {"end", "allowance spent"},
                          {"campaign", spec.id}})}});
           writer.sync();
-          settled_samples.push_back(SettledSample{0, 0.0});
+          settled_samples.push_back(SettledSample{0, 0});
           result.leaves++;  // the allowance leaf counts like cannot-split
           it = tickets.erase(it);
           continue;
@@ -1059,7 +1110,6 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                        {"campaign", spec.id}})}});
         writer.sync();  // the pool fold reads durable attempts
         result.leaves++;
-        settled_samples.push_back(SettledSample{0, 0.0});
         break;
       }
       case gate::Decision::Commit: {
@@ -1088,18 +1138,33 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                 "ATOMIC", {{"path", ticket.path + "-" + id},
                            {"verified", true}}));
         }
-        records.push_back(make_record(
-            "CRITIQUE", {{"path", ticket.path},
-                         {"score", std::to_string(chosen.score)},
-                         {"issues", attempt_issues(chosen)}}));
-        records.push_back(make_record(
-            "SETTLE", {{"path", ticket.path},
-                       {"kept", chosen.children.size()},
-                       {"atomic", atomic},
-                       {"attempts", funnel_result.attempts.size()},
-                       {"score", std::to_string(chosen.score)},
-                       {"end", "children"},
-                       {"campaign", spec.id}}));
+        // The critique is recorded only when the campaign turned the critic
+        // on (decision 0024); it never gated this commit.
+        if (spec.critic)
+          records.push_back(make_record(
+              "CRITIQUE", {{"path", ticket.path},
+                           {"score", std::to_string(chosen.score)},
+                           {"issues", attempt_issues(chosen)}}));
+        nlohmann::json settle_payload{{"path", ticket.path},
+                            {"kept", chosen.children.size()},
+                            {"atomic", atomic},
+                            {"attempts", funnel_result.attempts.size()},
+                            {"score", std::to_string(chosen.score)},
+                            {"end", "children"},
+                            {"campaign", spec.id}};
+        if (funnel_result.below_target) settle_payload["below_target"] = true;
+        records.push_back(make_record("SETTLE", std::move(settle_payload)));
+        // B3 audit sampling (decision 0024): each committed node is
+        // sampled deterministically — BLAKE2b(campaign ‖ path) mod 10^6
+        // below audit_rate x 10^6 — so every replica samples the same
+        // nodes. A sampled node gets an AUDIT record: a NON-blocking
+        // review item (the subtree keeps expanding).
+        if (spec.audit_rate > 0.0 &&
+            audit_sampled(spec.id, ticket.path, spec.audit_rate))
+          records.push_back(make_record(
+              "AUDIT", {{"path", ticket.path},
+                        {"campaign", spec.id},
+                        {"reason", "audit"}}));
         writer.submit(state::CommitTerminal{std::move(records)});
         // Fold the settle before the next refresh: the pool ledger
         // (decision 0020) reads the attempts table, and the parent's
@@ -1124,55 +1189,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         // toward it (verify_atomic is off by default in M3, so the
         // model's raw labels score 0 here; DR 0021 covers batching).
         settled_samples.push_back(SettledSample{
-            (funnel_options.verify_atomic && atomic > 0) ? 1 : 0,
-            chosen.score});
-        break;
-      }
-      case gate::Decision::NeedsReview: {
-        const auto& chosen = funnel_result.attempts[funnel_result.chosen];
-        // Children are stored with the review so accept can settle without
-        // spending more (decision 0008).  Atomic labels survive too: the
-        // ATOMIC records mirror the Commit branch and the NEEDS_REVIEW
-        // payload carries the count so accept can settle it faithfully.
-        std::vector<log::Record> records;
-        std::vector<std::string> new_ids;
-        int review_atomic = 0;
-        for (const gate::Child& child : chosen.children) {
-          const std::string id = node_ids_->allocate();
-          new_ids.push_back(id);
-          records.push_back(make_record(
-              "ADD_NODE", {{"path", ticket.path + "-" + id},
-                           {"layer", ticket.layer + 1},
-                           {"title", child.title}}));
-          if (child.atomic) {
-            ++review_atomic;
-            records.push_back(make_record(
-                "ATOMIC", {{"path", ticket.path + "-" + id},
-                           {"verified", true}}));
-          }
-        }
-        records.push_back(make_record(
-            "CRITIQUE", {{"path", ticket.path},
-                         {"score", std::to_string(chosen.score)},
-                         {"issues", attempt_issues(chosen)}}));
-        records.push_back(make_record(
-            "NEEDS_REVIEW", {{"path", ticket.path},
-                             {"reason", "below floor"},
-                             {"attempts", funnel_result.attempts.size()},
-                             {"atomic", review_atomic},
-                             {"score", std::to_string(chosen.score)}}));
-        writer.submit(state::CommitTerminal{std::move(records)});
-        if (cache_valid) {
-          review_cache.push_back(ticket.path);  // pause the subtree now
-          for (std::size_t i = 0; i < chosen.children.size(); ++i) {
-            store::Node child_node;
-            child_node.path = ticket.path + "-" + new_ids[i];
-            child_node.layer = ticket.layer + 1;
-            child_node.title = chosen.children[i].title;
-            node_cache.push_back(std::move(child_node));
-          }
-        }
-        result.reviews++;
+            static_cast<int>(chosen.children.size()),
+            funnel_options.verify_atomic ? atomic : 0});
         break;
       }
       case gate::Decision::Defer: {
@@ -1250,6 +1268,20 @@ void Engine::review_accept(std::string_view path, const CampaignSpec& spec) {
       impl_->options.writer.sync();
       return;
     }
+  // B3 audit (decision 0024): the audited node is ALREADY committed and
+  // its subtree already expanded — accepting records the verdict only
+  // (the REVIEW decision closes the audit item; nothing settles twice).
+  for (const store::Review& review :
+       impl_->options.writer.db().open_reviews(&error))
+    if (review.path == path && review.reason == "audit") {
+      std::vector<log::Record> records;
+      records.push_back(make_record(
+          "REVIEW", {{"path", std::string(path)}, {"decision", "accept"},
+                     {"note", ""}}));
+      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
+      impl_->options.writer.sync();
+      return;
+    }
   std::vector<store::Node> children =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   int kept = 0;
@@ -1298,6 +1330,20 @@ void Engine::review_retry(std::string_view path, const CampaignSpec& spec,
 
 void Engine::review_reject(std::string_view path, const CampaignSpec& spec) {
   std::string error;
+  // B3 audit (decision 0024): rejecting an audit records the verdict
+  // only — the node stays (a follow-up is the operator's review retry);
+  // nothing is tombstoned.
+  for (const store::Review& review :
+       impl_->options.writer.db().open_reviews(&error))
+    if (review.path == path && review.reason == "audit") {
+      std::vector<log::Record> records;
+      records.push_back(make_record(
+          "REVIEW", {{"path", std::string(path)}, {"decision", "reject"},
+                     {"note", ""}}));
+      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
+      impl_->options.writer.sync();
+      return;
+    }
   std::vector<store::Node> subtree =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   std::vector<log::Record> records;
@@ -1636,6 +1682,18 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   if (plan.saturated)
     out << "(saturated: values clamped at int64)\n";
   return out.str();
+}
+
+bool audit_sampled(std::string_view campaign, std::string_view path,
+                   double audit_rate) {
+  const std::string joined = std::string(campaign) + "\n" + std::string(path);
+  const std::string hash = onion::log::blake2b_hex(joined);
+  // The first 6 hex chars (24 bits) as the bucket index: mod 1e6.
+  const std::uint64_t bucket =
+      std::stoull(hash.substr(0, 6), nullptr, 16) % 1000000ULL;
+  const std::int64_t threshold =
+      static_cast<std::int64_t>(audit_rate * 1000000.0);
+  return static_cast<std::int64_t>(bucket) < threshold;
 }
 
 std::map<std::string, std::int64_t> compute_starting_pools(

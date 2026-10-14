@@ -4,6 +4,7 @@
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -207,6 +208,10 @@ class EngineTest : public ::testing::Test {
     s.loop_budget = 10000;
     s.mode = "breadth-first";
     s.chunk = 50;
+    // The offline fakes return three children per node; the product default
+    // target minimum is 8 (decision 0024). The gate rules themselves are
+    // covered in gate_test.cpp.
+    s.children_min = 3;
     return s;
   }
 
@@ -314,11 +319,14 @@ TEST_F(EngineTest, RunsAThreeHundredNodeCampaignOffline) {
   EXPECT_GT(result.leaves, 0);
 
   // P7: scan the log — no settled node has a failed attempt committed for
-  // it, and every committed settle carries a passing score ≥ the floor.
+  // it, and (decision 0024: the deterministic checks are the gate) every
+  // committed settle is backed by an ATTEMPT whose checks passed.
   std::ifstream in(writer_->segments().active_path());
   std::string line;
   int settles = 0;
   std::vector<std::string> failed_paths;
+  std::set<std::string> passed_paths;
+  std::vector<std::string> committed_paths;
   while (std::getline(in, line)) {
     if (line.empty()) continue;
     auto batch = json::parse(line, nullptr, false);
@@ -326,17 +334,20 @@ TEST_F(EngineTest, RunsAThreeHundredNodeCampaignOffline) {
     for (const auto& record : batch["recs"]) {
       if (record["t"] == "ATTEMPT" && record["p"]["passed"] == 0)
         failed_paths.push_back(record["p"]["path"].get<std::string>());
+      if (record["t"] == "ATTEMPT" && record["p"]["passed"] == 1)
+        passed_paths.insert(record["p"]["path"].get<std::string>());
       if (record["t"] == "SETTLE") {
         settles++;
         if (record["p"]["end"] == "children") {
-          const double score =
-              std::stod(record["p"]["score"].get<std::string>());
-          EXPECT_GE(score, 0.5);
+          committed_paths.push_back(record["p"]["path"].get<std::string>());
           EXPECT_GE(record["p"]["attempts"].get<int>(), 1);
         }
       }
     }
   }
+  for (const std::string& path : committed_paths)
+    EXPECT_TRUE(passed_paths.count(path))
+        << "committed without a passing attempt: " << path;
   // The P7 regression: every failed attempt belongs to a node that is
   // either retried or never settled — a settled node's failed attempt only
   // exists when the node settled from a LATER attempt, which this fake
@@ -353,8 +364,9 @@ TEST_F(EngineTest, RunsAThreeHundredNodeCampaignOffline) {
 TEST_F(EngineTest, StopRuleEndsAnAtomicFrontierCampaign) {
   seed_root();
   Budget budget("10");
-  // Atomic children from depth 4: once the last 50 settles are ≥ 90% atomic
-  // with average score ≥ 0.8, the campaign stops by itself.
+  // Atomic children from depth 4: once the verified-atomic share of the
+  // last 50 expansion nodes is ≥ 90% (decision 0024; no score clause), the
+  // campaign stops by itself.
   Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.9, 4),
                                 budget, 1, "dev0000000000000001", "0.001"});
   CampaignSpec campaign = spec();
@@ -390,7 +402,10 @@ TEST_F(EngineTest, WaitingTicketStartsWhenTheReservationIsReleased) {
 TEST_F(EngineTest, ReviewAcceptSettlesWithoutSpending) {
   seed_root();
   Budget budget("10");
-  Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.45), budget,
+  // spec() has structure=false, so the layer-0 root goes to review
+  // ("structure disallowed") — the funnel itself no longer creates reviews
+  // (decision 0024).
+  Engine engine(Engine::Options{*writer_, funnel_fake(5), budget,
                                 1, "dev0000000000000001", "0.001"});
   CampaignSpec below_floor = spec();
   const Engine::RunResult result = engine.run(below_floor, nullptr);
@@ -406,7 +421,7 @@ TEST_F(EngineTest, ReviewAcceptSettlesWithoutSpending) {
 TEST_F(EngineTest, ReviewRejectTombstonesTheSubtree) {
   seed_root();
   Budget budget("10");
-  Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.45), budget,
+  Engine engine(Engine::Options{*writer_, funnel_fake(5), budget,
                                 1, "dev0000000000000001", "0.001"});
   CampaignSpec below_floor = spec();
   engine.run(below_floor, nullptr);
@@ -677,6 +692,36 @@ TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
   const Engine::RunResult resumed = engine.run(campaign, nullptr);
   EXPECT_EQ(resumed.end_reason, "drained");
   EXPECT_GT(resumed.settled, 0);
+}
+
+TEST_F(EngineTest, AuditSamplesCommittedNodesWithoutBlocking) {
+  // Decision 0024: audit_rate 1.0 samples every committed node — an
+  // AUDIT record per settle, an open non-blocking review item, and the
+  // subtree keeps expanding (the children of audited nodes settle too).
+  seed_root();
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.structure = true;
+  campaign.audit_rate = 1.0;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_GT(result.settled, 0);
+  // Every committed node got an audit: sampled == settled.
+  std::string error;
+  const auto open = writer_->db().open_reviews(&error);
+  EXPECT_EQ(static_cast<std::int64_t>(open.size()), result.settled);
+  for (const onion::store::Review& review : open)
+    EXPECT_EQ(review.reason, "audit");
+  EXPECT_EQ(writer_->audits_sampled("c1"), result.settled);
+  EXPECT_EQ(writer_->audits_open("c1"), result.settled);
+  // Non-blocking: nothing in the review-pause set.
+  EXPECT_EQ(writer_->db().open_reviews(&error).size(), open.size());
+
+  // The verdict closes an audit without re-settling or tombstoning.
+  engine.review_accept(open[0].path, campaign);
+  EXPECT_EQ(writer_->audits_open("c1"), result.settled - 1);
+  EXPECT_FALSE(writer_->leaf(open[0].path));
 }
 
 TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {

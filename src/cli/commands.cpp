@@ -240,6 +240,9 @@ json state_json(onion::state::StateWriter& writer, int api_port,
          writer.reserved_by_origin(campaign.id))
       reserved_by_origin[origin] = total;
     entry["reserved_by_origin"] = std::move(reserved_by_origin);
+    // B3 audit sampling (decision 0024): the per-campaign audit queue.
+    entry["audits"] = {{"open", writer.audits_open(campaign.id)},
+                       {"sampled", writer.audits_sampled(campaign.id)}};
     try {
       entry["spec"] = json::parse(campaign.spec);
     } catch (const std::exception&) {

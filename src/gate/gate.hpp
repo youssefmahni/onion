@@ -35,6 +35,10 @@ struct Attempt {
   bool checks_passed{};
   std::vector<Child> children;
   std::string issues;  // critique issues, ≤ 1000 characters (decision 0000)
+  // Decision 0024: the deterministic checks are the gate.
+  std::vector<std::string> failures;  // every failed check, by title
+  std::vector<char> child_valid;      // per child: passes repeat/style/similarity
+  std::size_t valid_count{0};
   // Metering of the attempt's calls (decision 0003: exact integers/decimals).
   std::uint64_t tokens_in{};
   std::uint64_t tokens_cached{};
@@ -59,7 +63,8 @@ std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
                                const std::string& critique_text,
                                int target_min = 8, int target_max = 20,
-                               int max_children = 30, bool compact = false);
+                               int max_children = 30, bool compact = false,
+                               const std::string& problems = "");
 // The short separate call that confirms a child labelled atomic is a leaf
 // (decision 0021: batched — ONE call per parent listing every labelled
 // child; the reply names which admit no further decomposition).
@@ -85,38 +90,45 @@ std::optional<std::vector<std::string>> parse_atomic_verdict(
 struct Checks {
   bool complete{false};     // finish_reason stop (truncation is a failure)
   bool valid_json{false};
-  bool count_ok{false};     // 3..100 children
+  bool count_ok{false};     // min_children..max_children
   bool no_repeats{false};   // node, ancestors, siblings, existing (canonical)
   bool style_ok{false};
   bool ancestors_ok{false}; // parent ≥ 0.85, higher ancestors ≥ 0.95
   std::vector<std::string> failures;
+  std::vector<char> child_valid;  // per child: no repeat/style/similarity fault
+  std::size_t valid_count{0};
   bool passed() const;
 };
 Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
-                  int max_children = 100);
+                  int max_children = 100, int min_children = 3);
 
 // Defer: the provider failed (outage, rate limit, rejected credentials,
 // empty balance). Nothing about the node was learned, so nothing is
 // committed — a Leaf would be a permanent tombstone for the subtree.
-enum class Decision { Commit, Retry, Leaf, NeedsReview, Defer };
+enum class Decision { Commit, Retry, Leaf, Defer };
 
+// Decision 0024: the gate is the deterministic checks; no score thresholds.
 struct GateParams {
-  double pass_score{0.7};
-  double floor_score{0.5};
   int max_attempts{3};
+  int children_min{8};  // the campaign target's lower bound (default 8)
 };
 
 struct Outcome {
   Decision decision{Decision::Leaf};
-  int chosen{-1};  // index into attempts for Commit / NeedsReview
-  std::string end_reason;  // children | cannot split | below floor
+  int chosen{-1};  // index into attempts for Commit
+  std::string end_reason;  // children | cannot split
+  // Commit by the exhausted-attempts fallback with fewer valid children
+  // than children_min.
+  bool below_target{false};
 };
 
 // Exact decimal-string addition of two non-negative USD amounts (no floats
 // in audit records, decision 0003).
 std::string add_usd(const std::string& a, const std::string& b);
 
-// Best-of-3 per DESIGN.md › Quality gate and retries, pure.
+// Decision 0024, pure: the first attempt whose deterministic checks all pass
+// commits; otherwise retry until max_attempts; then the attempt with the most
+// valid children (>= 3) commits its valid children, else the node is a leaf.
 Outcome decide(const std::vector<Attempt>& attempts, const GateParams& params);
 
 // ---- the attempt loop (pre-check, funnel, decide) ----
@@ -128,6 +140,7 @@ struct FunnelResult {
   std::vector<Attempt> attempts;  // audit records, child-free
   int chosen{-1};
   bool precheck_leaf{false};
+  bool below_target{false};  // Commit with fewer valid children than the target
   // Decision::Defer only: "transient" (transport, timeout, 5xx, 429),
   // "auth", "balance" or "rejected" (other 4xx).
   std::string provider_failure;
@@ -136,6 +149,10 @@ struct FunnelResult {
 
 struct FunnelOptions {
   bool light{false};  // campaign's light-funnel depth reached
+  // Decision 0024: the critique runs (and is recorded) only when on; it
+  // never gates a commit.
+  bool critic{false};
+  std::string critic_model;  // the critique call's model; empty = `model`
   GateParams params;
   double temperatures[3]{0.0, 0.3, 0.5};
   int max_tokens{6000};

@@ -247,7 +247,7 @@ def main():
         campaign_file = os.path.join(root, "campaign_a.json")
         with open(campaign_file, "w") as f:
             json.dump({"id": "mp7", "scope": ["P01", "P02", "P03", "P04"],
-                       "loop_budget": 200, "mode": "breadth-first",
+                       "loop_budget": 200, "children_min": 3, "mode": "breadth-first",
                        "chunk": 50, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign_file, "--data-dir",
             devices[1]["data"], "--yes")
@@ -315,7 +315,7 @@ def main():
         campaign_b = os.path.join(root, "campaign_b.json")
         with open(campaign_b, "w") as f:
             json.dump({"id": "mp7b", "scope": ["P01", "P02", "P03", "P04"],
-                       "loop_budget": 300, "mode": "breadth-first",
+                       "loop_budget": 300, "children_min": 3, "mode": "breadth-first",
                        "chunk": 50, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign_b, "--data-dir",
             devices[1]["data"], "--yes")
@@ -387,7 +387,7 @@ def main():
         with open(campaign_c, "w") as f:
             json.dump({"id": "mp7c",
                        "scope": ["P05", "P06", "P07", "P08"],
-                       "loop_budget": 300, "mode": "breadth-first",
+                       "loop_budget": 300, "children_min": 3, "mode": "breadth-first",
                        "chunk": 50, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign_c, "--data-dir",
             devices[1]["data"], "--yes")

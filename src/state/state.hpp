@@ -230,6 +230,9 @@ class StateWriter {
   };
   void note_fork(ForkEvent fork);
   std::vector<ForkEvent> forks() const;
+  // B3 audit sampling (decision 0024): per-campaign counters.
+  std::int64_t audits_open(std::string_view campaign) const;
+  std::int64_t audits_sampled(std::string_view campaign) const;
 
   // M7: a member's sync (TCP) address from the durable table, if known.
   std::vector<MemberRow> members_table() const;
@@ -314,6 +317,13 @@ class StateWriter {
   std::unordered_set<std::string> settled_paths_;
   std::unordered_set<std::string> leaf_paths_;    // settled with end != children
   std::unordered_set<std::string> review_paths_;  // needs_review, state open
+  // M8/B3 audit sampling (decision 0024): NON-blocking review items.
+  // AUDIT records open a review row but never pause the subtree; the
+  // per-campaign open/sampled counters feed /api/state.
+  std::unordered_set<std::string> open_audit_paths_;
+  std::map<std::string, std::string> audit_campaign_by_path_;
+  std::map<std::string, std::int64_t> audit_open_by_campaign_;
+  std::map<std::string, std::int64_t> audit_sampled_by_campaign_;
   std::vector<CampaignInfo> campaigns_;
   std::map<std::string, std::int64_t> reserved_by_campaign_;
   std::map<std::string, std::int64_t> reserved_by_origin_campaign_;  // origin|campaign

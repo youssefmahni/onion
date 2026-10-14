@@ -129,7 +129,7 @@ def main():
         with open(campaign, "w") as f:
             json.dump({"id": "mp_budget", "scope": ["P01", "P02", "P03",
                                                     "P04", "P05"],
-                       "loop_budget": BUDGET, "mode": "breadth-first",
+                       "loop_budget": BUDGET, "children_min": 3, "mode": "breadth-first",
                        "chunk": CHUNK_FLOOR, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign, "--data-dir",
             devices[1]["data"], "--yes")

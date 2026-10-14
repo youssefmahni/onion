@@ -89,8 +89,8 @@ std::string planner_prompt(const NodeContext& ctx,
          "(things it directly contains or decomposes into) — never related "
          "topics from other domains. Return JSON {\"items\": [ aspects ]}.\n";
   if (!injected_issues.empty())
-    out << "Previous critique issues you MUST address: " << injected_issues
-        << "\n";
+    out << "Problems with your previous attempt that you MUST fix: "
+        << injected_issues << "\n";
   const std::string existing = existing_line(ctx);
   if (!existing.empty()) out << existing << "\n";
   out << node_line(ctx);
@@ -172,12 +172,16 @@ std::string synthesizer_prompt(const NodeContext& ctx,
                                const std::vector<std::string>& candidates,
                                const std::string& critique_text,
                                int target_min, int target_max,
-                               int max_children, bool compact) {
+                               int max_children, bool compact,
+                               const std::string& problems) {
   std::ostringstream out;
   out << "From these candidates select the final children set for this node. "
-         "Incorporate the critique: drop hallucinated or weak items, include "
-         "the missing items you judge valid, resolve any conflicts. Keep "
-         "between "
+      << (critique_text.empty()
+              ? "Drop hallucinated or weak items and resolve any conflicts. "
+              : "Incorporate the critique: drop hallucinated or weak items, "
+                "include the missing items you judge valid, resolve any "
+                "conflicts. ")
+      << "Keep between "
       << target_min << " and " << target_max
       << " children (never more than " << max_children
       << "). Do not pad — keep only what the node genuinely contains. ";
@@ -190,9 +194,12 @@ std::string synthesizer_prompt(const NodeContext& ctx,
            "return {\"title\": \"...\", \"atomic\": true if it cannot be "
            "decomposed into simpler items, false if it should nest further}. ";
   }
-  out << "Candidates:\n"
-      << join(candidates) << "\nCritique: " << critique_text << "\n"
-      << node_line(ctx);
+  out << "Candidates:\n" << join(candidates) << "\n";
+  if (!critique_text.empty()) out << "Critique: " << critique_text << "\n";
+  if (!problems.empty())
+    out << "Problems with your previous attempt that you MUST fix: "
+        << problems << "\n";
+  out << node_line(ctx);
   return out.str();
 }
 
@@ -325,13 +332,15 @@ bool Checks::passed() const {
 }
 
 Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
-                  int max_children) {
+                  int max_children, int min_children) {
   Checks checks;
-  checks.count_ok = children.size() >= 3 &&
-                    children.size() <= static_cast<std::size_t>(max_children);
+  checks.count_ok =
+      children.size() >= static_cast<std::size_t>(min_children) &&
+      children.size() <= static_cast<std::size_t>(max_children);
   if (!checks.count_ok)
     checks.failures.push_back("child count " + std::to_string(children.size()) +
-                              " outside 3.." + std::to_string(max_children));
+                              " outside " + std::to_string(min_children) +
+                              ".." + std::to_string(max_children));
 
   std::set<std::string> seen;
   seen.insert(depot::canonical(ctx.title));
@@ -345,91 +354,82 @@ Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
   checks.no_repeats = true;
   checks.style_ok = true;
   checks.ancestors_ok = true;
+  checks.child_valid.assign(children.size(), 1);
   const std::string node_canonical = depot::canonical(ctx.title);
-  for (const Child& child : children) {
+  for (std::size_t index = 0; index < children.size(); ++index) {
+    const Child& child = children[index];
     const std::string canonical = depot::canonical(child.title);
     if (!seen.insert(canonical).second) {
       checks.no_repeats = false;
+      checks.child_valid[index] = 0;
       checks.failures.push_back("repeated title: " + child.title);
     }
     const auto flags = depot::style_flags(child.title);
     if (!flags.empty()) {
       checks.style_ok = false;
+      checks.child_valid[index] = 0;
       checks.failures.push_back("style violation: " + child.title);
     }
     // Parent similarity ≥ 0.85 → reject; any higher ancestor ≥ 0.95 → reject.
     if (depot::sim_keys(canonical, node_canonical) >= 0.85) {
       checks.ancestors_ok = false;
+      checks.child_valid[index] = 0;
       checks.failures.push_back("too similar to parent: " + child.title);
     }
     for (const std::string& ancestor : ctx.ancestors) {
       if (depot::sim_keys(canonical, depot::canonical(ancestor)) >= 0.95) {
         checks.ancestors_ok = false;
+        checks.child_valid[index] = 0;
         checks.failures.push_back("too similar to ancestor: " + child.title);
         break;
       }
     }
   }
+  for (const char valid : checks.child_valid)
+    if (valid) ++checks.valid_count;
   return checks;
 }
 
+// Decision 0024: the gate is the deterministic checks.
 Outcome decide(const std::vector<Attempt>& attempts, const GateParams& params) {
   Outcome outcome;
-  const auto has_valid_children = [&](const Attempt& attempt) {
-    if (!attempt.checks_passed) return false;
-    std::set<std::string> distinct;
-    for (const Child& child : attempt.children)
-      distinct.insert(depot::canonical(child.title));
-    return distinct.size() >= 3;
-  };
-
+  // The first attempt whose checks all pass commits.
   for (std::size_t i = 0; i < attempts.size(); ++i) {
-    const Attempt& attempt = attempts[i];
-    if (attempt.checks_passed && attempt.score >= params.pass_score) {
+    if (attempts[i].checks_passed) {
       outcome.decision = Decision::Commit;
       outcome.chosen = static_cast<int>(i);
       outcome.end_reason = "children";
       return outcome;
     }
   }
-
+  // Retry only when a check failed.
   if (static_cast<int>(attempts.size()) < params.max_attempts) {
     outcome.decision = Decision::Retry;
     outcome.end_reason = "retry";
     return outcome;
   }
-
-  bool any_valid = false;
-  for (const Attempt& attempt : attempts)
-    if (has_valid_children(attempt)) any_valid = true;
-  if (!any_valid) {
+  // Attempts exhausted: the attempt with the most valid children (ties: the
+  // later one) commits its valid children when it has at least three;
+  // otherwise the node is a leaf.
+  int best = -1;
+  std::size_t best_valid = 0;
+  for (std::size_t i = 0; i < attempts.size(); ++i)
+    if (attempts[i].valid_count >= 3 && attempts[i].valid_count >= best_valid) {
+      best = static_cast<int>(i);
+      best_valid = attempts[i].valid_count;
+    }
+  if (best < 0) {
     outcome.decision = Decision::Leaf;
     outcome.end_reason = "cannot split";
     return outcome;
   }
-
-  int best = -1;
-  double best_score = -1.0;
-  for (std::size_t i = 0; i < attempts.size(); ++i) {
-    if (!attempts[i].checks_passed) continue;
-    if (attempts[i].score > best_score) {
-      best_score = attempts[i].score;
-      best = static_cast<int>(i);
-    }
-  }
-  if (best >= 0 && best_score >= params.floor_score) {
-    outcome.decision = Decision::Commit;
-    outcome.chosen = best;
-    outcome.end_reason = "children";
-    return outcome;
-  }
-  outcome.decision = Decision::NeedsReview;
-  outcome.chosen = best;  // may be -1
-  outcome.end_reason = "below floor";
+  outcome.decision = Decision::Commit;
+  outcome.chosen = best;
+  outcome.end_reason = "children";
+  outcome.below_target =
+      best_valid < static_cast<std::size_t>(params.children_min);
   return outcome;
 }
-
-// ---------------------------------------------------------------- funnel
 
 struct Funnel::Impl {
   FunnelOptions options;
@@ -572,9 +572,13 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     (void)tried;  // a failed pre-check runs the funnel; its checks decide
   }
 
+  // The failure reasons of the previous attempt (decision 0024): injected
+  // into the planner and the synthesizer of the next one.
   std::string injected_issues;
   std::vector<Attempt> attempts;
+  std::vector<Meter> meters;
   attempts.reserve(3);
+  meters.reserve(3);
 
   for (int number = 1; number <= impl_->options.params.max_attempts;
        ++number) {
@@ -665,6 +669,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     }
 
     // Trims: two rounds to 400 and 300; the light funnel runs one round.
+    // A round is skipped when the deduplicated pool is already at or below
+    // its target (decision 0024).
     int trim_failures = 0;
     std::string trim_failure_class;
     auto trim_round = [&](int keep) {
@@ -701,13 +707,16 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       if (doomed_by.empty()) doomed_by = trim_failure_class;
     }
 
-    // Critique.
+    // Critique — only when the campaign turned the critic on (decision
+    // 0024). Its score is recorded and its text feeds the synthesizer; it
+    // never gates the attempt.
     Critique critique;
-    if (!failed) {
-      const llm::Result reply = counted(make_request(
-          impl_->options, ctx,
-          critique_prompt(ctx, candidates),
-          temperature));
+    if (!failed && impl_->options.critic) {
+      llm::Request critique_request = make_request(
+          impl_->options, ctx, critique_prompt(ctx, candidates), temperature);
+      if (!impl_->options.critic_model.empty())
+        critique_request.model = impl_->options.critic_model;
+      const llm::Result reply = counted(critique_request);
       meter.add(reply);
       if (!result_ok(reply)) {
         failed = true;
@@ -722,22 +731,25 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     // Synthesizer.
     std::vector<Child> children;
     if (!failed) {
-      std::ostringstream critique_text;
-      critique_text << "score=" << critique.score << ", remove: ";
-      for (std::size_t i = 0; i < critique.remove.size(); ++i)
-        critique_text << (i ? ";" : "") << critique.remove[i];
-      critique_text << ", add: ";
-      for (std::size_t i = 0; i < critique.add.size(); ++i)
-        critique_text << (i ? ";" : "") << critique.add[i];
-      critique_text << ", issues: " << critique.issues;
-
+      std::string critique_text;
+      if (impl_->options.critic) {
+        std::ostringstream critique_stream;
+        critique_stream << "score=" << critique.score << ", remove: ";
+        for (std::size_t i = 0; i < critique.remove.size(); ++i)
+          critique_stream << (i ? ";" : "") << critique.remove[i];
+        critique_stream << ", add: ";
+        for (std::size_t i = 0; i < critique.add.size(); ++i)
+          critique_stream << (i ? ";" : "") << critique.add[i];
+        critique_stream << ", issues: " << critique.issues;
+        critique_text = critique_stream.str();
+      }
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          synthesizer_prompt(ctx, candidates, critique_text.str(),
+          synthesizer_prompt(ctx, candidates, critique_text,
                              impl_->options.synth_target_min,
                              impl_->options.synth_target_max,
                              impl_->options.synth_max_children,
-                             impl_->options.compact_output),
+                             impl_->options.compact_output, injected_issues),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -751,58 +763,30 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       }
     }
 
-    // Atomic verification (DESIGN › Quality gate and retries; decision
-    // 0021: batched — ONE call per parent).  A child the synthesizer
-    // labelled atomic is a leaf only when the check names it in
-    // admits_none; otherwise it stays a task.  A failed call keeps every
-    // labelled child a task — a transport error must not decide
-    // atomicity.
-    if (!failed && impl_->options.verify_atomic) {
-      std::vector<std::string> labelled;
-      for (const Child& child : children)
-        if (child.atomic) labelled.push_back(child.title);
-      if (!labelled.empty()) {
-        // The reply must be able to NAME titles: the budget scales with
-        // the labelled list (a 128-token cap truncated the 57-title
-        // replies in the DR 0021 measurement).
-        const llm::Result verify = counted(make_request(
-            impl_->options, ctx,
-            atomic_verification_prompt(ctx.title, labelled), 0.0,
-            std::max(128, 10 * static_cast<int>(labelled.size()))));
-        meter.add(verify);
-        const auto verdict = result_ok(verify)
-                                 ? parse_atomic_verdict(verify.content)
-                                 : std::nullopt;
-        std::set<std::string> admits_none;
-        if (verdict)
-          for (const std::string& title : *verdict)
-            admits_none.insert(depot::canonical(title));
-        for (Child& child : children)
-          if (child.atomic &&
-              admits_none.count(depot::canonical(child.title)) == 0)
-            child.atomic = false;
-      }
+    // The deterministic checks ARE the gate (decision 0024).
+    attempt.children = children;
+    attempt.issues = impl_->options.critic ? critique.issues.substr(0, 1000)
+                                           : std::string{};
+    attempt.score = (!failed && impl_->options.critic) ? critique.score : 0.0;
+    if (!failed && !children.empty()) {
+      const Checks checks =
+          run_checks(children, ctx, impl_->options.synth_max_children,
+                     impl_->options.params.children_min);
+      attempt.checks_passed = checks.passed();
+      attempt.valid_count = checks.valid_count;
+      attempt.child_valid = checks.child_valid;
+      attempt.failures = checks.failures;
+    } else {
+      attempt.checks_passed = false;
+      attempt.failures.push_back(failed
+                                     ? "a funnel call did not complete or its "
+                                       "reply was not valid JSON"
+                                     : "the reply contained no children");
     }
-
-    // The attempt's metering covers EVERY call it made, the synthesizer
-    // and the verification included (F-FUN-1).
     attempt.tokens_in = meter.in_miss;
     attempt.tokens_cached = meter.in_hit;
     attempt.tokens_out = meter.out;
     attempt.cost_usd = meter.cost();
-
-    attempt.children = children;
-    attempt.issues = critique.issues.substr(0, 1000);
-    if (!failed && !children.empty()) {
-      const Checks checks =
-          run_checks(children, ctx, impl_->options.synth_max_children);
-      attempt.checks_passed = checks.passed();
-      attempt.score = critique.score;
-    } else {
-      attempt.checks_passed = false;
-      attempt.score = failed ? 0.0 : critique.score;
-    }
-    if (failed) attempt.issues = "attempt failed: a funnel call did not complete";
 
     // A provider failure doomed this attempt: it taught nothing about the
     // node, so it is not an attempt and the node is not judged (F-GATE-2).
@@ -815,17 +799,82 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       return result;
     }
 
-    injected_issues = attempt.issues;
-    attempts.push_back(attempt);
+    // The failure reasons for the next attempt (capped like critique
+    // issues). A passing attempt never needs them.
+    injected_issues.clear();
+    if (!attempt.checks_passed) {
+      for (const std::string& failure : attempt.failures) {
+        if (!injected_issues.empty()) injected_issues += "; ";
+        injected_issues += failure;
+        if (injected_issues.size() > 1000) break;
+      }
+      if (injected_issues.size() > 1000) injected_issues.resize(1000);
+    }
+
+    attempts.push_back(std::move(attempt));
+    meters.push_back(meter);
 
     const Outcome outcome = decide(attempts, impl_->options.params);
-    if (outcome.decision != Decision::Retry) {
-      result.decision = outcome.decision;
-      result.end_reason = outcome.end_reason;
-      result.attempts = std::move(attempts);
-      result.chosen = outcome.chosen;
-      return result;
+    if (outcome.decision == Decision::Retry) continue;
+
+    result.decision = outcome.decision;
+    result.end_reason = outcome.end_reason;
+    result.chosen = outcome.chosen;
+    result.below_target = outcome.below_target;
+    if (outcome.decision == Decision::Commit) {
+      Attempt& chosen = attempts[outcome.chosen];
+      // Commit the valid children only, at most the hard maximum.
+      std::vector<Child> kept;
+      for (std::size_t i = 0; i < chosen.children.size(); ++i) {
+        const bool valid =
+            i < chosen.child_valid.size() ? chosen.child_valid[i] != 0 : true;
+        if (!valid) continue;
+        if (kept.size() >= static_cast<std::size_t>(
+                               impl_->options.synth_max_children))
+          break;
+        kept.push_back(chosen.children[i]);
+      }
+      chosen.children = std::move(kept);
+
+      // Atomic verification (decision 0021: batched — ONE call) runs on
+      // the chosen attempt only (decision 0024). A child the synthesizer
+      // labelled atomic is a leaf only when the check names it in
+      // admits_none; a failed call keeps every labelled child a task — a
+      // provider error must not decide atomicity.
+      if (impl_->options.verify_atomic) {
+        std::vector<std::string> labelled;
+        for (const Child& child : chosen.children)
+          if (child.atomic) labelled.push_back(child.title);
+        if (!labelled.empty()) {
+          // The reply must be able to NAME titles: the budget scales with
+          // the labelled list (a 128-token cap truncated the 57-title
+          // replies in the DR 0021 measurement).
+          const llm::Result verify = counted(make_request(
+              impl_->options, ctx,
+              atomic_verification_prompt(ctx.title, labelled), 0.0,
+              std::max(128, 10 * static_cast<int>(labelled.size()))));
+          Meter& chosen_meter = meters[outcome.chosen];
+          chosen_meter.add(verify);
+          chosen.tokens_in = chosen_meter.in_miss;
+          chosen.tokens_cached = chosen_meter.in_hit;
+          chosen.tokens_out = chosen_meter.out;
+          chosen.cost_usd = chosen_meter.cost();
+          const auto verdict = result_ok(verify)
+                                   ? parse_atomic_verdict(verify.content)
+                                   : std::nullopt;
+          std::set<std::string> admits_none;
+          if (verdict)
+            for (const std::string& title : *verdict)
+              admits_none.insert(depot::canonical(title));
+          for (Child& child : chosen.children)
+            if (child.atomic &&
+                admits_none.count(depot::canonical(child.title)) == 0)
+              child.atomic = false;
+        }
+      }
     }
+    result.attempts = std::move(attempts);
+    return result;
   }
 
   // Unreachable: decide() never returns Retry after max_attempts.

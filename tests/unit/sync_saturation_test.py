@@ -90,7 +90,7 @@ def main():
         campaign = os.path.join(root, "campaign.json")
         with open(campaign, "w") as f:
             json.dump({"id": "mp_sat", "scope": ["P01"],
-                       "loop_budget": 20, "mode": "breadth-first",
+                       "loop_budget": 20, "children_min": 3, "mode": "breadth-first",
                        "chunk": 50, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign, "--data-dir",
             devices[1]["data"], "--yes")
