@@ -176,3 +176,16 @@ Proof (frozen final binary, 2026-10-13): 30/30 sync.multi_process_convergence un
 CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the slow Linux runner — the fleet's in-flight chunk work (bounded by the budget, not the deadline) drains in ~8 min there while the local 30/30 proof runs in ~90 s. The deadline is the outer safety net, NOT the progress criterion, so it moves to 720 s (ctest TIMEOUT 780); the no-progress criterion (90 s, records-or-rounds) is untouched.
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
+
+## 2026-10-14 · takeover · Phase A review + B0 housekeeping
+
+Result: Phase A review written and PR'd (#42); B0 in progress on `b0-housekeeping`.
+Evidence:
+- Review: `docs/agent/REVIEW.md` (PR #42, commit `fa9e880`) — 2 Critical, 10 High, 20 Medium, 6 Low findings; decision registry `docs/decisions/INDEX.md`.
+- CI state of `m8-depth-scale`: run 38556586929 FAILED (macOS arm64 `sync.multi_process_convergence` "quiescence", 731 s), run 38553880466 FAILED (Windows). The earlier "7 of 8 green" claim is not supported. `main` is green (run 38512298081).
+- Local: `linux-debug` and `linux-release` build exit 0; full `ctest --preset linux-debug` = 100% pass, 341/341 in 707.25 s (4 `llm.*` probes skipped without `ONION_NIGHTLY=1`).
+- A4 load loops (mp x30, partition x20, fleet x10 under `ctest -j8` load) running from `scratchpad/a4_loops.sh`; results go into REVIEW.md A4.
+- Environment: three orphaned `data_depot` test nodes from Oct 13 were left running (kill was denied) — F-ENV-1.
+- B0: `CLAUDE.md` committed; `docs/agent/STATUS.md` replaced by pointers.
+Backlog (Medium/Low): tracked by ID in REVIEW.md section 0.
+Next step: finish A4 results into REVIEW.md, merge #42 and the B0 PR (all 8 CI jobs green), then B1 — Critical/High fixes each with a failing-first test, starting with F-SYNC-1 (NonceCache mutex), F-SEC-1, F-SEC-2, F-SYNC-2, F-GATE-2, F-FUN-1, F-BUD-1, F-M8-1.
