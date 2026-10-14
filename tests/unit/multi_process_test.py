@@ -24,6 +24,11 @@ HEALTHY_SCENARIO = str(ROOT / "tools" / "fake_deepseek" / "scenarios" / "healthy
 # The local verification loop runs at 120 s; the CI sanitizer and hosted
 # macOS jobs are slower, so ctest overrides this through the environment.
 HARD_DEADLINE_S = float(os.environ.get("ONION_MP_DEADLINE_S", "120"))
+# Step 2 (quiescence) has its OWN window: after the budget is reserved each
+# device still drains its in-flight chunk (50 attempts), which takes minutes
+# on a slow runner and used to be billed to the step-1 deadline (macOS arm64
+# CI, run 38556586929: "FAILED: quiescence" at 731 s).
+QUIESCENCE_S = float(os.environ.get("ONION_MP_QUIESCENCE_S", "300"))
 SYNC_ROUND_S = 15.0
 
 
@@ -229,9 +234,19 @@ def main():
 
         previous = None
         quiescent_rounds = 0
+        quiescence_started = time.time()
+        quiescence_deadline = quiescence_started + QUIESCENCE_S
+        vector_changes = 0
+        last_change_at = quiescence_started
         while quiescent_rounds < 3:
-            if time.time() > deadline:
-                raise DeadlineExceeded("quiescence")
+            if time.time() > quiescence_deadline:
+                # Say whether the fleet was still working (a slow drain) or
+                # had stopped moving without converging (a real defect).
+                raise DeadlineExceeded(
+                    "quiescence: no 3 silent rounds within %.0f s (%d vector "
+                    "changes, last %.0f s ago; sample=%r)"
+                    % (QUIESCENCE_S, vector_changes,
+                       time.time() - last_change_at, previous))
             time.sleep(SYNC_ROUND_S)
             try:
                 current = vector_signature()
@@ -247,6 +262,9 @@ def main():
                 quiescent_rounds += 1
             else:
                 quiescent_rounds = 0
+                if previous is not None:
+                    vector_changes += 1
+                    last_change_at = time.time()
             previous = current
 
         # 3. Convergence assertions.

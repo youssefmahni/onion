@@ -819,4 +819,98 @@ TEST_F(SyncTest, PeerLagMeasuresTheGapToThePeer) {
                 &error),
             0);
 }
+
+// F-SYNC-6 / F-SYNC-4: classification of pushed batches by exactly
+// (origin, number), not just for the head batch.
+TEST_F(SyncTest, PushClassifiesOlderBatchesGapsAndForgeriesByOriginAndNumber) {
+  // B commits four batches; A receives 1 and 2 only.
+  for (int i = 1; i <= 4; ++i) {
+    writer_b_->submit(CommitTerminal{{make_record(
+        "ADD_NODE", {{"path", "P01-IN01-T01-TK0000" + std::to_string(i)},
+                     {"layer", 4}, {"title", "From B " + std::to_string(i)}})}});
+    writer_b_->sync();
+  }
+  std::vector<std::string> batches;
+  {
+    std::ifstream in(writer_b_->segments().active_path());
+    std::string line;
+    while (std::getline(in, line))
+      if (!line.empty()) batches.push_back(line);
+  }
+  ASSERT_GE(batches.size(), 4u);
+
+  start_server_a();
+  httplib::Client client("127.0.0.1", server_->bound_port());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  Ed25519Signer signer_b(*key_b_);
+  const auto post = [&](const std::string& body) {
+    httplib::Headers headers;
+    for (const auto& [name, value] : onion::sync::signed_post_headers(
+             key_b_->device_id, "/sync/v1/push", body, signer_b))
+      headers.emplace(name, value);
+    return client.Post("/sync/v1/push", headers, body, "application/json");
+  };
+
+  ASSERT_EQ(post(batches[0])->status, 202);
+  writer_a_->sync();
+  ASSERT_EQ(post(batches[1])->status, 202);
+  writer_a_->sync();
+  ASSERT_EQ(writer_a_->vector()[key_b_->device_id], 2);
+
+  // (1) An identical OLDER batch (number 1 while the head is 2): a
+  // duplicate, not a fork, nothing re-applied.
+  auto response = post(batches[0]);
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  EXPECT_NE(response->body.find("duplicate"), std::string::npos);
+  EXPECT_TRUE(writer_a_->forks().empty());
+
+  // (2) A gap: number 4 while the head is 2 (3 is missing): 409 gap, not
+  // a fork, not applied (the puller closes the gap).
+  response = post(batches[3]);
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 409);
+  EXPECT_NE(response->body.find("gap"), std::string::npos);
+  EXPECT_TRUE(writer_a_->forks().empty());
+  writer_a_->sync();
+  EXPECT_EQ(writer_a_->vector()[key_b_->device_id], 2);
+
+  // (3) An older FORK: number 1 re-signed with different records is a
+  // forked log (409, recorded once, never applied).
+  const auto parsed = nlohmann::json::parse(batches[0], nullptr, false);
+  ASSERT_FALSE(parsed.is_discarded());
+  std::vector<onion::log::Record> records;
+  records.push_back(make_record(
+      "ADD_NODE", {{"path", "P01-IN01-T01-TK00001"}, {"layer", 4},
+                   {"title", "Forked older content"}}));
+  records[0].seq = 1;
+  const onion::log::Batch fork = onion::log::make_batch(
+      key_b_->device_id, 1, parsed["prev"].get<std::string>(), records,
+      signer_b);
+  response = post(fork.to_json().dump());
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 409);
+  EXPECT_NE(response->body.find("forked"), std::string::npos);
+  ASSERT_EQ(writer_a_->forks().size(), 1u);
+  EXPECT_EQ(writer_a_->forks()[0].number, 1u);
+  EXPECT_EQ(writer_a_->vector()[key_b_->device_id], 2);
+
+  // (4) A FORGERY for (B, 2): a different hash with a signature that does
+  // not verify under B's key must not plant a second fork entry — it
+  // fails its own verification first (F-SYNC-4).
+  auto forged = nlohmann::json::parse(batches[1], nullptr, false);
+  ASSERT_FALSE(forged.is_discarded());
+  // Same (origin, number) with a different claimed hash and a signature
+  // that cannot verify: what a malicious member would send to plant a
+  // fork entry against B.
+  forged["hash"] = std::string(64, 'a');
+  response = post(forged.dump());
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 409);
+  EXPECT_EQ(response->body.find("forked"), std::string::npos);
+  EXPECT_EQ(writer_a_->forks().size(), 1u);  // still only the real fork
+}
+
 }  // namespace

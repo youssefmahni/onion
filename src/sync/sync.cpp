@@ -649,7 +649,22 @@ bool SyncServer::start(std::string* error) {
         return;
       }
       // Same (origin, number), different hash: a forked log. Never
-      // apply it; record it, log it, surface it.
+      // apply it; record it, log it, surface it — but only when the
+      // incoming batch is genuinely the origin's: it must pass its own
+      // hash and signature check first, or any authenticated member could
+      // plant fork entries against another device (F-SYNC-4).
+      log::VerifyContext self_check;
+      self_check.version = 1;
+      self_check.expected_prev = batch.prev;
+      self_check.expected_first_seq =
+          batch.records.empty() ? 0 : batch.records.front().seq;
+      self_check.origin_public_key = &origin_public_key;
+      if (log::verify(batch, self_check) != log::Verify::Ok) {
+        response.status = 409;
+        response.set_content("{\"error\":\"batch verify failed\"}",
+                             "application/json");
+        return;
+      }
       impl_->options.writer->note_fork(
           state::StateWriter::ForkEvent{batch.origin, batch.number,
                                         batch.hash, *stored});
@@ -813,7 +828,7 @@ bool SyncServer::start(std::string* error) {
     auto& writer = *impl_->options.writer;
     const std::string origin = request.matches[1];
     std::string error;
-    const std::vector<store::Node> nodes = writer.db().all_nodes(&error);
+    const std::vector<store::Node> nodes = writer.read_db().all_nodes(&error);
     nlohmann::json json;
     json["origin"] = origin;
     json["root"] = store::merkle_root(nodes);
