@@ -549,21 +549,24 @@ TEST(MeasureParams, ReadsCompressedAndActiveLogFootprintPerSettledNode) {
                                        .time_since_epoch()
                                        .count()));
   std::filesystem::create_directories(dir / "oplog" / "dev");
-  onion::store::Db db(dir / "onion.db");
-  std::string error;
-  ASSERT_TRUE(db.open(&error)) << error;
-  ASSERT_TRUE(db.exec(
-      "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, hlc, origin) VALUES "
-      "('P01', 1, 0, 1, '0.8', 'c', 1, 'dev'),"
-      "('P02', 1, 0, 1, '0.8', 'c', 2, 'dev');",
-      &error)) << error;
   {
-    std::ofstream log(dir / "oplog" / "dev" / "1.log", std::ios::binary);
-    log << std::string(1000, 'x');
+    onion::store::Db db(dir / "onion.db");
+    std::string error;
+    ASSERT_TRUE(db.open(&error)) << error;
+    ASSERT_TRUE(db.exec(
+        "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, hlc, origin) VALUES "
+        "('P01', 1, 0, 1, '0.8', 'c', 1, 'dev'),"
+        "('P02', 1, 0, 1, '0.8', 'c', 2, 'dev');",
+        &error)) << error;
+    {
+      std::ofstream log(dir / "oplog" / "dev" / "1.log", std::ios::binary);
+      log << std::string(1000, 'x');
+    }
+    const auto params = onion::sched::measure_params(db, &error);
+    EXPECT_EQ(error, "");
+    EXPECT_DOUBLE_EQ(params.log_bytes_per_node, 500.0);
   }
-  const auto params = onion::sched::measure_params(db, &error);
-  EXPECT_EQ(error, "");
-  EXPECT_DOUBLE_EQ(params.log_bytes_per_node, 500.0);
+  // SQLite must be closed before Windows can remove the temporary directory.
   std::filesystem::remove_all(dir);
 }
 

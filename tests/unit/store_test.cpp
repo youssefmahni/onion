@@ -267,32 +267,34 @@ TEST(CheckpointTest, CompactsOldAuditRowsIntoSummaryWithoutChangingTotals) {
   });
   ASSERT_TRUE(writer.write(5005, {{"dev", 4}}, &error)) << error;
 
-  Db snapshot(dir / "checkpoint-5005.db");
-  ASSERT_TRUE(snapshot.open(&error)) << error;
-  auto count = [&](std::string_view table) {
-    auto statement = snapshot.prepare("SELECT COUNT(*) FROM " + std::string(table),
-                                      &error);
-    EXPECT_TRUE(statement.has_value()) << error;
-    EXPECT_TRUE(statement->step_row(&error)) << error;
-    return statement->integer_int(0);
-  };
-  EXPECT_EQ(count("attempts"), 1);   // only the fresh P02 row remains raw
-  EXPECT_EQ(count("critiques"), 1);  // only the fresh P02 row remains raw
+  {
+    Db snapshot(dir / "checkpoint-5005.db");
+    ASSERT_TRUE(snapshot.open(&error)) << error;
+    auto count = [&](std::string_view table) {
+      auto statement = snapshot.prepare("SELECT COUNT(*) FROM " + std::string(table),
+                                        &error);
+      EXPECT_TRUE(statement.has_value()) << error;
+      EXPECT_TRUE(statement->step_row(&error)) << error;
+      return statement->integer_int(0);
+    };
+    EXPECT_EQ(count("attempts"), 1);   // only the fresh P02 row remains raw
+    EXPECT_EQ(count("critiques"), 1);  // only the fresh P02 row remains raw
 
-  auto summary = snapshot.prepare(
-      "SELECT attempts, critiques, passed, tokens_in, tokens_cached, "
-      "tokens_out, cost_nanos FROM checkpoint_summaries WHERE path='P01';",
-      &error);
-  ASSERT_TRUE(summary.has_value()) << error;
-  ASSERT_TRUE(summary->step_row(&error)) << error;
-  EXPECT_EQ(summary->integer_int(0), 1);
-  EXPECT_EQ(summary->integer_int(1), 1);
-  EXPECT_EQ(summary->integer_int(2), 1);
-  EXPECT_EQ(summary->integer(3), 100);
-  EXPECT_EQ(summary->integer(4), 20);
-  EXPECT_EQ(summary->integer(5), 30);
-  EXPECT_EQ(summary->integer(6), 1200000);  // exact USD nanounits
-  EXPECT_EQ(snapshot.spend_usd(&error), "0.0016");
+    auto summary = snapshot.prepare(
+        "SELECT attempts, critiques, passed, tokens_in, tokens_cached, "
+        "tokens_out, cost_nanos FROM checkpoint_summaries WHERE path='P01';",
+        &error);
+    ASSERT_TRUE(summary.has_value()) << error;
+    ASSERT_TRUE(summary->step_row(&error)) << error;
+    EXPECT_EQ(summary->integer_int(0), 1);
+    EXPECT_EQ(summary->integer_int(1), 1);
+    EXPECT_EQ(summary->integer_int(2), 1);
+    EXPECT_EQ(summary->integer(3), 100);
+    EXPECT_EQ(summary->integer(4), 20);
+    EXPECT_EQ(summary->integer(5), 30);
+    EXPECT_EQ(summary->integer(6), 1200000);  // exact USD nanounits
+    EXPECT_EQ(snapshot.spend_usd(&error), "0.0016");
+  }  // Close SQLite before Windows removes the temporary directory.
 
   const auto manifest = nlohmann::json::parse(
       std::ifstream(dir / "checkpoint-5005.db.manifest"));
