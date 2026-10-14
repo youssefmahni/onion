@@ -1,4 +1,15 @@
 # Worklog (append-only, newest at top)
+## 2026-10-14 · M8 · local implementation complete
+
+Result: all planned implementation areas are in place locally: branch shares
+and pools, no-spend depth checkpoints, 30-day compact checkpoint summaries,
+measured oplog-growth planning, L6 light-funnel parsing, and API/dashboard
+observability. Focused M8 tests pass; API and live-node checks passed with
+host loopback available; complete Linux-debug CTest: 341/341 in 795.96 s
+(four configured optional LLM probes skipped). CI remains pending OA-14.
+Decision 0022 and `docs/agent/gates/M8.md` record the contract; Parquet
+remains OA-17.
+
 ## 2026-10-12T10:5xZ · m6 · owner corrections merged, m6-rc re-tagged
 
 Result: PASS. PR #22 (`m6-corrections`) merged after OPT's PR #21: decision 0014 budget safety (capped fold, void, one reservation per sync round, measured chunks), the structure-flag enforcement with the L4 test corpus, and the 0010-faithful convergence test (progress-based failure, OS-assigned ports, finished incl. nothing in flight). Proof: 20/20 consecutive local passes, 277/277 local, three consecutive green CI runs on the final head 7010e64 on every OS — macOS arm64 included (no skips). The M6 gate report carries the correction evidence table.

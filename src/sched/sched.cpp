@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <cstdio>
@@ -71,7 +72,10 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   }
   spec.max_attempts = value.value("max_attempts", 3);
   spec.chunk = value.value("chunk", std::int64_t{50});
-  spec.light_funnel_from = value.value("light_funnel_from", 8);
+  // Decision 0017 supersedes the original M3 L8 default.  Keep this in
+  // lockstep with CampaignSpec so a campaign file and its persisted spec
+  // select the same funnel at L6.
+  spec.light_funnel_from = value.value("light_funnel_from", 6);
   spec.structure = value.value("structure", false);
   spec.spillover = value.value("spillover", true);
   spec.model = value.value("model", std::string{"deepseek-flash"});
@@ -105,6 +109,44 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
     return fail("audit_rate out of range 0..1");
   if (spec.stop_atomic_share <= 0.0 || spec.stop_atomic_share > 1.0)
     return fail("stop_atomic_share out of range (0, 1]");
+  // M8 branch share (decision 0020): a number or an exact decimal string
+  // (decision 0003 — no floats in records).
+  try {
+    spec.branch_share = parse_score("branch_share", 0.5);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.branch_share <= 0.0 || spec.branch_share > 1.0)
+    return fail("branch_share must be in (0, 1]");
+  if (value.contains("pools") && value["pools"].is_object())
+    for (const auto& [path, attempts] : value["pools"].items())
+      if (attempts.is_number_integer())
+        spec.pools[path] = attempts.get<std::int64_t>();
+  spec.depth_checkpoint_from = value.value("depth_checkpoint_from", 0);
+  spec.depth_checkpoint_every = value.value("depth_checkpoint_every", 0);
+  if (spec.depth_checkpoint_from < 0 || spec.depth_checkpoint_every < 0)
+    return fail("depth checkpoint fields must be non-negative");
+  if ((spec.depth_checkpoint_from == 0) != (spec.depth_checkpoint_every == 0))
+    return fail("depth checkpoint needs both from and every (or neither)");
+  // M8 branch share (decision 0020): a number or an exact decimal string
+  // (decision 0003 — no floats in records).
+  try {
+    spec.branch_share = parse_score("branch_share", 0.5);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.branch_share <= 0.0 || spec.branch_share > 1.0)
+    return fail("branch_share must be in (0, 1]");
+  if (value.contains("pools") && value["pools"].is_object())
+    for (const auto& [path, attempts] : value["pools"].items())
+      if (attempts.is_number_integer())
+        spec.pools[path] = attempts.get<std::int64_t>();
+  spec.depth_checkpoint_from = value.value("depth_checkpoint_from", 0);
+  spec.depth_checkpoint_every = value.value("depth_checkpoint_every", 0);
+  if (spec.depth_checkpoint_from < 0 || spec.depth_checkpoint_every < 0)
+    return fail("depth checkpoint fields must be non-negative");
+  if ((spec.depth_checkpoint_from == 0) != (spec.depth_checkpoint_every == 0))
+    return fail("depth checkpoint needs both from and every (or neither)");
   // W5 funnel variants: optional; every value is validated on parse.
   if (value.contains("worker_candidates")) {
     if (!value["worker_candidates"].is_number_integer())
@@ -183,6 +225,18 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   if (spec.compact_output) out["compact_output"] = true;
   if (spec.cache_prefix) out["cache_prefix"] = true;
   if (spec.verify_atomic) out["verify_atomic"] = true;
+  // M8 branch share (decision 0020): the ratio and the starting pools
+  // travel in the record so every replica folds the same numbers.
+  out["branch_share"] = std::to_string(spec.branch_share);
+  if (spec.depth_checkpoint_every > 0) {
+    out["depth_checkpoint_from"] = spec.depth_checkpoint_from;
+    out["depth_checkpoint_every"] = spec.depth_checkpoint_every;
+  }
+  if (!spec.pools.empty()) {
+    nlohmann::json pools = nlohmann::json::object();
+    for (const auto& [path, attempts] : spec.pools) pools[path] = attempts;
+    out["pools"] = std::move(pools);
+  }
   return out;
 }
 
@@ -430,7 +484,7 @@ std::string attempt_issues(const gate::Attempt& attempt) {
 
 }  // namespace
 
-Engine::RunResult Engine::run(const CampaignSpec& spec,
+Engine::RunResult Engine::run(CampaignSpec& spec,
                               std::atomic<bool>* external_stop) {
   RunResult result;
   auto& writer = impl_->options.writer;
@@ -443,6 +497,15 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   // Emit the CAMPAIGN record only when the campaign is new (the run loop
   // re-enters run() after every drain; re-emission would spam the log).
   if (!existing) {
+    // M8 branch shares (decision 0020): the starting pools are computed
+    // HERE, once, and embedded in the record so every replica folds the
+    // same numbers. A pre-M8 campaign (pools already absent from a
+    // stored spec) stays without the rule.
+    if (spec.pools.empty() && !spec.scope.empty()) {
+      std::string pool_error;
+      spec.pools =
+          compute_starting_pools(writer, spec, &pool_error);
+    }
     writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", campaign_spec_json(spec)},
@@ -517,6 +580,13 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   std::vector<store::Node> node_cache;
   std::vector<std::string> review_cache;
   bool cache_valid = false;
+  // M8 branch shares (decision 0020): the allowance fold and the
+  // attempt list, rebuilt with the ticket cache. Deterministic: both
+  // come from the store (itself a fold), ordered by (hlc, origin) inside
+  // fold_pool_allowances. Empty spec.pools (pre-M8 campaigns) disables
+  // the rule.
+  std::map<std::string, std::int64_t> allowances;
+  std::vector<std::string> attempt_paths;
   const auto refresh_tickets = [&]() {
     std::string error;
     if (!cache_valid) {
@@ -534,10 +604,59 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
           review_cache.push_back(review.path);
       cache_valid = true;
     }
+    // The pool ledger is rebuilt on EVERY refresh: children join the
+    // node cache incrementally as settles commit, and each new attempt
+    // changes the remaining pools. The events come from the STORE, never
+    // the cache: the cache's incremental entries carry no hlc (they would
+    // sort before every attempt and break the remaining-pool math).
+    allowances.clear();
+    attempt_paths.clear();
+    if (!spec.pools.empty()) {
+      std::vector<PoolEvent> events;
+      std::string nodes_error;
+      if (spec.scope.empty()) {
+        for (const store::Node& node : writer.db().all_nodes(&nodes_error))
+          events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
+                                     node.hlc, node.origin});
+      } else {
+        for (const std::string& prefix : spec.scope)
+          for (const store::Node& node : writer.db().nodes_with_path_prefix(
+                   prefix, &nodes_error))
+            events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
+                                       node.hlc, node.origin});
+      }
+      std::string attempt_error;
+      auto statement = writer.db().prepare(
+          "SELECT path, hlc, origin FROM attempts "
+          "WHERE campaign = ?1;",
+          &attempt_error);
+      if (statement) {
+        std::string bind_error;
+        statement->bind(1, spec.id, &bind_error);
+        std::string step_error;
+        while (statement->step_row(&step_error)) {
+          const std::string path = statement->text(0);
+          events.push_back(PoolEvent{PoolEvent::Kind::Attempt, path,
+                                     static_cast<std::uint64_t>(
+                                         statement->integer(1)),
+                                     statement->text(2)});
+          attempt_paths.push_back(path);
+        }
+      }
+      allowances = fold_pool_allowances(spec.pools, events);
+    }
     return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
                          [&](std::string_view path) { return writer.leaf(path); },
                          review_cache, spec);
+  };
+  // The ticket's share: attempts in its subtree (the prefix rule).
+  const auto subtree_attempts = [&](std::string_view path) {
+    const std::string prefix = std::string(path) + "-";
+    std::int64_t total = 0;
+    for (const std::string& attempted : attempt_paths)
+      if (attempted == path || attempted.rfind(prefix, 0) == 0) ++total;
+    return total;
   };
 
   std::int64_t now_ms = wall_ms();
@@ -721,6 +840,80 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         }
         tickets.push_back(*stolen);
         stole_this_round = true;
+      }
+    }
+    // M8 depth checkpoint (DESIGN › Depth checkpoint): a ticket at a
+    // checkpoint layer is NOT started — the scheduler writes
+    // NEEDS_REVIEW (reason depth checkpoint) without spending an
+    // attempt, and accepting it (REVIEW decide) releases the ticket
+    // until the next checkpoint.
+    if (spec.depth_checkpoint_every > 0) {
+      for (auto it = tickets.begin(); it != tickets.end();) {
+        const bool at_checkpoint =
+            it->layer >= spec.depth_checkpoint_from &&
+            (it->layer - spec.depth_checkpoint_from) %
+                    spec.depth_checkpoint_every ==
+                0;
+        // A DECIDED review means the operator released this node after
+        // its checkpoint pause: attempt it now, do not re-pause it.
+        std::string review_error;
+        const auto prior =
+            at_checkpoint
+                ? writer.db().review_state(it->path, &review_error)
+                : std::nullopt;
+        if (at_checkpoint && (!prior || *prior != "decided")) {
+          writer.submit(state::CommitTerminal{{make_record(
+              "NEEDS_REVIEW", {{"path", it->path},
+                               {"reason", "depth checkpoint"},
+                               {"attempts", 0},
+                               {"score", "0"}})}});
+          writer.sync();
+          review_cache.push_back(it->path);
+          result.reviews++;
+          it = tickets.erase(it);
+          continue;
+        }
+        ++it;
+      }
+    }
+    // M8 branch shares (decision 0020): a ticket may start only when
+    // EVERY ancestor (the scope root's pool included) can still pay one
+    // more attempt — a spent allowance anywhere on the chain, or a
+    // folded allowance below 1, leafs it WITHOUT spending (end =
+    // allowance spent), exactly like the cannot-split leaf. Runs after
+    // the steal so stolen tickets are checked too.
+    if (!allowances.empty()) {
+      const auto share_exhausted = [&](std::string_view path) -> bool {
+        std::string ancestor(path);
+        while (true) {
+          const auto share = allowances.find(ancestor);
+          if (share != allowances.end() &&
+              (share->second < 1 ||
+               subtree_attempts(ancestor) >= share->second))
+            return true;
+          const std::size_t dash = ancestor.rfind('-');
+          if (dash == std::string::npos) break;
+          ancestor = ancestor.substr(0, dash);
+        }
+        return false;
+      };
+      for (auto it = tickets.begin(); it != tickets.end();) {
+        if (share_exhausted(it->path)) {
+          writer.submit(state::CommitTerminal{{make_record(
+              "SETTLE", {{"path", it->path},
+                         {"kept", 0},
+                         {"atomic", 0},
+                         {"attempts", 0},
+                         {"score", "0"},
+                         {"end", "allowance spent"},
+                         {"campaign", spec.id}})}});
+          writer.sync();
+          settled_samples.push_back(SettledSample{0, 0.0});
+          result.leaves++;  // the allowance leaf counts like cannot-split
+          it = tickets.erase(it);
+          continue;
+        }
+        ++it;
       }
     }
     if (tickets.empty() && waiting.empty()) {
@@ -915,6 +1108,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"score", "0"},
                        {"end", "cannot split"},
                        {"campaign", spec.id}})}});
+        writer.sync();  // the pool fold reads durable attempts
         result.leaves++;
         break;
       }
@@ -972,6 +1166,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                         {"campaign", spec.id},
                         {"reason", "audit"}}));
         writer.submit(state::CommitTerminal{std::move(records)});
+        // Fold the settle before the next refresh: the pool ledger
+        // (decision 0020) reads the attempts table, and the parent's
+        // pending attempts must be durable before its children's
+        // allowances are computed.
+        writer.sync();
         if (cache_valid) {
           for (std::size_t i = 0; i < chosen.children.size(); ++i) {
             store::Node child_node;
@@ -1055,6 +1254,20 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
 
 void Engine::review_accept(std::string_view path, const CampaignSpec& spec) {
   std::string error;
+  // M8 depth checkpoint: the node was paused WITHOUT an attempt, so it
+  // has no children to settle — accepting releases it back into the
+  // ticket stream (REVIEW decide only; the node stays unsettled and the
+  // next run attempts it).
+  for (const store::Review& review : impl_->options.writer.db().open_reviews(&error))
+    if (review.path == path && review.reason == "depth checkpoint") {
+      std::vector<log::Record> records;
+      records.push_back(make_record(
+          "REVIEW", {{"path", std::string(path)}, {"decision", "accept"},
+                     {"note", ""}}));
+      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
+      impl_->options.writer.sync();
+      return;
+    }
   // B3 audit (decision 0024): the audited node is ALREADY committed and
   // its subtree already expanded — accepting records the verdict only
   // (the REVIEW decision closes the audit item; nothing settles twice).
@@ -1092,6 +1305,20 @@ void Engine::review_accept(std::string_view path, const CampaignSpec& spec) {
 
 void Engine::review_retry(std::string_view path, const CampaignSpec& spec,
                           std::string note) {
+  // M8 depth checkpoint: retry releases the paused ticket WITHOUT a
+  // re-expansion lock (nothing was expanded; a dangling lock would
+  // pause the children the retried attempt is about to create).
+  std::string error;
+  for (const store::Review& review : impl_->options.writer.db().open_reviews(&error))
+    if (review.path == path && review.reason == "depth checkpoint") {
+      std::vector<log::Record> records;
+      records.push_back(make_record(
+          "REVIEW", {{"path", std::string(path)}, {"decision", "retry"},
+                     {"note", note}}));
+      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
+      impl_->options.writer.sync();
+      return;
+    }
   std::vector<log::Record> records;
   records.push_back(make_record(
       "REVIEW", {{"path", std::string(path)}, {"decision", "retry"}, {"note", note}}));
@@ -1170,6 +1397,17 @@ namespace {
 double money(std::int64_t tokens, double per_million) {
   return static_cast<double>(tokens) * per_million / 1000000.0;
 }
+
+std::int64_t projected_log_growth(std::int64_t expanded_nodes,
+                                  double bytes_per_node) {
+  if (expanded_nodes <= 0 || !(bytes_per_node > 0.0)) return 0;
+  const long double estimate = static_cast<long double>(expanded_nodes) *
+                               static_cast<long double>(bytes_per_node);
+  if (estimate >=
+      static_cast<long double>(std::numeric_limits<std::int64_t>::max()))
+    return std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(std::llround(estimate));
+}
 }  // namespace
 
 CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
@@ -1234,6 +1472,8 @@ CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
     plan.levels.push_back(row);
 
     plan.total_new_nodes = sat_add(plan.total_new_nodes, row.new_nodes);
+    plan.total_expanded_nodes =
+        sat_add(plan.total_expanded_nodes, row.expandable);
     plan.total_attempts = sat_add(plan.total_attempts, row.attempts);
     plan.total_calls = sat_add(plan.total_calls, row.calls);
     plan.tokens_in_miss = sat_add(plan.tokens_in_miss, row.tokens_in_miss);
@@ -1249,6 +1489,8 @@ CampaignPlan plan_campaign(const std::vector<std::int64_t>& level_nodes,
   plan.spend_per_hour_peak = plan.hours > 0.0 ? plan.cost_peak / plan.hours : 0.0;
   plan.spend_per_hour_offpeak =
       plan.hours > 0.0 ? plan.cost_offpeak / plan.hours : 0.0;
+  plan.expected_log_growth_bytes =
+      projected_log_growth(plan.total_expanded_nodes, params.log_bytes_per_node);
   return plan;
 }
 
@@ -1305,6 +1547,8 @@ CampaignPlan plan_grow_levels(std::int64_t expandable_total, int levels,
     plan.levels.push_back(row);
 
     plan.total_new_nodes = sat_add(plan.total_new_nodes, row.new_nodes);
+    plan.total_expanded_nodes =
+        sat_add(plan.total_expanded_nodes, row.expandable);
     plan.total_attempts = sat_add(plan.total_attempts, row.attempts);
     plan.total_calls = sat_add(plan.total_calls, row.calls);
     plan.tokens_in_miss = sat_add(plan.tokens_in_miss, row.tokens_in_miss);
@@ -1321,6 +1565,8 @@ CampaignPlan plan_grow_levels(std::int64_t expandable_total, int levels,
       plan.hours > 0.0 ? plan.cost_peak / plan.hours : 0.0;
   plan.spend_per_hour_offpeak =
       plan.hours > 0.0 ? plan.cost_offpeak / plan.hours : 0.0;
+  plan.expected_log_growth_bytes =
+      projected_log_growth(plan.total_expanded_nodes, params.log_bytes_per_node);
   return plan;
 }
 
@@ -1367,7 +1613,43 @@ PlanParams measure_params(const store::Db& db, std::string* error) {
     params.tokens_in_per_call = in_sum / attempt_rows / params.calls_per_attempt;
     params.tokens_out_per_call = out_sum / attempt_rows / params.calls_per_attempt;
   }
+  // The observed footprint includes active raw segments and sealed zstd
+  // segments, exactly what consumes device disk.  Settled nodes are the
+  // completed units which produced those terminal batches, so this is the
+  // measured bytes-per-node input for the next campaign's projection.
+  const std::filesystem::path oplog = db.path().parent_path() / "oplog";
+  std::error_code filesystem_error;
+  std::uintmax_t log_bytes = 0;
+  if (std::filesystem::exists(oplog, filesystem_error)) {
+    for (std::filesystem::recursive_directory_iterator it(
+             oplog, filesystem_error), end;
+         !filesystem_error && it != end; it.increment(filesystem_error)) {
+      if (!it->is_regular_file(filesystem_error)) continue;
+      const std::uintmax_t size = it->file_size(filesystem_error);
+      if (filesystem_error) break;
+      if (size > std::numeric_limits<std::uintmax_t>::max() - log_bytes) {
+        log_bytes = std::numeric_limits<std::uintmax_t>::max();
+        break;
+      }
+      log_bytes += size;
+    }
+  }
+  if (!settles.empty() && log_bytes > 0)
+    params.log_bytes_per_node = static_cast<double>(log_bytes) /
+                                static_cast<double>(settles.size());
   return params;
+}
+
+bool log_growth_matches_projection(std::int64_t observed_bytes,
+                                   const CampaignPlan& plan,
+                                   double tolerance) {
+  if (observed_bytes < 0 || tolerance < 0.0) return false;
+  if (plan.expected_log_growth_bytes == 0) return observed_bytes == 0;
+  const long double projected =
+      static_cast<long double>(plan.expected_log_growth_bytes);
+  const long double delta = std::fabs(static_cast<long double>(observed_bytes) -
+                                      projected);
+  return delta <= projected * static_cast<long double>(tolerance);
 }
 
 std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
@@ -1394,6 +1676,9 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
       << " output tokens/s: " << std::setprecision(2) << plan.hours << " hours\n";
   out << "spend/hour peak=" << plan.spend_per_hour_peak
       << " offpeak=" << plan.spend_per_hour_offpeak << " USD\n";
+  out << "log growth=" << plan.expected_log_growth_bytes << " bytes ("
+      << std::setprecision(2) << params.log_bytes_per_node
+      << " bytes/settled node)\n";
   if (plan.saturated)
     out << "(saturated: values clamped at int64)\n";
   return out.str();
@@ -1409,6 +1694,121 @@ bool audit_sampled(std::string_view campaign, std::string_view path,
   const std::int64_t threshold =
       static_cast<std::int64_t>(audit_rate * 1000000.0);
   return static_cast<std::int64_t>(bucket) < threshold;
+std::map<std::string, std::int64_t> compute_starting_pools(
+    state::StateWriter& writer, const CampaignSpec& spec,
+    std::string* error) {
+  std::map<std::string, std::int64_t> pools;
+  if (spec.scope.empty() || spec.loop_budget <= 0) return pools;
+  // The same open-ticket rule the engine will work with (order_tickets):
+  // under the scope, not settled, not a leaf, no open review above.
+  std::vector<store::Node> nodes;
+  for (const std::string& prefix : spec.scope)
+    for (const store::Node& node :
+         writer.db().nodes_with_path_prefix(prefix, error))
+      nodes.push_back(node);
+  std::vector<std::string> reviews;
+  for (const store::Review& review : writer.db().open_reviews(error))
+    if (review.state == "open" || review.state.empty())
+      reviews.push_back(review.path);
+  const std::vector<Ticket> tickets = order_tickets(
+      nodes,
+      [&](std::string_view path) { return writer.settled(path); },
+      [&](std::string_view path) { return writer.leaf(path); },
+      reviews, spec);
+  // Count open tickets per root (the first path segment).
+  std::map<std::string, std::int64_t> open;
+  for (const Ticket& ticket : tickets) {
+    const std::size_t dash = ticket.path.find('-');
+    const std::string root =
+        dash == std::string::npos ? ticket.path : ticket.path.substr(0, dash);
+    ++open[root];
+  }
+  // A root with no tickets gets one attempt (decision 0020); the rest of
+  // the budget splits proportionally to the ticket counts.
+  for (const std::string& root : spec.scope)
+    if (!open.count(root)) open[root] = 0;
+  std::int64_t total_open = 0;
+  for (const auto& [root, count] : open) total_open += count;
+  if (total_open <= 0) {
+    for (const std::string& root : spec.scope) pools[root] = 1;
+    return pools;
+  }
+  std::int64_t handed_out = 0;
+  for (auto it = open.begin(); it != open.end(); ++it) {
+    const bool last = std::next(it) == open.end();
+    const std::int64_t share =
+        last
+            ? spec.loop_budget - handed_out
+            : (spec.loop_budget * it->second) / total_open;
+    pools[it->first] = std::max<std::int64_t>(1, share);
+    handed_out += pools[it->first];
+  }
+  return pools;
+}
+
+std::map<std::string, std::int64_t> fold_pool_allowances(
+    const std::map<std::string, std::int64_t>& root_pools,
+    const std::vector<PoolEvent>& events) {
+  // The fold is order-independent by construction: events sort by
+  // (hlc, origin), and the allowance of a child is frozen at its
+  // creation from the parent's remaining pool AT THAT POINT.
+  std::vector<const PoolEvent*> sorted;
+  sorted.reserve(events.size());
+  for (const PoolEvent& event : events) sorted.push_back(&event);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const PoolEvent* a, const PoolEvent* b) {
+              if (a->hlc != b->hlc) return a->hlc < b->hlc;
+              return a->origin < b->origin;
+            });
+
+  std::map<std::string, std::int64_t> allowances;
+  std::map<std::string, std::int64_t> spent;
+  for (const auto& [root, pool] : root_pools) allowances[root] = pool;
+
+  // remaining(node) = allowance(node) - spent in the node's SUBTREE.
+  const auto subtree_spent = [&](std::string_view path) -> std::int64_t {
+    std::int64_t total = 0;
+    const std::string prefix = std::string(path) + "-";
+    for (const auto& [node, count] : spent)
+      if (node == path || node.rfind(prefix, 0) == 0) total += count;
+    return total;
+  };
+
+  for (const PoolEvent* event : sorted) {
+    switch (event->kind) {
+      case PoolEvent::Kind::Attempt:
+        ++spent[event->path];
+        break;
+      case PoolEvent::Kind::Create: {
+        // The parent: the nearest existing scoped ancestor (every node
+        // in the ledger has one once its ancestors were created; a child
+        // event always follows its ancestors' events in path depth —
+        // fold order keeps the invariant when hlcs are sane; when they
+        // are not, the parent lookup fails and the child keeps 0).
+        std::string parent;
+        {
+          std::string candidate = event->path;
+          while (true) {
+            const std::size_t dash = candidate.rfind('-');
+            if (dash == std::string::npos) break;
+            candidate = candidate.substr(0, dash);
+            if (allowances.count(candidate)) {
+              parent = candidate;
+              break;
+            }
+          }
+        }
+        if (parent.empty()) break;  // the root itself (or unknown): no halving
+        const std::int64_t parent_allowance = allowances.at(parent);
+        const std::int64_t remaining =
+            std::max<std::int64_t>(0, parent_allowance -
+                                      subtree_spent(parent));
+        allowances[event->path] = remaining / 2;
+        break;
+      }
+    }
+  }
+  return allowances;
 }
 
 }  // namespace onion::sched

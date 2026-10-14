@@ -22,6 +22,12 @@ struct CheckpointManifest {
   std::string snapshot_hash;   // BLAKE2b-256 of the snapshot file bytes
   std::string merkle_root;
   std::map<std::string, std::int64_t> vector;  // origin -> last_seq
+  // M8 compaction metadata.  The checkpoint snapshot contains per-path
+  // summaries for these old audit records instead of their raw rows.
+  std::uint64_t compacted_before_hlc{};
+  std::uint64_t compacted_attempts{};
+  std::uint64_t compacted_critiques{};
+  std::uint64_t compacted_nodes{};
   std::string signature;       // the creating device (hex)
   std::string cosignature;     // a second device (empty until M6)
 
