@@ -304,4 +304,10 @@ double hrw_score(std::string_view path, std::string_view device_id,
 std::optional<std::string> lane_owner(std::string_view path,
                                       const std::vector<LaneMember>& members);
 
+// B3 audit sampling (decision 0024): deterministic per-replica sampling
+// of committed nodes. BLAKE2b(campaign ‖ path) taken modulo 10^6 falls
+// below audit_rate x 10^6. Pure, so every replica samples the same set.
+bool audit_sampled(std::string_view campaign, std::string_view path,
+                   double audit_rate);
+
 }  // namespace onion::sched

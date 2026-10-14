@@ -566,3 +566,27 @@ TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
   EXPECT_NE(report.find("cost peak="), std::string::npos);
   EXPECT_NE(report.find("spend/hour peak="), std::string::npos);
 }
+
+TEST(AuditSampling, DeterministicAndRateMonotonic) {
+  // Decision 0024: the sample is a pure function of (campaign, path) —
+  // every replica and every run samples the same nodes; a higher rate
+  // samples at least the same set.
+  const double rate = 0.02;
+  int low_hits = 0;
+  for (int i = 0; i < 1000; ++i) {
+    const std::string path = "P01-TK" + std::to_string(i);
+    if (onion::sched::audit_sampled("c1", path, rate)) ++low_hits;
+    EXPECT_EQ(onion::sched::audit_sampled("c1", path, rate),
+              onion::sched::audit_sampled("c1", path, rate));
+  }
+  int high_hits = 0;
+  for (int i = 0; i < 1000; ++i)
+    if (onion::sched::audit_sampled(
+            "c1", "P01-TK" + std::to_string(i), rate * 2.0))
+      ++high_hits;
+  EXPECT_GT(low_hits, 0);
+  EXPECT_GE(high_hits, low_hits);
+  // Roughly the advertised rate (within a generous band).
+  EXPECT_LT(low_hits, 80);
+  EXPECT_GT(low_hits, 4);
+}

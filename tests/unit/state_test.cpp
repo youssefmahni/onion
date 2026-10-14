@@ -1400,3 +1400,31 @@ TEST_F(StateWriterTest, ReexpandPausesTheSubtreeUntilTheSettle) {
   EXPECT_FALSE(writer_->reexpand_open("P01"));
   EXPECT_FALSE(writer_->reexpand_open("P01-IN01"));
 }
+
+TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
+  // Decision 0024: an AUDIT record opens a review row (reason audit) but
+  // NEVER pauses the subtree (needs_review stays false); the REVIEW
+  // verdict closes the item and decrements the open counter.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  submit_campaign(*writer_);
+  writer_->submit(CommitTerminal{{make_record(
+      "AUDIT", {{"path", "P01-IN01"}, {"campaign", "mp1"},
+                {"reason", "audit"}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->audits_sampled("mp1"), 1);
+  EXPECT_EQ(writer_->audits_open("mp1"), 1);
+  // Non-blocking: the audit never enters the review-pause set.
+  EXPECT_FALSE(writer_->needs_review("P01-IN01"));
+  const auto open = writer_->db().open_reviews(&error);
+  ASSERT_EQ(open.size(), 1u);
+  EXPECT_EQ(open[0].reason, "audit");
+
+  // The verdict (REVIEW decide) closes the audit item only.
+  writer_->submit(CommitTerminal{{make_record(
+      "REVIEW", {{"path", "P01-IN01"}, {"decision", "accept"},
+                 {"note", ""}})}});
+  writer_->sync();
+  EXPECT_EQ(writer_->audits_open("mp1"), 0);
+  EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
+}
