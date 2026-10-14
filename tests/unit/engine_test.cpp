@@ -51,12 +51,77 @@ int depth_of(const std::string& prompt) {
   return digits.empty() ? 0 : std::atoi(digits.c_str());
 }
 
+// M8: a chain fake — every node produces exactly ONE child until
+// max_depth, where the pre-check refuses. Used by the branch-share
+// tests: a single chain halves its pool per level.
+SyncAsk chain_fake(int max_depth) {
+  // Every splittable node yields ONE chain link and two dead ends; the
+  // dead ends fail the next pre-check and leaf via cannot-split. The
+  // chain links get unique titles per level (an ancestor repeat would
+  // trip the similarity gate), so the tree is a single chain of
+  // splittable nodes.
+  return [=](const Request& request) -> Result {
+    Result result;
+    result.kind = Kind::Ok;
+    result.finish_reason = "stop";
+    result.cost_usd = "0.001";
+    auto reply = [&](const std::string& content) {
+      result.content = content;
+      return result;
+    };
+    const std::string& prompt = request.user;
+    const int depth = depth_of(prompt);
+    // Distinct words per level: the ancestor gate compares by LCS
+    // similarity, so "Chain Link 1" vs "Chain Link 2" (0.92) would be
+    // rejected as a repeated ancestor.
+    static const char* kChainNames[] = {
+        "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"};
+    const auto chain_title = [](int level) {
+      return "Chain Link " + std::string(kChainNames[level % 7]);
+    };
+    if (prompt.find("Can this node be split") != std::string::npos) {
+      const bool splittable =
+          depth < max_depth &&
+          (depth == 0 ||
+           prompt.find(chain_title(depth)) != std::string::npos);
+      return reply(json{{"splits", splittable}}.dump());
+    }
+    if (prompt.find("Plan the knowledge coverage") != std::string::npos)
+      return reply(json{{"items", {"Coverage A"}}}.dump());
+    if (prompt.find("Aspect:") != std::string::npos)
+      return reply(json{{"items",
+                         {chain_title(depth + 1),
+                          "Terminal Zero " + std::to_string(depth),
+                          "Terminal One " + std::to_string(depth)}}}
+                       .dump());
+    if (prompt.find("From these candidates keep only") != std::string::npos)
+      return reply(json{{"items",
+                         {chain_title(depth + 1),
+                          "Terminal Zero " + std::to_string(depth),
+                          "Terminal One " + std::to_string(depth)}}}
+                       .dump());
+    if (prompt.find("Critique this candidate set") != std::string::npos)
+      return reply(json{{"score", 0.9}, {"remove", json::array()},
+                        {"add", json::array()}, {"issues", ""}}.dump());
+    if (prompt.find("select the final children set") != std::string::npos) {
+      json children = json::array();
+      children.push_back({{"title", chain_title(depth + 1)},
+                          {"atomic", false}});
+      children.push_back({{"title", "Terminal Zero " + std::to_string(depth)},
+                          {"atomic", false}});
+      children.push_back({{"title", "Terminal One " + std::to_string(depth)},
+                          {"atomic", false}});
+      return reply(json{{"items", children}}.dump());
+    }
+    return reply(json{{"items", {"One"}}}.dump());
+  };
+}
+
 SyncAsk funnel_fake(int max_depth, std::vector<json>* calls = nullptr,
                     double score = 0.9, int atomic_from = 99) {
   return [=](const Request& request) -> Result {
     if (calls) calls->push_back({{"user", request.user}});
-    const std::string& prompt = request.user;
-    const int depth = depth_of(prompt);
+    const std::string& prompt = request.user;    const int depth = depth_of(prompt);
     Result result;
     result.kind = Kind::Ok;
     result.finish_reason = "stop";
@@ -243,7 +308,8 @@ TEST_F(EngineTest, ReviewAcceptSettlesWithoutSpending) {
   Budget budget("10");
   Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.45), budget,
                                 1, "dev0000000000000001", "0.001"});
-  const Engine::RunResult result = engine.run(spec(), nullptr);
+  CampaignSpec below_floor = spec();
+  const Engine::RunResult result = engine.run(below_floor, nullptr);
   EXPECT_EQ(result.reviews, 1);
   EXPECT_TRUE(writer_->needs_review("P01"));
 
@@ -258,7 +324,8 @@ TEST_F(EngineTest, ReviewRejectTombstonesTheSubtree) {
   Budget budget("10");
   Engine engine(Engine::Options{*writer_, funnel_fake(5, nullptr, 0.45), budget,
                                 1, "dev0000000000000001", "0.001"});
-  engine.run(spec(), nullptr);
+  CampaignSpec below_floor = spec();
+  engine.run(below_floor, nullptr);
   ASSERT_TRUE(writer_->needs_review("P01"));
 
   engine.review_reject("P01", spec());
@@ -273,7 +340,8 @@ TEST_F(EngineTest, StopIsFinal) {
   Engine engine = make_engine(budget);
   std::atomic<bool> stop{false};
   stop.store(true);
-  const Engine::RunResult result = engine.run(spec(), &stop);
+  CampaignSpec stopped_spec = spec();
+  const Engine::RunResult result = engine.run(stopped_spec, &stop);
   EXPECT_EQ(result.end_reason, "stopped");
 
   // After a stop record the campaign is final: a restart must not run it.
@@ -286,7 +354,8 @@ TEST_F(EngineTest, StopIsFinal) {
       }(),
   }});
   writer_->sync();
-  const Engine::RunResult second = engine.run(spec(), nullptr);
+  CampaignSpec stopped_spec_2 = spec();
+  const Engine::RunResult second = engine.run(stopped_spec_2, nullptr);
   EXPECT_EQ(second.end_reason, "stopped");
   EXPECT_EQ(second.settled, 0);
 }
@@ -336,6 +405,9 @@ TEST_F(EngineTest, ExhaustedCampaignStaysRunningAndResumesOnBudgetRaise) {
   tiny.chunk = 1;
   tiny.mode = "breadth-first";
   tiny.structure = true;  // this test is about the budget, not structure
+  // Pools pre-set (decision 0020): a 2-attempt budget starves the
+  // branch-share rule, and this test isolates the RESERVATION pacing.
+  tiny.pools = {{"P01", 1000}};
 
   // Decision 0014 amendment: the reservation gate starts CLOSED — a
   // 2-member fleet device reserves only after a completed (majority)
@@ -521,4 +593,41 @@ TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
   const Engine::RunResult resumed = engine.run(campaign, nullptr);
   EXPECT_EQ(resumed.end_reason, "drained");
   EXPECT_GT(resumed.settled, 0);
+}
+
+TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {
+  // M8 agent-exit criterion (decision 0020): a single chain halves its
+  // pool per level, so it ends in an allowance-spent leaf — even though
+  // the funnel fake would happily grow the chain to depth 6.
+  seed_root();
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, chain_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 8;
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+
+  // The chain halves its pool per level: 8 -> 3 -> 1 -> 0. The root and
+  // two chain links settle; the third chain link leafs WITHOUT an
+  // attempt (end = allowance spent); the chain never reaches layer 4 —
+  // the funnel fake alone would grow it to depth 6.
+  EXPECT_EQ(result.end_reason, "drained");
+  EXPECT_EQ(result.settled, 3);  // root + two chain links
+  EXPECT_EQ(result.attempts, 3);  // one per settled node, none on the leaf
+  std::string error;
+  int chain_leaf_layer = -1;
+  int chain_leaf_count = 0;
+  for (const onion::store::Node& node : writer_->db().all_nodes(&error)) {
+    if (node.title.rfind("Chain Link ", 0) != 0) continue;
+    if (writer_->leaf(node.path)) {
+      ++chain_leaf_count;
+      chain_leaf_layer = node.layer;
+    } else {
+      EXPECT_LT(node.layer, 3) << "a chain link past the allowance settled";
+    }
+  }
+  EXPECT_EQ(chain_leaf_count, 1);
+  EXPECT_EQ(chain_leaf_layer, 3);
+  EXPECT_GE(result.leaves, 5);  // dead-end siblings + the allowance leaf
 }

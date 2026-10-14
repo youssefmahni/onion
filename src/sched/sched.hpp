@@ -46,6 +46,13 @@ struct CampaignSpec {
   bool compact_output{false};
   bool cache_prefix{true};   // decision 0017: shared prompt prefix on by default
   bool verify_atomic{true};               // decision 0021: batched, on by default
+  // M8 branch shares (decision 0020): a child branch may spend at most
+  // branch_share of its parent's remaining pool; the pools map (root
+  // path -> attempts) is computed at campaign start, embedded in the
+  // CAMPAIGN record, and folded by every replica. Empty = the rule is
+  // off (pre-M8 campaigns).
+  double branch_share{0.5};
+  std::map<std::string, std::int64_t> pools;
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
@@ -246,7 +253,9 @@ class Engine {
 
   // Blocks until the campaign ends. `external_stop` may be set from another
   // thread (the CLI's stop command).
-  RunResult run(const CampaignSpec& spec, std::atomic<bool>* external_stop);
+  // Takes the spec by reference: a NEW campaign gets its starting pools
+  // (decision 0020) embedded before the CAMPAIGN record is written.
+  RunResult run(CampaignSpec& spec, std::atomic<bool>* external_stop);
 
   // Decision 0014: the node loop reports a completed sync round; the
   // engine measures the window's attempts (the next chunk is
@@ -309,5 +318,13 @@ struct PoolEvent {
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
     const std::vector<PoolEvent>& events);
+
+// Decision 0020: starting pools — the campaign's loop budget split
+// across its scope roots in proportion to each root's OPEN ticket count
+// (a root with none gets one attempt). Uses the same open-ticket rule as
+// order_tickets, so the pools are what the engine will actually work.
+std::map<std::string, std::int64_t> compute_starting_pools(
+    state::StateWriter& writer, const CampaignSpec& spec,
+    std::string* error);
 
 }  // namespace onion::sched

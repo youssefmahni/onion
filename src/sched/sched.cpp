@@ -77,6 +77,19 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  // M8 branch share (decision 0020): a number or an exact decimal string
+  // (decision 0003 — no floats in records).
+  try {
+    spec.branch_share = parse_score("branch_share", 0.5);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.branch_share <= 0.0 || spec.branch_share > 1.0)
+    return fail("branch_share must be in (0, 1]");
+  if (value.contains("pools") && value["pools"].is_object())
+    for (const auto& [path, attempts] : value["pools"].items())
+      if (attempts.is_number_integer())
+        spec.pools[path] = attempts.get<std::int64_t>();
   // W5 funnel variants: optional; every value is validated on parse.
   if (value.contains("worker_candidates")) {
     if (!value["worker_candidates"].is_number_integer())
@@ -151,6 +164,14 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   if (spec.compact_output) out["compact_output"] = true;
   if (spec.cache_prefix) out["cache_prefix"] = true;
   if (spec.verify_atomic) out["verify_atomic"] = true;
+  // M8 branch share (decision 0020): the ratio and the starting pools
+  // travel in the record so every replica folds the same numbers.
+  out["branch_share"] = std::to_string(spec.branch_share);
+  if (!spec.pools.empty()) {
+    nlohmann::json pools = nlohmann::json::object();
+    for (const auto& [path, attempts] : spec.pools) pools[path] = attempts;
+    out["pools"] = std::move(pools);
+  }
   return out;
 }
 
@@ -394,7 +415,7 @@ std::string attempt_issues(const gate::Attempt& attempt) {
 
 }  // namespace
 
-Engine::RunResult Engine::run(const CampaignSpec& spec,
+Engine::RunResult Engine::run(CampaignSpec& spec,
                               std::atomic<bool>* external_stop) {
   RunResult result;
   auto& writer = impl_->options.writer;
@@ -407,6 +428,15 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   // Emit the CAMPAIGN record only when the campaign is new (the run loop
   // re-enters run() after every drain; re-emission would spam the log).
   if (!existing) {
+    // M8 branch shares (decision 0020): the starting pools are computed
+    // HERE, once, and embedded in the record so every replica folds the
+    // same numbers. A pre-M8 campaign (pools already absent from a
+    // stored spec) stays without the rule.
+    if (spec.pools.empty() && !spec.scope.empty()) {
+      std::string pool_error;
+      spec.pools =
+          compute_starting_pools(writer, spec, &pool_error);
+    }
     writer.submit(state::CommitTerminal{{make_record(
       "CAMPAIGN", {{"id", spec.id},
                    {"spec", campaign_spec_json(spec)},
@@ -481,6 +511,13 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   std::vector<store::Node> node_cache;
   std::vector<std::string> review_cache;
   bool cache_valid = false;
+  // M8 branch shares (decision 0020): the allowance fold and the
+  // attempt list, rebuilt with the ticket cache. Deterministic: both
+  // come from the store (itself a fold), ordered by (hlc, origin) inside
+  // fold_pool_allowances. Empty spec.pools (pre-M8 campaigns) disables
+  // the rule.
+  std::map<std::string, std::int64_t> allowances;
+  std::vector<std::string> attempt_paths;
   const auto refresh_tickets = [&]() {
     std::string error;
     if (!cache_valid) {
@@ -498,10 +535,59 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
           review_cache.push_back(review.path);
       cache_valid = true;
     }
+    // The pool ledger is rebuilt on EVERY refresh: children join the
+    // node cache incrementally as settles commit, and each new attempt
+    // changes the remaining pools. The events come from the STORE, never
+    // the cache: the cache's incremental entries carry no hlc (they would
+    // sort before every attempt and break the remaining-pool math).
+    allowances.clear();
+    attempt_paths.clear();
+    if (!spec.pools.empty()) {
+      std::vector<PoolEvent> events;
+      std::string nodes_error;
+      if (spec.scope.empty()) {
+        for (const store::Node& node : writer.db().all_nodes(&nodes_error))
+          events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
+                                     node.hlc, node.origin});
+      } else {
+        for (const std::string& prefix : spec.scope)
+          for (const store::Node& node : writer.db().nodes_with_path_prefix(
+                   prefix, &nodes_error))
+            events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
+                                       node.hlc, node.origin});
+      }
+      std::string attempt_error;
+      auto statement = writer.db().prepare(
+          "SELECT path, hlc, origin FROM attempts "
+          "WHERE campaign = ?1;",
+          &attempt_error);
+      if (statement) {
+        std::string bind_error;
+        statement->bind(1, spec.id, &bind_error);
+        std::string step_error;
+        while (statement->step_row(&step_error)) {
+          const std::string path = statement->text(0);
+          events.push_back(PoolEvent{PoolEvent::Kind::Attempt, path,
+                                     static_cast<std::uint64_t>(
+                                         statement->integer(1)),
+                                     statement->text(2)});
+          attempt_paths.push_back(path);
+        }
+      }
+      allowances = fold_pool_allowances(spec.pools, events);
+    }
     return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
                          [&](std::string_view path) { return writer.leaf(path); },
                          review_cache, spec);
+  };
+  // The ticket's share: attempts in its subtree (the prefix rule).
+  const auto subtree_attempts = [&](std::string_view path) {
+    const std::string prefix = std::string(path) + "-";
+    std::int64_t total = 0;
+    for (const std::string& attempted : attempt_paths)
+      if (attempted == path || attempted.rfind(prefix, 0) == 0) ++total;
+    return total;
   };
 
   std::int64_t now_ms = wall_ms();
@@ -679,6 +765,46 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         }
         tickets.push_back(*stolen);
         stole_this_round = true;
+      }
+    }
+    // M8 branch shares (decision 0020): a ticket may start only when
+    // EVERY ancestor (the scope root's pool included) can still pay one
+    // more attempt — a spent allowance anywhere on the chain, or a
+    // folded allowance below 1, leafs it WITHOUT spending (end =
+    // allowance spent), exactly like the cannot-split leaf. Runs after
+    // the steal so stolen tickets are checked too.
+    if (!allowances.empty()) {
+      const auto share_exhausted = [&](std::string_view path) -> bool {
+        std::string ancestor(path);
+        while (true) {
+          const auto share = allowances.find(ancestor);
+          if (share != allowances.end() &&
+              (share->second < 1 ||
+               subtree_attempts(ancestor) >= share->second))
+            return true;
+          const std::size_t dash = ancestor.rfind('-');
+          if (dash == std::string::npos) break;
+          ancestor = ancestor.substr(0, dash);
+        }
+        return false;
+      };
+      for (auto it = tickets.begin(); it != tickets.end();) {
+        if (share_exhausted(it->path)) {
+          writer.submit(state::CommitTerminal{{make_record(
+              "SETTLE", {{"path", it->path},
+                         {"kept", 0},
+                         {"atomic", 0},
+                         {"attempts", 0},
+                         {"score", "0"},
+                         {"end", "allowance spent"},
+                         {"campaign", spec.id}})}});
+          writer.sync();
+          settled_samples.push_back(SettledSample{0, 0.0});
+          result.leaves++;  // the allowance leaf counts like cannot-split
+          it = tickets.erase(it);
+          continue;
+        }
+        ++it;
       }
     }
     if (tickets.empty() && waiting.empty()) {
@@ -869,6 +995,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"score", "0"},
                        {"end", "cannot split"},
                        {"campaign", spec.id}})}});
+        writer.sync();  // the pool fold reads durable attempts
         result.leaves++;
         settled_samples.push_back(SettledSample{0, 0.0});
         break;
@@ -912,6 +1039,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"end", "children"},
                        {"campaign", spec.id}}));
         writer.submit(state::CommitTerminal{std::move(records)});
+        // Fold the settle before the next refresh: the pool ledger
+        // (decision 0020) reads the attempts table, and the parent's
+        // pending attempts must be durable before its children's
+        // allowances are computed.
+        writer.sync();
         if (cache_valid) {
           for (std::size_t i = 0; i < chosen.children.size(); ++i) {
             store::Node child_node;
@@ -1326,6 +1458,58 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   if (plan.saturated)
     out << "(saturated: values clamped at int64)\n";
   return out.str();
+}
+
+std::map<std::string, std::int64_t> compute_starting_pools(
+    state::StateWriter& writer, const CampaignSpec& spec,
+    std::string* error) {
+  std::map<std::string, std::int64_t> pools;
+  if (spec.scope.empty() || spec.loop_budget <= 0) return pools;
+  // The same open-ticket rule the engine will work with (order_tickets):
+  // under the scope, not settled, not a leaf, no open review above.
+  std::vector<store::Node> nodes;
+  for (const std::string& prefix : spec.scope)
+    for (const store::Node& node :
+         writer.db().nodes_with_path_prefix(prefix, error))
+      nodes.push_back(node);
+  std::vector<std::string> reviews;
+  for (const store::Review& review : writer.db().open_reviews(error))
+    if (review.state == "open" || review.state.empty())
+      reviews.push_back(review.path);
+  const std::vector<Ticket> tickets = order_tickets(
+      nodes,
+      [&](std::string_view path) { return writer.settled(path); },
+      [&](std::string_view path) { return writer.leaf(path); },
+      reviews, spec);
+  // Count open tickets per root (the first path segment).
+  std::map<std::string, std::int64_t> open;
+  for (const Ticket& ticket : tickets) {
+    const std::size_t dash = ticket.path.find('-');
+    const std::string root =
+        dash == std::string::npos ? ticket.path : ticket.path.substr(0, dash);
+    ++open[root];
+  }
+  // A root with no tickets gets one attempt (decision 0020); the rest of
+  // the budget splits proportionally to the ticket counts.
+  for (const std::string& root : spec.scope)
+    if (!open.count(root)) open[root] = 0;
+  std::int64_t total_open = 0;
+  for (const auto& [root, count] : open) total_open += count;
+  if (total_open <= 0) {
+    for (const std::string& root : spec.scope) pools[root] = 1;
+    return pools;
+  }
+  std::int64_t handed_out = 0;
+  for (auto it = open.begin(); it != open.end(); ++it) {
+    const bool last = std::next(it) == open.end();
+    const std::int64_t share =
+        last
+            ? spec.loop_budget - handed_out
+            : (spec.loop_budget * it->second) / total_open;
+    pools[it->first] = std::max<std::int64_t>(1, share);
+    handed_out += pools[it->first];
+  }
+  return pools;
 }
 
 std::map<std::string, std::int64_t> fold_pool_allowances(

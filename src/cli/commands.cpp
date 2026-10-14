@@ -1739,10 +1739,18 @@ int campaign_cmd(int argc, char** argv) {
       std::cerr << "run with --yes to confirm the projection\n";
       return 3;
     }
-    writer->submit(onion::state::CommitTerminal{{make_record(
-        "CAMPAIGN", {{"id", spec->id},
-                     {"spec", onion::sched::campaign_spec_json(*spec)},
-                     {"state", "running"}})}});
+    // M8 branch shares (decision 0020): the starting pools ride in the
+    // CAMPAIGN record, so every replica folds the same numbers.
+    {
+      onion::sched::CampaignSpec with_pools = *spec;
+      std::string pool_error;
+      with_pools.pools = onion::sched::compute_starting_pools(
+          *writer, *spec, &pool_error);
+      writer->submit(onion::state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", with_pools.id},
+                       {"spec", onion::sched::campaign_spec_json(with_pools)},
+                       {"state", "running"}})}});
+    }
     writer->sync();
     std::cout << "campaign " << spec->id << " started\n";
     return 0;
