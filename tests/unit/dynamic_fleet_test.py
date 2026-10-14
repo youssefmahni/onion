@@ -211,23 +211,25 @@ def main():
                 time.sleep(2.0)
             raise AssertionError("nodes never converged: %r" % last)
 
-        def wait_merkle(apis, timeout=60):
+        def wait_vectors(apis, timeout=90):
             # Equal settled counts can momentarily precede the last
             # conflicting settle's propagation (a steal lands twice with
             # different scores and the winner fold resolves it everywhere
-            # only once both records arrived). The Merkle root proves
-            # every device holds the same records — the deterministic
-            # gate before any winner scan.
+            # only once both records arrived). Equal APPLIED VECTORS are
+            # the record-level gate: the fold is deterministic, so every
+            # device with the same records holds the same settle rows.
+            # (The Merkle root alone covers only the nodes table.)
             end = time.time() + timeout
             while time.time() < end:
                 try:
-                    roots = [state(a)["merkle_root"] for a in apis]
-                    if roots[0] and roots[0] == roots[1] == roots[2]:
+                    vs = [tuple(sorted(state(a)["vector"].items()))
+                          for a in apis]
+                    if vs[0] and vs[0] == vs[1] == vs[2]:
                         return
                 except Exception:
                     pass
                 time.sleep(1.0)
-            raise AssertionError("merkle roots never agreed")
+            raise AssertionError("vectors never agreed")
 
         # ---------------------------------------------------------------
         # Scenario A: node 3 joins mid-run and converges.
@@ -390,7 +392,7 @@ def main():
         # Every device must hold the SAME records before the winner
         # scan: a stolen ticket settled twice resolves by the winner
         # fold only once both records reached every replica.
-        wait_merkle([devices[i]["api"] for i in (1, 2, 3)])
+        wait_vectors([devices[i]["api"] for i in (1, 2, 3)])
         # The steal actually happened: node 3's oplog carries CLAIM
         # records (the fleet works through its own lanes first, then
         # claims from the busy ones).
