@@ -38,7 +38,8 @@ completeness), and they are free.
 2. **Retry only when a check fails**: up to `max_attempts` (default 3) at
    temperatures 0 / 0.3 / 0.5. The failure reasons of the previous attempt
    (every failed check, by name and offending title) are injected into the
-   next attempt's planner prompt.
+   next attempt's planner and synthesizer prompts — the synthesizer is where
+   the titles are written, so that is where the reasons matter.
 3. **Fewer than three valid children is a leaf.** A *valid* child is one
    that passes the per-title checks (repeat, similarity, style). When the
    attempts are exhausted without a passing attempt, the attempt with the
