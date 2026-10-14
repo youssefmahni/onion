@@ -218,18 +218,27 @@ def main():
             # only once both records arrived). Equal APPLIED VECTORS are
             # the record-level gate: the fold is deterministic, so every
             # device with the same records holds the same settle rows.
-            # (The Merkle root alone covers only the nodes table.)
+            # (The Merkle root alone covers only the nodes table.) The
+            # devices keep producing records (claim renewals, stray
+            # settles), so a single equal snapshot is not enough — the
+            # vectors must agree AND stay equal across a short window
+            # (the mp test's quiescence property).
             end = time.time() + timeout
+            last = None
             while time.time() < end:
                 try:
                     vs = [tuple(sorted(state(a)["vector"].items()))
                           for a in apis]
                     if vs[0] and vs[0] == vs[1] == vs[2]:
-                        return
+                        if last == vs:
+                            return
+                        last = vs
+                    else:
+                        last = None
                 except Exception:
-                    pass
-                time.sleep(1.0)
-            raise AssertionError("vectors never agreed")
+                    last = None
+                time.sleep(2.0)
+            raise AssertionError("vectors never reached quiescence")
 
         # ---------------------------------------------------------------
         # Scenario A: node 3 joins mid-run and converges.
