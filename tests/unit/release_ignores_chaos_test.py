@@ -101,7 +101,7 @@ def main():
         campaign_file = os.path.join(root, "campaign.json")
         with open(campaign_file, "w") as f:
             json.dump({"id": "nohook", "scope": ["P01", "P02"],
-                       "loop_budget": 120, "mode": "breadth-first",
+                       "loop_budget": 120, "children_min": 3, "mode": "breadth-first",
                        "chunk": 50, "model": "deepseek-flash"}, f)
         run(binary, "campaign", "start", campaign_file, "--data-dir",
             devices[1]["data"], "--yes")

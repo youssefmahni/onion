@@ -123,84 +123,100 @@ TEST(GateChecks, AncestorSimilarityThresholds) {
   EXPECT_TRUE(checks.ancestors_ok);
 }
 
-// ---------------- decide (best-of-3) ----------------
+// ---------------- decide (decision 0024: deterministic checks) ----------------
 
-Attempt passing_attempt(int number, double score) {
+Attempt passing_attempt(int number) {
   Attempt attempt;
   attempt.number = number;
-  attempt.score = score;
+  attempt.score = 0.0;  // the score is irrelevant to the gate
   attempt.checks_passed = true;
-  attempt.children = children_of({"One", "Two", "Three"});
+  attempt.valid_count = 8;
+  attempt.children = children_of(
+      {"One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"});
   return attempt;
 }
 
-Attempt failing_attempt(int number) {
+Attempt failing_attempt(int number, std::size_t valid_count = 0) {
   Attempt attempt;
   attempt.number = number;
   attempt.score = 0.0;
   attempt.checks_passed = false;
+  attempt.valid_count = valid_count;
   return attempt;
 }
 
-TEST(GateDecide, CommitWhenChecksPassAndScoreIsAtLeastZeroSeven) {
-  const Outcome outcome = decide({passing_attempt(1, 0.85)}, GateParams{});
+TEST(GateDecide, CommitsTheFirstAttemptWhoseChecksPassWhateverItsScore) {
+  Attempt low_score = passing_attempt(1);
+  low_score.score = 0.01;  // a critic score of ~0 must not matter
+  Outcome outcome = decide({low_score}, GateParams{});
   EXPECT_EQ(outcome.decision, Decision::Commit);
   EXPECT_EQ(outcome.chosen, 0);
   EXPECT_EQ(outcome.end_reason, "children");
+  EXPECT_FALSE(outcome.below_target);
+  outcome = decide({failing_attempt(1), passing_attempt(2)}, GateParams{});
+  EXPECT_EQ(outcome.decision, Decision::Commit);
+  EXPECT_EQ(outcome.chosen, 1);
 }
 
-TEST(GateDecide, RetryBeforeMaxAttempts) {
+TEST(GateDecide, RetriesOnlyWhenAChecksFailed) {
   Outcome outcome = decide({failing_attempt(1)}, GateParams{});
   EXPECT_EQ(outcome.decision, Decision::Retry);
   outcome = decide({failing_attempt(1), failing_attempt(2)}, GateParams{});
   EXPECT_EQ(outcome.decision, Decision::Retry);
+  // A passing first attempt never retries.
+  EXPECT_EQ(decide({passing_attempt(1)}, GateParams{}).decision,
+            Decision::Commit);
 }
 
 TEST(GateDecide, LeafWhenNoAttemptHasThreeValidChildren) {
   const Outcome outcome =
-      decide({failing_attempt(1), failing_attempt(2), failing_attempt(3)},
+      decide({failing_attempt(1, 2), failing_attempt(2, 0),
+              failing_attempt(3, 1)},
              GateParams{});
   EXPECT_EQ(outcome.decision, Decision::Leaf);
   EXPECT_EQ(outcome.end_reason, "cannot split");
 }
 
-TEST(GateDecide, CommitBestPassingAttemptAtOrAboveFloor) {
-  const Outcome outcome =
-      decide({passing_attempt(1, 0.4), passing_attempt(2, 0.6),
-              passing_attempt(3, 0.55)},
+TEST(GateDecide, ExhaustedAttemptsCommitTheMostValidChildrenBelowTarget) {
+  // 4, 7, 5 valid children and no passing attempt: the 7-child attempt
+  // commits its valid children, flagged below the target of 8.
+  Outcome outcome =
+      decide({failing_attempt(1, 4), failing_attempt(2, 7),
+              failing_attempt(3, 5)},
              GateParams{});
   EXPECT_EQ(outcome.decision, Decision::Commit);
-  EXPECT_EQ(outcome.chosen, 1);  // the 0.6 attempt
-}
-
-TEST(GateDecide, NeedsReviewWhenBestIsBelowFloor) {
-  const Outcome outcome =
-      decide({passing_attempt(1, 0.3), passing_attempt(2, 0.4),
-              passing_attempt(3, 0.45)},
-             GateParams{});
-  EXPECT_EQ(outcome.decision, Decision::NeedsReview);
-  EXPECT_EQ(outcome.end_reason, "below floor");
+  EXPECT_EQ(outcome.chosen, 1);
+  EXPECT_TRUE(outcome.below_target);
+  // Ties go to the later attempt.
+  outcome = decide({failing_attempt(1, 6), failing_attempt(2, 6),
+                    failing_attempt(3, 3)},
+                   GateParams{});
+  EXPECT_EQ(outcome.chosen, 1);
+  // Nine valid children (one other title was bad) is not below target.
+  outcome = decide({failing_attempt(1, 9), failing_attempt(2, 2),
+                    failing_attempt(3, 2)},
+                   GateParams{});
+  EXPECT_EQ(outcome.decision, Decision::Commit);
+  EXPECT_FALSE(outcome.below_target);
 }
 
 TEST(GateDecide, RetryInjectsHigherTemperatureViaFunnel) {
   // The funnel drives temperature 0 → 0.3 → 0.5 across attempts; the first
-  // passing attempt commits, so observe the critique temperature of each
-  // attempt.
+  // attempt whose checks pass commits, so a passing first attempt runs at
+  // temperature 0 only.
   FunnelOptions options;
   options.params = GateParams{};
+  options.params.children_min = 3;  // the small fakes return three children
   Funnel funnel(options);
   NodeContext context = ctx();
-  std::vector<double> critique_temperatures;
+  std::vector<double> planner_temperatures;
   auto fake = [&](const Request& request) -> Result {
     Result result;
     result.kind = Kind::Ok;
     result.content = R"({"items": ["One", "Two", "Three"]})";
     result.finish_reason = "stop";
-    if (request.user.find("Critique this candidate set") !=
-        std::string::npos) {
-      critique_temperatures.push_back(request.temperature);
-      result.content = R"({"score": 0.9, "remove": [], "add": [], "issues": ""})";
-    }
+    if (request.user.find("Plan the knowledge coverage") != std::string::npos)
+      planner_temperatures.push_back(request.temperature);
     if (request.user.find("select the final children set") !=
         std::string::npos) {
       result.content =
@@ -213,8 +229,8 @@ TEST(GateDecide, RetryInjectsHigherTemperatureViaFunnel) {
   };
   const FunnelResult result = funnel.run(context, fake);
   ASSERT_EQ(result.decision, Decision::Commit);
-  ASSERT_EQ(critique_temperatures.size(), 1u);
-  EXPECT_DOUBLE_EQ(critique_temperatures[0], 0.0);
+  ASSERT_EQ(planner_temperatures.size(), 1u);
+  EXPECT_DOUBLE_EQ(planner_temperatures[0], 0.0);
 }
 
 // ---------------- parsers ----------------
@@ -442,6 +458,7 @@ TEST(GateFunnel, ProviderFailureNeverBecomesALeaf) {
 // verification — and nothing from the pre-check.
 TEST(GateFunnel, AttemptTokensCoverEveryCallOfTheAttempt) {
   FunnelOptions options;
+  options.params.children_min = 3;  // the fake returns three children
   onion::llm::PriceSchedule prices;
   prices.peak.input = "1.0";
   prices.peak.cached_input = "0.0";
@@ -477,7 +494,7 @@ TEST(GateFunnel, AttemptTokensCoverEveryCallOfTheAttempt) {
   const FunnelResult result = funnel.run(context, fake);
   ASSERT_EQ(result.decision, Decision::Commit);
   ASSERT_EQ(result.attempts.size(), 1u);
-  EXPECT_GE(attempt_calls, 5);  // planner, workers, critique, synth, verify
+  EXPECT_GE(attempt_calls, 5);  // planner, workers, synth, verify (critic off)
   const std::uint64_t calls = static_cast<std::uint64_t>(attempt_calls);
   EXPECT_EQ(result.attempts[0].tokens_in, 3 * calls);
   EXPECT_EQ(result.attempts[0].tokens_out, 5 * calls);
@@ -540,60 +557,258 @@ TEST(GateFunnel, TransientFailureMidAttemptDefersAndKeepsEarlierAttempts) {
   EXPECT_EQ(result.attempts[0].number, 1);
 }
 
-TEST(GateFunnel, RetryInjectsPreviousIssuesAndCommitsBetterAttempt) {
-  FunnelOptions options;
-  Funnel funnel(options);
-  NodeContext context = ctx();
-  std::vector<double> critique_temperatures;
-  std::vector<std::string> planner_users;
-  auto fake = [&](const Request& request) -> Result {
-    if (request.user.find("Can this node be split") != std::string::npos)
-      return ok(R"({"splits": true})");
-    if (request.user.find("Plan the knowledge coverage") != std::string::npos) {
-      planner_users.push_back(request.user);
-      return ok(R"({"items": ["Ops", "Gov"]})");
-    }
-    if (request.user.find("Critique this candidate set") != std::string::npos) {
-      critique_temperatures.push_back(request.temperature);
-      return (critique_temperatures.back() == 0.0)
-                 ? ok(R"({"score": 0.5, "remove": [], "add": [], "issues": "missed governance"})")
-                 : ok(R"({"score": 0.9, "remove": [], "add": [], "issues": ""})");
-    }
-    if (request.user.find("select the final children set") !=
-        std::string::npos) {
-      return ok(R"({"items": [{"title": "One", "atomic": false}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
-    }
-    return ok(R"({"items": ["Alpha", "Beta", "Gamma"]})");
-  };
-  const FunnelResult result = funnel.run(context, fake);
-  EXPECT_EQ(result.decision, Decision::Commit);
-  EXPECT_EQ(result.attempts.size(), 2u);
-  EXPECT_EQ(result.chosen, 1);
-  // The retried planner received the previous critique issues.
-  EXPECT_NE(planner_users[1].find("missed governance"), std::string::npos);
-  // And the retry ran at the raised temperature.
-  ASSERT_EQ(critique_temperatures.size(), 2u);
-  EXPECT_DOUBLE_EQ(critique_temperatures[1], 0.3);
+// ---- decision 0024: the funnel with the deterministic gate ----
+
+// Distinct, filler-free titles ("A" would be dropped as an article by
+// canonical() and collapse every title into one).
+const char* kTitles[] = {
+    "Invoice Matching",   "Payment Capture",   "Tax Calculation",
+    "Order Routing",      "Stock Reservation", "Fraud Screening",
+    "Address Validation", "Refund Handling",   "Carrier Selection",
+    "Return Authorization", "Warehouse Picking", "Delivery Scheduling"};
+
+std::string children_json(int count, bool atomic = false,
+                          const std::string& prefix = "") {
+  std::string json = R"({"items": [)";
+  for (int i = 0; i < count; ++i) {
+    if (i) json += ", ";
+    json += R"({"title": ")" + prefix + kTitles[i] + R"(", "atomic": )" +
+            (atomic ? "true" : "false") + "}";
+  }
+  return json + "]}";
 }
 
-TEST(GateFunnel, NeedsReviewBelowFloorSpendsNothingMore) {
+std::string eight_children_json() { return children_json(8); }
+
+// The standard fake: pre-check yes, planner/workers/trim return items,
+// the synthesizer returns what `synth(call_index)` says.
+SyncAsk gate_fake(std::function<Result(int, const Request&)> synth,
+                  int* critique_calls = nullptr, int* trim_calls = nullptr) {
+  auto synth_calls = std::make_shared<int>(0);
+  return [=](const Request& request) -> Result {
+    if (request.user.find("Can this node be split") != std::string::npos)
+      return ok(R"({"splits": true})");
+    if (request.user.find("Critique this candidate set") != std::string::npos) {
+      if (critique_calls) ++*critique_calls;
+      return ok(R"({"score": 0.05, "remove": [], "add": [], "issues": "meh"})");
+    }
+    if (request.user.find("From these candidates keep only") !=
+        std::string::npos) {
+      if (trim_calls) ++*trim_calls;
+      return ok(R"({"items": ["T1", "T2", "T3"]})");
+    }
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      return synth((*synth_calls)++, request);
+    return ok(R"({"items": ["Alpha", "Beta", "Gamma", "Delta"]})");
+  };
+}
+
+TEST(GateFunnel, CommitsOnPassingChecksWithoutAnyCritique) {
+  // The critic is off by default: no critique call is made and the
+  // attempt commits on the deterministic checks alone.
   FunnelOptions options;
   Funnel funnel(options);
   NodeContext context = ctx();
-  auto fake = [&](const Request& request) -> Result {
-    if (request.user.find("Can this node be split") != std::string::npos)
-      return ok(R"({"splits": true})");
-    if (request.user.find("Critique this candidate set") != std::string::npos)
-      return ok(R"({"score": 0.45, "remove": [], "add": [], "issues": "vague"})");
-    if (request.user.find("select the final children set") !=
-        std::string::npos)
-      return ok(R"({"items": [{"title": "One", "atomic": false}, {"title": "Two", "atomic": false}, {"title": "Three", "atomic": false}]})");
-    return ok(R"({"items": ["A", "B", "C", "D"]})");
+  int critique_calls = 0;
+  const FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        return ok(eight_children_json());
+      }, &critique_calls));
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(critique_calls, 0);
+  ASSERT_EQ(result.attempts.size(), 1u);
+  EXPECT_EQ(result.attempts[0].children.size(), 8u);
+  EXPECT_FALSE(result.below_target);
+}
+
+TEST(GateFunnel, CriticOnRecordsTheScoreButNeverGatesOrRetries) {
+  FunnelOptions options;
+  options.critic = true;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int critique_calls = 0;
+  const FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        return ok(eight_children_json());
+      }, &critique_calls));
+  // A critic score of 0.05 (far below the old 0.5 floor) commits anyway.
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(critique_calls, 1);
+  ASSERT_EQ(result.attempts.size(), 1u);
+  EXPECT_DOUBLE_EQ(result.attempts[0].score, 0.05);
+}
+
+TEST(GateFunnel, RetriesOnlyOnCheckFailureAndInjectsTheReasons) {
+  // Attempt 1 repeats the node's own title (a check failure); attempt 2
+  // is clean. The retry runs hotter and BOTH the planner and the
+  // synthesizer of attempt 2 are told what was wrong.
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  std::vector<std::string> synthesizer_prompts;
+  std::vector<std::string> planner_prompts;
+  std::vector<double> synthesizer_temperatures;
+  auto base = gate_fake([&](int index, const Request& request) {
+    synthesizer_prompts.push_back(request.user);
+    synthesizer_temperatures.push_back(request.temperature);
+    if (index == 0) {
+      std::string json = eight_children_json();
+      const std::size_t at = json.find("Invoice Matching");
+      json.replace(at, std::string("Invoice Matching").size(),
+                   "Order Capture");
+      return ok(json);
+    }
+    return ok(eight_children_json());
+  });
+  const SyncAsk fake = [&](const Request& request) -> Result {
+    if (request.user.find("Plan the knowledge coverage") != std::string::npos)
+      planner_prompts.push_back(request.user);
+    return base(request);
   };
   const FunnelResult result = funnel.run(context, fake);
-  EXPECT_EQ(result.decision, Decision::NeedsReview);
-  EXPECT_EQ(result.end_reason, "below floor");
-  EXPECT_EQ(result.attempts.size(), 3u);  // nothing beyond the third attempt
+  ASSERT_EQ(result.decision, Decision::Commit);
+  ASSERT_EQ(result.attempts.size(), 2u);
+  EXPECT_EQ(result.chosen, 1);
+  ASSERT_EQ(synthesizer_temperatures.size(), 2u);
+  EXPECT_DOUBLE_EQ(synthesizer_temperatures[0], 0.0);
+  EXPECT_DOUBLE_EQ(synthesizer_temperatures[1], 0.3);
+  const std::string reason = "repeated title: Order Capture";
+  EXPECT_EQ(synthesizer_prompts[0].find("Problems with your previous"),
+            std::string::npos);
+  EXPECT_NE(synthesizer_prompts[1].find(reason), std::string::npos);
+  ASSERT_EQ(planner_prompts.size(), 2u);
+  EXPECT_NE(planner_prompts[1].find(reason), std::string::npos);
+}
+
+TEST(GateFunnel, BelowTargetFallbackCommitsTheValidChildrenOnly) {
+  // Five valid children on every attempt (the target is 8): after three
+  // attempts the best commits its five, flagged below target.
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  const FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        return ok(R"({"items": [{"title": "Alpha One", "atomic": false}, {"title": "Beta Two", "atomic": false}, {"title": "Gamma Three", "atomic": false}, {"title": "Delta Four", "atomic": false}, {"title": "Epsilon Five", "atomic": false}]})");
+      }));
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(result.attempts.size(), 3u);
+  EXPECT_TRUE(result.below_target);
+  EXPECT_EQ(result.attempts[result.chosen].children.size(), 5u);
+}
+
+TEST(GateFunnel, AnInvalidTitleIsDroppedNotCommitted) {
+  // Nine good titles and one question: the checks fail every attempt (a
+  // style violation), the best attempt commits its NINE valid children.
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  const FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        std::string json = R"({"items": [)";
+        for (int i = 0; i < 9; ++i)
+          json += R"({"title": ")" + std::string(kTitles[i]) +
+                  R"(", "atomic": false}, )";
+        json += R"({"title": "Is This A Question?", "atomic": false}]})";
+        return ok(json);
+      }));
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(result.attempts[result.chosen].children.size(), 9u);
+  EXPECT_FALSE(result.below_target);
+  for (const Child& child : result.attempts[result.chosen].children)
+    EXPECT_EQ(child.title.find('?'), std::string::npos);
+}
+
+TEST(GateFunnel, FewerThanThreeValidChildrenIsALeaf) {
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  const FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        return ok(R"({"items": [{"title": "Only One", "atomic": false}, {"title": "Only Two", "atomic": false}]})");
+      }));
+  EXPECT_EQ(result.decision, Decision::Leaf);
+  EXPECT_EQ(result.end_reason, "cannot split");
+  EXPECT_EQ(result.attempts.size(), 3u);  // every attempt completed
+}
+
+TEST(GateFunnel, TrimIsSkippedWhenThePoolIsAtOrBelowTheTarget) {
+  // Workers return 4 candidates per aspect (well under the 150 target):
+  // no trim call at all. With a 400-candidate pool exactly ONE trim runs.
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  int trim_calls = 0;
+  FunnelResult result = funnel.run(
+      context, gate_fake([](int, const Request&) {
+        return ok(eight_children_json());
+      }, nullptr, &trim_calls));
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(trim_calls, 0);
+
+  trim_calls = 0;
+  const SyncAsk big = [&](const Request& request) -> Result {
+    if (request.user.find("Aspect:") != std::string::npos) {
+      // 100 distinct candidates per aspect, distinct across aspects.
+      const std::size_t at = request.user.find("Aspect: ") + 8;
+      const std::string aspect =
+          request.user.substr(at, request.user.find('\n', at) - at);
+      std::string json = R"({"items": [)";
+      for (int i = 0; i < 100; ++i) {
+        if (i) json += ", ";
+        json += "\"" + aspect + " Candidate " + std::to_string(i * 7919) +
+                "\"";
+      }
+      return ok(json + "]}");
+    }
+    if (request.user.find("Plan the knowledge coverage") != std::string::npos)
+      return ok(R"({"items": ["Aspect Aaaa", "Aspect Bbbb", "Aspect Cccc"]})");
+    return gate_fake([](int, const Request&) {
+      return ok(eight_children_json());
+    }, nullptr, &trim_calls)(request);
+  };
+  Funnel funnel_big(options);
+  result = funnel_big.run(context, big);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(trim_calls, 1);
+}
+
+TEST(GateFunnel, VerificationRunsOnlyOnTheChosenAttempt) {
+  // Attempts 1 and 2 fail the style check but carry atomic labels; attempt
+  // 3 passes. Exactly ONE verification call is made, listing attempt 3's
+  // labelled titles only.
+  FunnelOptions options;
+  Funnel funnel(options);
+  NodeContext context = ctx();
+  std::vector<std::string> verification_prompts;
+  // Attempts 1-2: the first title is a question (style failure) and
+  // every title carries an atomic label; attempt 3 is clean.
+  auto labelled_json = [](const std::string& prefix, bool bad) {
+    std::string json = R"({"items": [)";
+    for (int i = 0; i < 8; ++i) {
+      if (i) json += ", ";
+      json += R"({"title": ")" + prefix + kTitles[i] + (bad && i == 0 ? "?" : "") +
+              R"(", "atomic": true})";
+    }
+    return json + "]}";
+  };
+  auto base = gate_fake([&](int index, const Request&) {
+    return ok(labelled_json(index < 2 ? "Faulty " : "Sound ", index < 2));
+  });
+  const SyncAsk fake = [&](const Request& request) -> Result {
+    if (request.user.find("were labelled atomic") != std::string::npos) {
+      verification_prompts.push_back(request.user);
+      return ok(R"({"admits_none": []})");
+    }
+    return base(request);
+  };
+  const FunnelResult result = funnel.run(context, fake);
+  ASSERT_EQ(result.decision, Decision::Commit);
+  EXPECT_EQ(result.chosen, 2);
+  ASSERT_EQ(verification_prompts.size(), 1u);
+  EXPECT_NE(verification_prompts[0].find("Sound Invoice Matching"),
+            std::string::npos);
+  EXPECT_EQ(verification_prompts[0].find("Faulty"), std::string::npos);
 }
 
 TEST(GateParsers, CritiqueScoreScaleDriftIsRejected) {
@@ -657,8 +872,7 @@ TEST(GateParsers, ChildrenKeyFromTheRecordedW54Replies) {
 TEST(GateFunnel, BatchedAtomicVerificationKeepsOnlyNamedLeaves) {
   FunnelOptions options;
   options.verify_atomic = true;
-  options.params.floor_score = 0.0;
-  options.params.pass_score = 0.0;
+  options.params.children_min = 3;  // these fakes return three children
   Funnel funnel(options);
   NodeContext context = ctx();
   int verify_calls = 0;
@@ -694,8 +908,7 @@ TEST(GateFunnel, BatchedAtomicVerificationKeepsOnlyNamedLeaves) {
 TEST(GateFunnel, BatchedAtomicVerificationFailureKeepsEveryChildATask) {
   FunnelOptions options;
   options.verify_atomic = true;
-  options.params.floor_score = 0.0;
-  options.params.pass_score = 0.0;
+  options.params.children_min = 3;  // these fakes return three children
   Funnel funnel(options);
   NodeContext context = ctx();
   auto fake = [&](const Request& request) -> Result {
@@ -722,8 +935,7 @@ TEST(GateFunnel, BatchedAtomicVerificationFailureKeepsEveryChildATask) {
 
 TEST(GateFunnel, BatchedVerificationRunsByDefault) {
   FunnelOptions options;  // verify_atomic defaults on (decision 0021)
-  options.params.floor_score = 0.0;
-  options.params.pass_score = 0.0;
+  options.params.children_min = 3;  // these fakes return three children
   Funnel funnel(options);
   NodeContext context = ctx();
   int verify_calls = 0;

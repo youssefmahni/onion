@@ -118,7 +118,7 @@ def main():
                 json.dump(members, f)
 
         campaign = {"id": "mp1", "scope": ["P01", "P02", "P03"],
-                    "loop_budget": 100, "mode": "breadth-first", "chunk": 50,
+                    "loop_budget": 100, "children_min": 3, "mode": "breadth-first", "chunk": 50,
                     "model": "deepseek-flash"}
         with open(os.path.join(root, "campaign.json"), "w") as f:
             json.dump(campaign, f)

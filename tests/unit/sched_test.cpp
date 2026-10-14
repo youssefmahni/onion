@@ -225,23 +225,84 @@ TEST(OrderTickets, OpenReviewPausesTheWholeSubtree) {
   EXPECT_EQ(tickets[1].path, "P01-IN02");
 }
 
-TEST(StopRule, NeedsFiftySettledAndTheThresholds) {
+TEST(StopRule, VerifiedAtomicShareOverTheLastFiftyExpansions) {
+  // Decision 0024: pooled verified-atomic share (Σ atomic / Σ kept) over
+  // the last 50 settled expansion nodes; no score clause.
   std::vector<SettledSample> samples;
-  for (int i = 0; i < 49; ++i) samples.push_back({1, 1.0});
+  for (int i = 0; i < 49; ++i) samples.push_back({10, 10});
   EXPECT_FALSE(stop_rule_met(samples));  // 49 is not 50
-  samples.push_back({1, 1.0});
-  EXPECT_TRUE(stop_rule_met(samples));   // 50 × atomic, avg 1.0
+  samples.push_back({10, 10});
+  EXPECT_TRUE(stop_rule_met(samples));   // 50 nodes, share 1.0
 
-  samples.clear();
-  for (int i = 0; i < 44; ++i) samples.push_back({1, 1.0});
-  for (int i = 0; i < 6; ++i) samples.push_back({0, 1.0});
-  EXPECT_FALSE(stop_rule_met(samples));  // 44/50 = 0.88 < 0.9
-  samples.back() = {1, 1.0};
-  EXPECT_TRUE(stop_rule_met(samples));   // 45/50 = 0.9 ≥ 0.9
+  // Exactly 0.9 passes, just under fails.
+  samples.assign(50, SettledSample{10, 9});
+  EXPECT_TRUE(stop_rule_met(samples));   // 450/500 = 0.90
+  samples.back() = {10, 8};
+  EXPECT_FALSE(stop_rule_met(samples));  // 449/500 = 0.898
 
-  samples.clear();
-  for (int i = 0; i < 50; ++i) samples.push_back({1, 0.5});
-  EXPECT_FALSE(stop_rule_met(samples));  // average 0.5 < 0.8
+  // The share is pooled over children, not a count of nodes: one big
+  // non-atomic node outweighs many small atomic ones.
+  samples.assign(49, SettledSample{2, 2});
+  samples.push_back({30, 0});
+  EXPECT_FALSE(stop_rule_met(samples));  // 98/128 = 0.77
+
+  // Only the LAST 50 count: an old non-atomic stretch scrolls away.
+  samples.assign(40, SettledSample{10, 0});
+  for (int i = 0; i < 50; ++i) samples.push_back({10, 10});
+  EXPECT_TRUE(stop_rule_met(samples));
+
+  // The threshold is configurable; a window with no children never stops.
+  samples.assign(50, SettledSample{10, 8});
+  EXPECT_FALSE(stop_rule_met(samples, 50, 0.9));
+  EXPECT_TRUE(stop_rule_met(samples, 50, 0.8));
+  samples.assign(50, SettledSample{0, 0});
+  EXPECT_FALSE(stop_rule_met(samples));
+}
+
+TEST(ParseCampaign, Decision0024FieldsDefaultAndRoundTrip) {
+  std::string error;
+  auto spec = onion::sched::parse_campaign(nlohmann::json{{"id", "n"}}, &error);
+  ASSERT_TRUE(spec.has_value()) << error;
+  EXPECT_FALSE(spec->critic);                    // critic: off by default
+  EXPECT_EQ(spec->children_min, 8);
+  EXPECT_DOUBLE_EQ(spec->audit_rate, 0.02);
+  EXPECT_DOUBLE_EQ(spec->stop_atomic_share, 0.90);
+
+  spec = onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"critic", "on"}, {"children_min", 5},
+                     {"audit_rate", "0.10"}, {"stop_atomic_share", "0.75"}},
+      &error);
+  ASSERT_TRUE(spec.has_value()) << error;
+  EXPECT_TRUE(spec->critic);
+  EXPECT_EQ(spec->children_min, 5);
+  EXPECT_DOUBLE_EQ(spec->audit_rate, 0.10);
+  EXPECT_DOUBLE_EQ(spec->stop_atomic_share, 0.75);
+
+  // The record form round-trips (decision 0003: decimal strings, no floats).
+  const auto json = onion::sched::campaign_spec_json(*spec);
+  EXPECT_EQ(json["critic"], "on");
+  EXPECT_TRUE(json["audit_rate"].is_string());
+  EXPECT_TRUE(json["stop_atomic_share"].is_string());
+  const auto reparsed = onion::sched::parse_campaign(json, &error);
+  ASSERT_TRUE(reparsed.has_value()) << error;
+  EXPECT_TRUE(reparsed->critic);
+  EXPECT_EQ(reparsed->children_min, 5);
+  EXPECT_DOUBLE_EQ(reparsed->audit_rate, 0.10);
+  EXPECT_DOUBLE_EQ(reparsed->stop_atomic_share, 0.75);
+
+  // Old files still parse: gate/floor are accepted and ignored.
+  EXPECT_TRUE(onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"gate", 0.7}, {"floor", 0.5}}, &error));
+
+  // Validation.
+  EXPECT_FALSE(onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"critic", "maybe"}}, &error));
+  EXPECT_FALSE(onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"children_min", 2}}, &error));
+  EXPECT_FALSE(onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"audit_rate", "1.5"}}, &error));
+  EXPECT_FALSE(onion::sched::parse_campaign(
+      nlohmann::json{{"id", "n"}, {"stop_atomic_share", "0"}}, &error));
 }
 
 TEST(ProjectCost, ScalesLinearlyInExactDecimals) {

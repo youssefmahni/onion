@@ -77,6 +77,34 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  // Decision 0024. critic: "on" | "off" (a boolean is accepted too).
+  if (value.contains("critic")) {
+    if (value["critic"].is_boolean())
+      spec.critic = value["critic"].get<bool>();
+    else if (value["critic"].is_string() &&
+             (value["critic"].get<std::string>() == "on" ||
+              value["critic"].get<std::string>() == "off"))
+      spec.critic = value["critic"].get<std::string>() == "on";
+    else
+      return fail("critic must be \"on\" or \"off\"");
+  }
+  if (value.contains("children_min")) {
+    if (!value["children_min"].is_number_integer())
+      return fail("children_min must be an integer");
+    const std::int64_t v = value["children_min"].get<std::int64_t>();
+    if (v < 3 || v > 30) return fail("children_min out of range 3..30");
+    spec.children_min = static_cast<int>(v);
+  }
+  try {
+    spec.audit_rate = parse_score("audit_rate", 0.02);
+    spec.stop_atomic_share = parse_score("stop_atomic_share", 0.90);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
+  if (spec.audit_rate < 0.0 || spec.audit_rate > 1.0)
+    return fail("audit_rate out of range 0..1");
+  if (spec.stop_atomic_share <= 0.0 || spec.stop_atomic_share > 1.0)
+    return fail("stop_atomic_share out of range (0, 1]");
   // W5 funnel variants: optional; every value is validated on parse.
   if (value.contains("worker_candidates")) {
     if (!value["worker_candidates"].is_number_integer())
@@ -140,7 +168,11 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
       {"spillover", spec.spillover},
       {"model", spec.model},
       {"critic_model", spec.critic_model},
-      {"auto_accept", spec.auto_accept}};
+      {"auto_accept", spec.auto_accept},
+      {"critic", spec.critic ? "on" : "off"},
+      {"children_min", spec.children_min},
+      {"audit_rate", std::to_string(spec.audit_rate)},
+      {"stop_atomic_share", std::to_string(spec.stop_atomic_share)}};
   if (spec.worker_candidates)
     out["worker_candidates"] = *spec.worker_candidates;
   if (spec.aspects_min) out["aspects_min"] = *spec.aspects_min;
@@ -187,17 +219,17 @@ std::vector<Ticket> order_tickets(
 }
 
 bool stop_rule_met(const std::vector<SettledSample>& settled_in_order,
-                   std::size_t window) {
+                   std::size_t window, double share) {
   if (settled_in_order.size() < window) return false;
   const std::size_t begin = settled_in_order.size() - window;
-  int atomic = 0;
-  double score_sum = 0.0;
+  std::int64_t kept = 0;
+  std::int64_t atomic = 0;
   for (std::size_t i = begin; i < settled_in_order.size(); ++i) {
+    kept += settled_in_order[i].kept;
     atomic += settled_in_order[i].atomic;
-    score_sum += settled_in_order[i].score;
   }
-  return static_cast<double>(atomic) / static_cast<double>(window) >= 0.9 &&
-         score_sum / static_cast<double>(window) >= 0.8;
+  if (kept <= 0) return false;
+  return static_cast<double>(atomic) / static_cast<double>(kept) >= share;
 }
 
 std::string project_cost_usd(std::int64_t loop_budget,
@@ -422,11 +454,11 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
   }
 
   gate::FunnelOptions funnel_options;
-  funnel_options.params.pass_score = spec.gate;
-  funnel_options.params.floor_score = spec.floor;
   funnel_options.params.max_attempts = spec.max_attempts;
-  funnel_options.model = spec.critic_model.empty() ? spec.model
-                                                   : spec.critic_model;
+  funnel_options.params.children_min = spec.children_min;
+  funnel_options.critic = spec.critic;
+  funnel_options.model = spec.model;
+  funnel_options.critic_model = spec.critic_model;  // the critique call only
   funnel_options.prices = impl_->options.prices;
   // W5 funnel variants (absent spec fields keep the FunnelOptions default).
   if (spec.worker_candidates)
@@ -601,7 +633,7 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
       result.end_reason = "stopped";
       break;
     }
-    if (stop_rule_met(settled_samples)) {
+    if (stop_rule_met(settled_samples, 50, spec.stop_atomic_share)) {
       result.end_reason = "stop rule";
       break;
     }
@@ -884,7 +916,6 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                        {"end", "cannot split"},
                        {"campaign", spec.id}})}});
         result.leaves++;
-        settled_samples.push_back(SettledSample{0, 0.0});
         break;
       }
       case gate::Decision::Commit: {
@@ -913,18 +944,22 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
                 "ATOMIC", {{"path", ticket.path + "-" + id},
                            {"verified", true}}));
         }
-        records.push_back(make_record(
-            "CRITIQUE", {{"path", ticket.path},
-                         {"score", std::to_string(chosen.score)},
-                         {"issues", attempt_issues(chosen)}}));
-        records.push_back(make_record(
-            "SETTLE", {{"path", ticket.path},
-                       {"kept", chosen.children.size()},
-                       {"atomic", atomic},
-                       {"attempts", funnel_result.attempts.size()},
-                       {"score", std::to_string(chosen.score)},
-                       {"end", "children"},
-                       {"campaign", spec.id}}));
+        // The critique is recorded only when the campaign turned the critic
+        // on (decision 0024); it never gated this commit.
+        if (spec.critic)
+          records.push_back(make_record(
+              "CRITIQUE", {{"path", ticket.path},
+                           {"score", std::to_string(chosen.score)},
+                           {"issues", attempt_issues(chosen)}}));
+        nlohmann::json settle_payload{{"path", ticket.path},
+                            {"kept", chosen.children.size()},
+                            {"atomic", atomic},
+                            {"attempts", funnel_result.attempts.size()},
+                            {"score", std::to_string(chosen.score)},
+                            {"end", "children"},
+                            {"campaign", spec.id}};
+        if (funnel_result.below_target) settle_payload["below_target"] = true;
+        records.push_back(make_record("SETTLE", std::move(settle_payload)));
         writer.submit(state::CommitTerminal{std::move(records)});
         if (cache_valid) {
           for (std::size_t i = 0; i < chosen.children.size(); ++i) {
@@ -944,55 +979,8 @@ Engine::RunResult Engine::run(const CampaignSpec& spec,
         // toward it (verify_atomic is off by default in M3, so the
         // model's raw labels score 0 here; DR 0021 covers batching).
         settled_samples.push_back(SettledSample{
-            (funnel_options.verify_atomic && atomic > 0) ? 1 : 0,
-            chosen.score});
-        break;
-      }
-      case gate::Decision::NeedsReview: {
-        const auto& chosen = funnel_result.attempts[funnel_result.chosen];
-        // Children are stored with the review so accept can settle without
-        // spending more (decision 0008).  Atomic labels survive too: the
-        // ATOMIC records mirror the Commit branch and the NEEDS_REVIEW
-        // payload carries the count so accept can settle it faithfully.
-        std::vector<log::Record> records;
-        std::vector<std::string> new_ids;
-        int review_atomic = 0;
-        for (const gate::Child& child : chosen.children) {
-          const std::string id = node_ids_->allocate();
-          new_ids.push_back(id);
-          records.push_back(make_record(
-              "ADD_NODE", {{"path", ticket.path + "-" + id},
-                           {"layer", ticket.layer + 1},
-                           {"title", child.title}}));
-          if (child.atomic) {
-            ++review_atomic;
-            records.push_back(make_record(
-                "ATOMIC", {{"path", ticket.path + "-" + id},
-                           {"verified", true}}));
-          }
-        }
-        records.push_back(make_record(
-            "CRITIQUE", {{"path", ticket.path},
-                         {"score", std::to_string(chosen.score)},
-                         {"issues", attempt_issues(chosen)}}));
-        records.push_back(make_record(
-            "NEEDS_REVIEW", {{"path", ticket.path},
-                             {"reason", "below floor"},
-                             {"attempts", funnel_result.attempts.size()},
-                             {"atomic", review_atomic},
-                             {"score", std::to_string(chosen.score)}}));
-        writer.submit(state::CommitTerminal{std::move(records)});
-        if (cache_valid) {
-          review_cache.push_back(ticket.path);  // pause the subtree now
-          for (std::size_t i = 0; i < chosen.children.size(); ++i) {
-            store::Node child_node;
-            child_node.path = ticket.path + "-" + new_ids[i];
-            child_node.layer = ticket.layer + 1;
-            child_node.title = chosen.children[i].title;
-            node_cache.push_back(std::move(child_node));
-          }
-        }
-        result.reviews++;
+            static_cast<int>(chosen.children.size()),
+            funnel_options.verify_atomic ? atomic : 0});
         break;
       }
       case gate::Decision::Defer: {

@@ -35,6 +35,12 @@ struct CampaignSpec {
   std::string model{"deepseek-flash"};
   std::string critic_model;               // empty = same as model
   bool auto_accept{false};                // M3: parsed, not acted on
+  // Decision 0024: the gate is the deterministic checks. `gate`/`floor`
+  // above stay parseable for old campaign files and are ignored.
+  bool critic{false};          // "on": critique runs and is recorded; never gates
+  int children_min{8};         // target lower bound (hard max: synth_max_children, 30)
+  double audit_rate{0.02};     // deterministic audit sample of committed nodes
+  double stop_atomic_share{0.90};  // stop rule: verified atomic share threshold
   // W5 funnel variants (absent = the FunnelOptions default): V1 workers'
   // candidates per aspect, V2 planner aspect range, V3 trim rounds, V4
   // synthesizer max children, V5 compact output, V6 shared cache prefix.
@@ -91,14 +97,18 @@ std::vector<Ticket> order_tickets(
     const std::vector<std::string>& open_review_paths,
     const CampaignSpec& spec);
 
+// One settled expansion node (SETTLE with children): how many children it
+// kept and how many of them are VERIFIED atomic.
 struct SettledSample {
+  int kept{};
   int atomic{};
-  double score{};
 };
 
-// "last 50 settled nodes ≥ 90% atomic and average score ≥ 0.8".
+// Decision 0024: over the last `window` (50) settled expansion nodes the
+// pooled verified-atomic share (Σ atomic / Σ kept) is at least `share`
+// (default 0.90). Needs `window` samples. No score clause.
 bool stop_rule_met(const std::vector<SettledSample>& settled_in_order,
-                   std::size_t window = 50);
+                   std::size_t window = 50, double share = 0.90);
 
 // Pure cost projection: loop budget × measured average cost per attempt,
 // with the expected log growth in bytes per node.
