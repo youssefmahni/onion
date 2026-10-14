@@ -5,7 +5,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,6 +40,10 @@ bool request_signature_valid(
     std::string_view signature, const std::vector<std::uint8_t>& public_key,
     std::int64_t timestamp_s, std::int64_t now_s);
 
+// A fresh request nonce: 32 lowercase hex characters (128 bits) from the
+// platform random device, one value per request attempt (decision 0018).
+std::string fresh_nonce();
+
 // Signed POST headers (M7 evict submission): the same scheme with a
 // fresh random nonce per attempt, covering the request body. Returned as
 // a plain map so this header needs no httplib include.
@@ -46,7 +52,8 @@ std::map<std::string, std::string> signed_post_headers(
     std::string_view body, log::Signer& signer);
 
 // Sliding nonce cache: a (device_id, nonce) pair is accepted once per
-// 60-second window; older entries are pruned.
+// 60-second window; older entries are pruned. Thread-safe: the server's
+// handler threads share one cache.
 class NonceCache {
  public:
   bool seen_and_add(std::string_view device_id, std::string_view nonce,
@@ -56,6 +63,7 @@ class NonceCache {
   struct Entry {
     std::int64_t window{};
   };
+  std::mutex mutex_;
   std::map<std::string, Entry> seen_;
 };
 
@@ -72,6 +80,23 @@ inline bool majority_round(std::size_t answered_peers,
                            std::size_t total_members) {
   return (answered_peers + 1) * 2 > total_members;
 }
+
+// The devices that no longer take part in the fleet: members-table rows in
+// state EVICTED or LEFT. A round never contacts them and never counts them.
+std::set<std::string> retired_member_ids(
+    const std::vector<state::StateWriter::MemberRow>& table);
+
+// The denominator of majority_round(): every device that is a CURRENT
+// member — folded table rows not retired, plus the static members.json ids
+// (static fleets never write MEMBER_ADD) that the table has not retired —
+// and this device itself, which always answers. members.json is never
+// pruned, so an evicted or departed device listed there must not keep
+// inflating the denominator (decision 0014: a stuck 2-fleet member is
+// removed by eviction and the survivor then completes rounds alone).
+std::size_t majority_denominator(
+    const std::vector<std::string>& listed_ids,
+    const std::vector<state::StateWriter::MemberRow>& table,
+    std::string_view self_id);
 
 struct MemberKey {
   std::string device_id;

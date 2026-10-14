@@ -21,6 +21,23 @@ extern "C" {
 
 namespace onion::sync {
 
+std::string fresh_nonce() {
+  // 16 bytes = 128 bits. Every byte comes from the random device (four per
+  // draw); a seeded PRNG would cap the entropy at the seed's width.
+  static const char* digits = "0123456789abcdef";
+  std::random_device entropy;
+  std::string nonce;
+  nonce.reserve(32);
+  while (nonce.size() < 32) {
+    std::uint32_t word = entropy();
+    for (int i = 0; i < 4 && nonce.size() < 32; ++i, word >>= 8) {
+      nonce.push_back(digits[(word >> 4) & 0xf]);
+      nonce.push_back(digits[word & 0xf]);
+    }
+  }
+  return nonce;
+}
+
 namespace {
 
 std::string signed_bytes(std::string_view device_id, std::string_view method,
@@ -69,13 +86,7 @@ std::string signed_bytes_hex(std::string_view device_id,
 httplib::Headers signed_headers(std::string_view device_id,
                                 std::string_view path, std::int64_t ts,
                                 log::Signer& signer) {
-  std::random_device entropy;
-  std::mt19937_64 generator(entropy());
-  std::uniform_int_distribution<std::uint64_t> distribution;
-  std::ostringstream nonce_stream;
-  nonce_stream << std::hex << distribution(generator)
-               << distribution(generator);
-  const std::string nonce = nonce_stream.str();
+  const std::string nonce = fresh_nonce();
   const std::string signature =
       sign_request(device_id, "GET", path, "", nonce, ts, signer);
   if (std::getenv("ONION_SYNC_DEBUG"))
@@ -141,6 +152,7 @@ bool NonceCache::seen_and_add(std::string_view device_id,
                               std::string_view nonce, std::int64_t now_s) {
   const std::string key = std::string(device_id) + ":" + std::string(nonce);
   const std::int64_t window = now_s / 60;
+  std::lock_guard lock(mutex_);
   // Prune old windows.
   for (auto it = seen_.begin(); it != seen_.end();)
     if (it->second.window < window - 1)
@@ -151,6 +163,29 @@ bool NonceCache::seen_and_add(std::string_view device_id,
   if (found != seen_.end() && found->second.window >= window - 1) return true;
   seen_[key] = Entry{window};
   return false;
+}
+
+std::set<std::string> retired_member_ids(
+    const std::vector<state::StateWriter::MemberRow>& table) {
+  std::set<std::string> retired;
+  for (const auto& row : table)
+    if (row.state == "EVICTED" || row.state == "LEFT")
+      retired.insert(row.device_id);
+  return retired;
+}
+
+std::size_t majority_denominator(
+    const std::vector<std::string>& listed_ids,
+    const std::vector<state::StateWriter::MemberRow>& table,
+    std::string_view self_id) {
+  const std::set<std::string> retired = retired_member_ids(table);
+  std::set<std::string> counted;
+  for (const auto& row : table)
+    if (!retired.count(row.device_id)) counted.insert(row.device_id);
+  for (const std::string& id : listed_ids)
+    if (!retired.count(id)) counted.insert(id);
+  counted.insert(std::string(self_id));  // self answers trivially
+  return counted.size();
 }
 
 // ----------------------------------------------------------------- server
@@ -172,13 +207,7 @@ struct SyncServer::Impl {
 std::map<std::string, std::string> signed_post_headers(
     std::string_view device_id, std::string_view path,
     std::string_view body, log::Signer& signer) {
-  std::random_device entropy;
-  std::mt19937_64 generator(entropy());
-  std::uniform_int_distribution<std::uint64_t> distribution;
-  std::ostringstream nonce_stream;
-  nonce_stream << std::hex << distribution(generator)
-               << distribution(generator);
-  const std::string nonce = nonce_stream.str();
+  const std::string nonce = fresh_nonce();
   const std::int64_t ts = now_s();
   const std::string signature =
       sign_request(device_id, "POST", path, body, nonce, ts, signer);
@@ -356,6 +385,11 @@ bool SyncServer::start(std::string* error) {
     } else {
       return reject("unknown device");
     }
+    // An evicted or departed device is refused even when its key is still
+    // listed in members.json: the folded members table is the authority.
+    if (onion::state::StateWriter::member_retired_on(
+            impl_->options.writer->read_db(), device_id))
+      return reject("evicted or departed device");
     const std::int64_t ts = std::atoll(timestamp.c_str());
     // The signature covers the full target (path + query); httplib keeps
     // the query only in request.target. GETs and the evict POST sign the
