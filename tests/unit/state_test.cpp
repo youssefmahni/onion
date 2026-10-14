@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -167,6 +168,33 @@ TEST_F(StateWriterTest, RestartReplaysLogAndRestoresIndex) {
     EXPECT_EQ(node->title, "Survives Restart");
     writer->stop();
   }
+}
+
+TEST_F(StateWriterTest, ReservedTotalReadsRaceFreeWithCampaignFolds) {
+  // The sync scheduler reads reserved_total()/reservation_void() (which
+  // consult the campaign's loop budget) while the writer thread folds
+  // CAMPAIGN records that update that budget. Under TSan an unlocked read
+  // is a reported data race.
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  std::atomic<bool> stop{false};
+  std::atomic<std::int64_t> reads{0};
+  std::thread reader([&] {
+    while (!stop.load()) {
+      (void)writer_->reserved_total("c1");
+      ++reads;
+    }
+  });
+  for (int i = 0; i < 300; ++i)
+    writer_->submit(CommitTerminal{{make_record(
+        "CAMPAIGN", {{"id", "c1"},
+                     {"spec", {{"loop_budget", 100 + i}}},
+                     {"state", "running"}})}});
+  writer_->sync();
+  stop = true;
+  reader.join();
+  EXPECT_GT(reads.load(), 0);
+  EXPECT_EQ(writer_->reserved_total("c1"), 0);
 }
 
 TEST_F(StateWriterTest, CampaignFoldAndStopIsFinal) {

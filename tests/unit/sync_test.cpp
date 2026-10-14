@@ -5,6 +5,7 @@
 #include <fstream>
 #include <thread>
 #include <memory>
+#include <set>
 #include <string>
 
 #include "sync/sync.hpp"
@@ -164,6 +165,138 @@ TEST_F(SyncTest, NonceCacheRejectsReplaysInTheWindow) {
   EXPECT_FALSE(cache.seen_and_add("dev1", "sig2", 1050));   // new signature
   EXPECT_FALSE(cache.seen_and_add("dev2", "sig1", 1050));   // other device
   EXPECT_FALSE(cache.seen_and_add("dev1", "sig1", 2000));   // window moved on
+}
+
+TEST_F(SyncTest, FreshNonceIsFixedWidthHexAndNeverRepeats) {
+  // Decision 0018 point 1: >= 128 bits, 32 hex characters, a fresh value
+  // per request attempt. Fixed width matters: an unpadded draw would make
+  // the width (and the entropy) vary.
+  std::set<std::string> seen;
+  for (int i = 0; i < 4000; ++i) {
+    const std::string nonce = onion::sync::fresh_nonce();
+    ASSERT_EQ(nonce.size(), 32u) << nonce;
+    for (const char c : nonce)
+      ASSERT_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) << nonce;
+    seen.insert(nonce);
+  }
+  EXPECT_EQ(seen.size(), 4000u);
+}
+
+TEST_F(SyncTest, NonceCacheIsSafeUnderConcurrentRequests) {
+  // The server's handler threads share one cache. Eight threads each
+  // present 2,000 distinct nonces: every first sighting must be accepted
+  // exactly once, and a second sighting rejected. Under TSan an unlocked
+  // cache is a reported data race; without one it corrupts the map.
+  NonceCache cache;
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 2000;
+  std::atomic<int> accepted{0};
+  std::atomic<int> replays_accepted{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kPerThread; ++i) {
+        const std::string nonce =
+            "t" + std::to_string(t) + "-" + std::to_string(i);
+        if (!cache.seen_and_add("dev", nonce, 1000)) ++accepted;
+        if (!cache.seen_and_add("dev", nonce, 1000)) ++replays_accepted;
+      }
+    });
+  for (std::thread& thread : threads) thread.join();
+  EXPECT_EQ(accepted.load(), kThreads * kPerThread);
+  EXPECT_EQ(replays_accepted.load(), 0);
+}
+
+TEST_F(SyncTest, DeviceThatLeftCanNoLongerAuthenticate) {
+  // Authentication resolves the key from the static list first, so a
+  // device that is in members.json AND has a table row must still be
+  // refused once its row is EVICTED or LEFT. A static-only member (no
+  // table row) keeps working — static fleets never write MEMBER_ADD.
+  writer_a_->submit(CommitTerminal{{
+      make_record("MEMBER_ADD", {{"pubkey", pubkey_hex(*key_b_)},
+                                 {"nonce", "7c7d7e7f8081828384858687"}}),
+  }});
+  writer_a_->sync();
+  start_server_a();
+  httplib::Client client("127.0.0.1", server_->bound_port());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  client.set_write_timeout(5, 0);
+  Ed25519Signer signer_b(*key_b_);
+  const auto get_vector = [&]() {
+    const std::string nonce = onion::sync::fresh_nonce();
+    const std::int64_t ts = now_s();
+    const std::string signature = sign_request(
+        key_b_->device_id, "GET", "/sync/v1/vector", "", nonce, ts,
+        signer_b);
+    const httplib::Headers headers{{"X-Onion-Device", key_b_->device_id},
+                                   {"X-Onion-Time", std::to_string(ts)},
+                                   {"X-Onion-Nonce", nonce},
+                                   {"X-Onion-Sig", signature}};
+    const auto response = client.Get("/sync/v1/vector", headers);
+    return response ? response->status : -1;
+  };
+  EXPECT_EQ(get_vector(), 200);  // a current member
+
+  // B leaves: its own MEMBER_LEAVE batch reaches A through a signed push.
+  writer_b_->submit(CommitTerminal{{make_record(
+      "MEMBER_LEAVE", {{"device_id", key_b_->device_id}})}});
+  writer_b_->sync();
+  std::string batch_json;
+  {
+    std::ifstream in(writer_b_->segments().active_path());
+    std::string line;
+    while (std::getline(in, line))
+      if (!line.empty()) batch_json = line;
+  }
+  ASSERT_FALSE(batch_json.empty());
+  const auto push_headers = onion::sync::signed_post_headers(
+      key_b_->device_id, "/sync/v1/push", batch_json, signer_b);
+  httplib::Headers headers;
+  for (const auto& [name, value] : push_headers)
+    headers.emplace(name, value);
+  const auto pushed =
+      client.Post("/sync/v1/push", headers, batch_json, "application/json");
+  ASSERT_TRUE(pushed);
+  EXPECT_EQ(pushed->status, 202);
+  writer_a_->sync();
+  std::string state;
+  for (const auto& row : writer_a_->members_table())
+    if (row.device_id == key_b_->device_id) state = row.state;
+  ASSERT_EQ(state, "LEFT");
+
+  EXPECT_EQ(get_vector(), 401);  // left: refused on every endpoint
+}
+
+TEST_F(SyncTest, MajorityDenominatorDropsEvictedAndDepartedDevices) {
+  // members.json is never pruned, so a device listed there that the
+  // members table marks LEFT/EVICTED must not stay in the denominator
+  // (the old rule took max(table count, file size) and counted it).
+  using Row = StateWriter::MemberRow;
+  const auto row = [](std::string id, std::string state) {
+    Row r;
+    r.device_id = std::move(id);
+    r.state = std::move(state);
+    return r;
+  };
+  const std::vector<std::string> listed{"A", "B"};
+  // Static 2-fleet, no table rows: both count; B must answer.
+  EXPECT_EQ(onion::sync::majority_denominator(listed, {}, "A"), 2u);
+  EXPECT_FALSE(onion::sync::majority_round(0, 2));
+  // B left: the survivor completes a round alone.
+  const std::vector<Row> left{row("B", "LEFT")};
+  EXPECT_EQ(onion::sync::majority_denominator(listed, left, "A"), 1u);
+  EXPECT_TRUE(onion::sync::majority_round(0, 1));
+  // B evicted behaves the same; the retired set names it.
+  const std::vector<Row> evicted{row("B", "EVICTED")};
+  EXPECT_EQ(onion::sync::majority_denominator(listed, evicted, "A"), 1u);
+  EXPECT_EQ(onion::sync::retired_member_ids(evicted),
+            std::set<std::string>{"B"});
+  // A dynamic joiner with a table row counts once, even when also listed.
+  const std::vector<Row> joined{row("B", "ACTIVE"), row("C", "JOINING")};
+  EXPECT_EQ(onion::sync::majority_denominator(listed, joined, "A"), 3u);
+  // Self always counts, listed or not.
+  EXPECT_EQ(onion::sync::majority_denominator({}, {}, "A"), 1u);
 }
 
 TEST_F(SyncTest, MajorityRoundCountsSelfAndNeedsStrictlyMoreThanHalf) {
