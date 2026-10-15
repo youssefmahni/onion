@@ -1,4 +1,26 @@
 # Worklog (append-only, newest at top)
+
+## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
+
+Result: PR open (dash/d0-foundation, 2 commits: preserved checkpoint
+endpoint + D0). §2 done earlier (docs/dashboard/INVENTORY.md on
+b3-gate-funnel; prerequisite gate: 0024 merged, 0025 in flight as PR #50 —
+now CI-green).
+Evidence:
+- api tests 18/18 and platform tests 12/12 locally; live-node checks:
+  one-time code -> /auth 302 + flagged cookie -> /api/v1/version 200,
+  code replay 401, POST /api/checkpoint 200 with a real checkpoint file.
+- The concurrent fleet session's uncommitted checkpoint work was
+  preserved as commit 6878b7b (its /api/checkpoint glue reconstructed;
+  the state-side WriteCheckpoint command is theirs verbatim).
+- PR #50 (prerequisite 0025) CI green on the fixed head (run 38731595992,
+  the ASan leak in the fold-idempotency test was fixed by scoping the
+  statement before writer->stop()).
+Next step: 3 green CI runs on #50 then merge; merge main into
+dash/d0-foundation and resolve the expected api.cpp/api.hpp/commands.cpp
+conflicts; then D1 (tree endpoints, counters, viewcache.db, screens 5-7).
+
+
 ## 2026-10-15 · dashboard D0 · §2 verify-and-adapt (inventories + prerequisite gate)
 
 Result: in progress
@@ -37,6 +59,7 @@ tagged `m8-rc`; recent CI runs green incl. the PR #48 main merge). The
 earlier OA-14 wording in old WORKLOG entries and REVIEW.md F-CI-1 remains
 as historical record.
 Next step: finish B3 on `b3-gate-funnel`, then B2/B5 and B6 from REVIEW.md.
+
 
 ## 2026-10-14 · M8 · local implementation complete
 
@@ -227,6 +250,32 @@ CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
 
+
+## 2026-10-15 — Fleet ACTIVE bug: root cause + repair
+
+**Root cause (two compounding bugs):**
+1. `campaign start` run while the node was live opened the data dir as a
+   second writer → interleaved batches forked #1's hash chain (batches
+   65–115). #2 quarantined everything after the join (`verify 2` = BadPrev).
+2. Checkpoints are written every 6 h / 100 k records, so #1's checkpoints
+   predated the fork — every fresh join cloned a stale chain and could
+   never verify against the live log.
+
+**Fix:** shipped `POST /api/checkpoint` (WriteCheckpoint command → writer
+thread → fresh checkpoint) on both Macs. Repaired #1: wiped oplog +
+batches table (kept the DB: 530 settles, tree, campaigns), fresh clean
+chain, forced checkpoint. #2: fresh join → clone matched → **joined:
+ACTIVE (lag 6)**. Lanes split 1,782 / 1,903. OPERATOR.md gained the two
+hard rules (no second writer on a live data dir; checkpoint before
+admitting a joiner).
+
+**Next step:** land the checkpoint endpoint + the OPERATOR.md rules via PR
+(b3-gate-funnel); also fix reload_members() wiping members-table URLs.
+NOTE: the working dir was switched to branch `dash/d0-foundation` (a
+dashboard rework in progress) — my checkpoint edits are uncommitted there;
+the earlier commits live on b3-gate-funnel.
+
+
 ## 2026-10-14 · Mac Pro deployment — first machine live (mac@192.168.1.63)
 
 Result: deployed
@@ -272,3 +321,4 @@ Next step: owner's three manual steps above; then the first real campaign (one p
 **Finding (real bug, to fix in the PR):** `reload_members()` (commands.cpp, sync thread) replaces `member_urls` from the static members.json every round, wiping URLs the main loop had merged from the members table (the M7 "deterministic fallback" for joined devices). Symptom: the seed never pulls a joined device — rounds verdict `answered=1/2 majority=no`, vector stuck at 2. Workaround: list both members with `url`/`swim` in the seed's members.json. After that: rounds completing, lanes split ~50/50 (158,298 / 158,961 tickets), vector 913/958 both ways, 110 settles, $0.35.
 
 **Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.
+

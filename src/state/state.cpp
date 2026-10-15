@@ -1273,6 +1273,14 @@ void StateWriter::run() {
         }
         break;
       }
+      case Command::Kind::Checkpoint: {
+        std::string checkpoint_error;
+        if (!write_checkpoint(&checkpoint_error))
+          std::fprintf(stderr, "state writer: forced checkpoint failed: "
+                               "%s\n",
+                       checkpoint_error.c_str());
+        break;
+      }
       case Command::Kind::MemberUrl: {
         auto statement = db_.prepare(
             "UPDATE members SET sync_url=?2 WHERE device_id=?1;", &error);
@@ -1392,6 +1400,15 @@ void StateWriter::submit(AppendForeign command) {
   Command queued;
   queued.kind = Command::Kind::Foreign;
   queued.foreign = std::move(command.batch);
+  queue_.push_back(std::move(queued));
+  queue_cv_.notify_one();
+}
+
+void StateWriter::submit(WriteCheckpoint command) {
+  (void)command;
+  std::lock_guard lock(queue_mutex_);
+  Command queued;
+  queued.kind = Command::Kind::Checkpoint;
   queue_.push_back(std::move(queued));
   queue_cv_.notify_one();
 }

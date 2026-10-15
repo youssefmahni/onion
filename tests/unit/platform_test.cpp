@@ -176,3 +176,21 @@ TEST(PlatformUdpTest, MulticastJoinFailsGracefullyWithoutTheGroup) {
   if (!socket.join_group("239.255.77.31", &error))
     EXPECT_FALSE(error.empty());
 }
+
+TEST(PlatformSecureRandomTest, ReturnsRequestedLengthWithEntropy) {
+  const auto a = onion::platform::secure_random(32);
+  const auto b = onion::platform::secure_random(32);
+  EXPECT_EQ(a.size(), 32u);
+  EXPECT_EQ(b.size(), 32u);
+  // Two draws of 256 bits must not collide, and the bytes must not be
+  // the all-zero stream a broken CSPRNG would return.
+  EXPECT_NE(a, b);
+  bool non_zero = false;
+  for (const char c : a + b)
+    if (c != '\0') non_zero = true;
+  EXPECT_TRUE(non_zero);
+}
+
+TEST(PlatformSecureRandomTest, EmptyRequestReturnsEmpty) {
+  EXPECT_TRUE(onion::platform::secure_random(0).empty());
+}
