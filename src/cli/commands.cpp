@@ -220,7 +220,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string error;
   json result = json::object();
   auto children_stmt = read.prepare(
-      "SELECT id, code, path, layer, title, hlc FROM nodes "
+      "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
       "WHERE parent_id = ?1 AND tombstone = 0 ORDER BY layer, id "
       "LIMIT ?2 OFFSET ?3;",
       &error);
@@ -253,12 +253,14 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   };
   std::vector<Frame> frames;
   const auto make_node = [&](std::string_view code, std::string_view path,
-                             int layer, std::string_view title) {
+                             int layer, std::string_view title,
+                             std::string_view tree) {
     json node;
     node["code"] = code;
     node["path"] = path;
     node["layer"] = layer;
     node["title"] = title;
+    if (!tree.empty()) node["tree"] = tree;
     node["children"] = json::array();
     settle_for(path, node);
     return node;
@@ -266,7 +268,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string bind_error;
   if (root.empty()) {
     auto roots = read.prepare(
-        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
         "WHERE parent_id IS NULL AND tombstone = 0 ORDER BY layer, id "
         "LIMIT ?1;",
         &error);
@@ -282,7 +284,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       const std::int64_t id = roots->integer(0);
       root_ids.push_back(id);
       nodes.push_back(make_node(roots->text(1), roots->text(2),
-                                roots->integer_int(3), roots->text(4)));
+                                roots->integer_int(3), roots->text(4),
+                                roots->text(6)));
     }
     result["nodes"] = std::move(nodes);
     if (depth > 0)
@@ -290,7 +293,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
         frames.push_back(Frame{&result["nodes"][i], root_ids[i], depth});
   } else {
     auto node_stmt = read.prepare(
-        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
         "WHERE path = ?1 AND tombstone = 0;",
         &error);
     if (!node_stmt) {
@@ -305,7 +308,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
     }
     const std::int64_t id = node_stmt->integer(0);
     result["node"] = make_node(node_stmt->text(1), node_stmt->text(2),
-                               node_stmt->integer_int(3), node_stmt->text(4));
+                               node_stmt->integer_int(3), node_stmt->text(4),
+                               node_stmt->text(6));
     if (depth > 0) frames.push_back(Frame{&result["node"], id, depth});
   }
   std::size_t cursor = 0;
@@ -328,7 +332,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       const std::int64_t child_id = children_stmt->integer(0);
       batch.emplace_back(
           make_node(children_stmt->text(1), children_stmt->text(2),
-                    children_stmt->integer_int(3), children_stmt->text(4)),
+                    children_stmt->integer_int(3), children_stmt->text(4),
+                    children_stmt->text(6)),
           child_id);
     }
     // sqlite3_step AUTO-RESETS the statement when it returns DONE, so
@@ -2196,17 +2201,20 @@ int review_cmd(int argc, char** argv) {
 int dev_import_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot dev-import --root <corpus-copy> "
-                 "[--data-dir <dir>]\n"
+                 "[--data-dir <dir>] [--tree <name>] [--allow-skip]\n"
               << "\nimport a development corpus (per-layer CSVs named "
-                 "\"Onion - level_NN.csv\") into the data dir.\n";
+                 "\"Onion - level_NN.csv\") into the data dir. --tree "
+                 "tags every imported node with a domain tree (empty = "
+                 "planning).\n";
     return 0;
   }
   const std::string root = flag(argc, argv, "--root", "");
   if (root.empty()) {
     std::cerr << "usage: data_depot dev-import --root <corpus-copy> "
-                 "[--data-dir <dir>]\n";
+                 "[--data-dir <dir>] [--tree <name>]\n";
     return 2;
   }
+  const std::string tree = flag(argc, argv, "--tree", "");
   const std::filesystem::path dir = data_dir_arg(argc, argv);
   auto data_lock = lock_data_dir(dir);
   if (!data_lock) return 1;
@@ -2240,6 +2248,7 @@ int dev_import_cmd(int argc, char** argv) {
       }
     }
   }
+  for (auto& node : import.nodes) node.tree = tree;
   // Decision 0027: collisions are a hard stop unless --allow-skip is
   // given. A collision is (a) a path that already exists with DIFFERENT
   // content, or (b) a code already used by another path. Every collision
@@ -2292,16 +2301,18 @@ int dev_import_cmd(int argc, char** argv) {
 int export_csv_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot export-csv --out <dir> [--data-dir "
-                 "<dir>] [--max-layer 9]\n"
-              << "\nexport the knowledge tree to per-layer CSVs.\n";
+                 "<dir>] [--max-layer 9] [--tree <name>]\n"
+              << "\nexport the knowledge tree to per-layer CSVs. --tree "
+                 "exports only one domain tree.\n";
     return 0;
   }
   const std::string out = flag(argc, argv, "--out", "");
   if (out.empty()) {
     std::cerr << "usage: data_depot export-csv --out <dir> [--data-dir <dir>] "
-                 "[--max-layer 9]\n";
+                 "[--max-layer 9] [--tree <name>]\n";
     return 2;
   }
+  const std::string tree = flag(argc, argv, "--tree", "");
   const std::filesystem::path dir = data_dir_arg(argc, argv);
   const int max_layer =
       std::atoi(flag(argc, argv, "--max-layer", "9").c_str());
@@ -2311,7 +2322,7 @@ int export_csv_cmd(int argc, char** argv) {
     std::cerr << error << "\n";
     return 1;
   }
-  if (!db.export_csv(out, max_layer, &error)) {
+  if (!db.export_csv(out, max_layer, &error, tree)) {
     std::cerr << error << "\n";
     return 1;
   }

@@ -42,11 +42,15 @@ void upsert_node(store::Db& db, const log::Record& record,
   // Decision 0027: the record carries the node's source; legacy
   // records (no field) default to "engine".
   const std::string source = payload.value("source", std::string{"engine"});
+  // Decision 0027: the record carries the node's domain tree; legacy
+  // records (no field) default to the planning tree (empty).
+  const std::string tree = payload.value("tree", std::string{});
   auto statement = db.prepare(
       "INSERT INTO nodes(id, code, path, parent_id, layer, title, origin, "
-      "hlc, source) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, "
-      "?1, ?2, "
-      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7, ?8) "
+      "hlc, source, tree) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) "
+      "+ 1, ?1, ?2, "
+      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7, ?8, "
+      "?9) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
       "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
       "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
@@ -60,7 +64,8 @@ void upsert_node(store::Db& db, const log::Record& record,
       !statement->bind(5, title, &bind_error) ||
       !statement->bind(6, origin, &bind_error) ||
       !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error) ||
-      !statement->bind(8, source, &bind_error)) {
+      !statement->bind(8, source, &bind_error) ||
+      !statement->bind(9, tree, &bind_error)) {
     if (error) *error = "fold node bind failed: " + bind_error;
     return;
   }
@@ -1308,9 +1313,9 @@ void StateWriter::run() {
         // an existence check per row.
         auto statement = db_.prepare(
             "INSERT OR IGNORE INTO nodes(code, path, parent_id, layer, "
-            "title, origin, hlc, source) VALUES (?1, ?2, (SELECT n2.id FROM "
-            "nodes n2 WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6, "
-            "'import');",
+            "title, origin, hlc, source, tree) VALUES (?1, ?2, (SELECT n2.id "
+            "FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6, "
+            "'import', ?7);",
             &error);
         auto exists = db_.prepare(
             "SELECT 1 FROM nodes WHERE path = ?1;", &error);
@@ -1341,7 +1346,8 @@ void StateWriter::run() {
               !statement->bind(3, parent, &bind_error) ||
               !statement->bind(4, static_cast<std::int64_t>(node.layer), &bind_error) ||
               !statement->bind(5, node.title, &bind_error) ||
-              !statement->bind(6, static_cast<std::int64_t>(hlc_.now()), &bind_error)) {
+              !statement->bind(6, static_cast<std::int64_t>(hlc_.now()), &bind_error) ||
+              !statement->bind(7, node.tree, &bind_error)) {
             error = "import bind failed: " + bind_error;
             break;
           }
@@ -1398,8 +1404,11 @@ ImportCollisionReport check_import_collisions(
   ImportCollisionReport report;
   auto existing_path =
       db.prepare("SELECT code, title FROM nodes WHERE path = ?1;", error);
-  auto existing_code =
-      db.prepare("SELECT path FROM nodes WHERE code = ?1 LIMIT 1;", error);
+  // Decision 0027: codes may repeat across different trees, so the code
+  // collision check is scoped to the imported node's tree.
+  auto existing_code = db.prepare(
+      "SELECT path FROM nodes WHERE code = ?1 AND tree = ?2 LIMIT 1;",
+      error);
   if (!existing_path || !existing_code) {
     if (error && error->empty()) *error = "cannot prepare collision checks";
     report.refused = true;
@@ -1424,6 +1433,7 @@ ImportCollisionReport check_import_collisions(
     }
     existing_code->reset(&step_error);
     existing_code->bind(1, node.code, &step_error);
+    existing_code->bind(2, node.tree, &step_error);
     if (!collides && existing_code->step_row(&step_error)) {
       collides = true;
       report.rows.push_back(node.path + "\t" + node.code +

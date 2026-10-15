@@ -1507,6 +1507,40 @@ TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollision
     EXPECT_TRUE(report.refused);
     EXPECT_NE(report.rows[0].find("already used"), std::string::npos);
   }
+  // Decision 0027: codes may repeat across different trees — the same
+  // code in another tree is not a collision.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "R01-IN01", 1, "Identify Problem", "react"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_FALSE(report.refused);
+    EXPECT_TRUE(report.rows.empty());
+    EXPECT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes[0].tree, "react");
+  }
+  // The same code inside the same tree still collides.
+  {
+    writer->submit(CommitTerminal{{
+        make_record("ADD_NODE", {{"path", "R01"}, {"layer", 0},
+                                 {"title", "React Root"},
+                                 {"code", "R01"}, {"tree", "react"}}),
+    }});
+    writer->sync();
+    std::vector<DevImportedNode> nodes = {
+        {"R01", "R01-OTHER", 1, "Other React Node", "react"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_TRUE(report.refused);
+    EXPECT_EQ(report.rows.size(), 1u);
+  }
+  // The folded node carries its tree.
+  {
+    std::string read_error;
+    const auto react_root = writer->db().node_by_path("R01", &read_error);
+    ASSERT_TRUE(react_root) << read_error;
+    EXPECT_EQ(react_root->tree, "react");
+  }
   writer->stop();
   std::filesystem::remove_all(dir);
 }

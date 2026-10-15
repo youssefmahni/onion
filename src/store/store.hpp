@@ -32,6 +32,11 @@ struct Node {
   // import, exempt from the allowance fold per decision 0025) or
   // "engine" (created by a campaign settle). Empty = engine (legacy).
   std::string source;
+  // Decision 0027: the domain tree this node belongs to. Empty = the
+  // planning tree (the embedded default profile). Campaigns, exports
+  // and the dashboard filter by tree, and node codes may repeat across
+  // different trees.
+  std::string tree;
 };
 
 struct Settle {
@@ -152,7 +157,8 @@ class Db {
   // Typed helpers.
   std::optional<Node> node_by_path(std::string_view path, std::string* error) const;
   std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error) const;
-  std::vector<Node> nodes_at_layer(int layer, std::string* error) const;
+  std::vector<Node> nodes_at_layer(int layer, std::string* error,
+                                   std::string_view tree = "") const;
   std::vector<Node> all_nodes(std::string* error) const;
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
                                            std::string* error) const;
@@ -177,7 +183,7 @@ class Db {
                                       std::string* error) const;
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,
-                  std::string* error) const;
+                  std::string* error, std::string_view tree = "") const;
 
   std::filesystem::path path() const { return path_; }
 

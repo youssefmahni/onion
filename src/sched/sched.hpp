@@ -64,6 +64,9 @@ struct CampaignSpec {
   // checkpoint) without spending an attempt. Both 0 = off.
   int depth_checkpoint_from{0};
   int depth_checkpoint_every{0};
+  // Decision 0027: the domain tree this campaign works in (empty = the
+  // planning tree). Every ADD_NODE the campaign emits carries it.
+  std::string tree;
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,

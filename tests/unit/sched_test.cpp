@@ -117,6 +117,26 @@ TEST(ParseCampaign, GateAndFloorAcceptNumericStrings) {
                    .has_value());
 }
 
+TEST(ParseCampaign, TreeRoundTrips) {
+  // Decision 0027: a campaign works one domain tree (empty = planning).
+  std::string error;
+  const auto planning = parse_campaign(json{{"id", "p"}}, &error);
+  ASSERT_TRUE(planning.has_value()) << error;
+  EXPECT_TRUE(planning->tree.empty());
+  const auto canonical_planning = onion::sched::campaign_spec_json(*planning);
+  EXPECT_FALSE(canonical_planning.contains("tree"));  // planning stays lean
+
+  const auto react = parse_campaign(
+      json{{"id", "r"}, {"tree", "react"}}, &error);
+  ASSERT_TRUE(react.has_value()) << error;
+  EXPECT_EQ(react->tree, "react");
+  const auto canonical = onion::sched::campaign_spec_json(*react);
+  EXPECT_EQ(canonical["tree"].get<std::string>(), "react");
+  const auto reparsed = parse_campaign(canonical, &error);
+  ASSERT_TRUE(reparsed.has_value()) << error;
+  EXPECT_EQ(reparsed->tree, "react");
+}
+
 TEST(ParseCampaign, RejectsInvalidVariantFields) {
   std::string error;
   EXPECT_FALSE(parse_campaign(json{{"id", "c"}, {"worker_candidates", 0}},

@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   title     TEXT NOT NULL,
   origin    TEXT NOT NULL,
   hlc       INTEGER NOT NULL,
-  tombstone INTEGER NOT NULL DEFAULT 0
+  tombstone INTEGER NOT NULL DEFAULT 0,
+  source    TEXT NOT NULL DEFAULT '',
+  tree      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
 CREATE TABLE IF NOT EXISTS settles   (path TEXT PRIMARY KEY, kept INT, atomic INT, attempts INT, score TEXT,
@@ -295,9 +297,11 @@ bool Db::open(std::string* error) {
   sqlite3_exec(handle_,
                "ALTER TABLE campaigns ADD COLUMN reason TEXT;",
                nullptr, nullptr, nullptr);
-  // Decision 0027: nodes carry their source ("import" | "engine").
+  // Decision 0027: nodes carry their source ("import" | "engine") and
+  // their domain tree (empty = planning).
   sqlite3_exec(handle_,
-               "ALTER TABLE nodes ADD COLUMN source TEXT;",
+               "ALTER TABLE nodes ADD COLUMN source TEXT; "
+               "ALTER TABLE nodes ADD COLUMN tree TEXT NOT NULL DEFAULT '';",
                nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
@@ -368,12 +372,13 @@ Node read_node(Statement& stmt) {
   node.hlc = static_cast<std::uint64_t>(stmt.integer(7));
   node.tombstone = stmt.integer_int(8);
   node.source = stmt.text(9);
+  node.tree = stmt.text(10);
   return node;
 }
 
 constexpr const char* kNodeColumns =
     "id, code, path, parent_id, layer, title, origin, hlc, tombstone, "
-    "source";
+    "source, tree";
 
 }  // namespace
 
@@ -414,14 +419,18 @@ std::vector<Node> Db::nodes_in_subtree(std::string_view path, std::string* error
   return nodes;
 }
 
-std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) const {
+std::vector<Node> Db::nodes_at_layer(int layer, std::string* error,
+                                     std::string_view tree) const {
+  const bool filter_tree = !tree.empty();
   std::optional<Statement> stmt = prepare(
-      std::string("SELECT ") + kNodeColumns +
-          " FROM nodes WHERE layer = ?1 AND tombstone = 0 ORDER BY path;",
+      std::string("SELECT ") + kNodeColumns + " FROM nodes WHERE layer = ?1 "
+          "AND tombstone = 0" + (filter_tree ? " AND tree = ?2" : "") +
+          " ORDER BY path;",
       error);
   if (!stmt) return {};
   std::string step_error;
-  if (!stmt->bind(1, static_cast<std::int64_t>(layer), &step_error)) {
+  if (!stmt->bind(1, static_cast<std::int64_t>(layer), &step_error) ||
+      (filter_tree && !stmt->bind(2, std::string(tree), &step_error))) {
     set_error(error, handle_, "layer bind failed");
     return {};
   }
@@ -623,7 +632,7 @@ std::string Db::spend_rate_usd_per_hour(std::int64_t window_seconds,
 }
 
 bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
-                    std::string* error) const {
+                    std::string* error, std::string_view tree) const {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
@@ -631,7 +640,7 @@ bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
     return false;
   }
   for (int layer = 0; layer <= max_layer && layer <= 9; ++layer) {
-    std::vector<Node> nodes = nodes_at_layer(layer, error);
+    std::vector<Node> nodes = nodes_at_layer(layer, error, tree);
     if (!error->empty()) return false;
     char name[32];
     std::snprintf(name, sizeof(name), "Onion - level_%02d.csv", layer);

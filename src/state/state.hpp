@@ -62,6 +62,9 @@ struct DevImportedNode {
   std::string path;
   int layer{};
   std::string title;
+  // Decision 0027: the domain tree the node belongs to (empty = the
+  // planning tree).
+  std::string tree;
 };
 
 struct DevImport {

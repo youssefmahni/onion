@@ -81,6 +81,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  spec.tree = value.value("tree", std::string{});
   // Decision 0024. critic: "on" | "off" (a boolean is accepted too).
   if (value.contains("critic")) {
     if (value["critic"].is_boolean())
@@ -224,6 +225,7 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   // M8 branch share (decision 0020): the ratio and the starting pools
   // travel in the record so every replica folds the same numbers.
   out["branch_share"] = std::to_string(spec.branch_share);
+  if (!spec.tree.empty()) out["tree"] = spec.tree;
   if (spec.depth_checkpoint_every > 0) {
     out["depth_checkpoint_from"] = spec.depth_checkpoint_from;
     out["depth_checkpoint_every"] = spec.depth_checkpoint_every;
@@ -1117,6 +1119,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                          {"layer", ticket.layer + 1},
                          {"title", child.title},
                          {"source", "engine"}}));
+        if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
       }
       records.push_back(make_record(
           "CRITIQUE", {{"path", ticket.path},
@@ -1181,6 +1184,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
               "ADD_NODE", {{"path", ticket.path + "-" + id},
                            {"layer", ticket.layer + 1},
                            {"title", child.title}}));
+          if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
           if (child.atomic)
             records.push_back(make_record(
                 "ATOMIC", {{"path", ticket.path + "-" + id},
