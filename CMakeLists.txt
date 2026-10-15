@@ -58,6 +58,7 @@ endfunction()
 
 # Base layer
 onion_add_compiled_module(core src/core/depot_core.cpp)
+target_link_libraries(core PUBLIC onion::domain)
 
 if(ONION_ENABLE_OPENCL)
   find_path(ONION_OPENCL_INCLUDE_DIR CL/cl.h
@@ -137,6 +138,13 @@ target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)
 target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_compiled_module(store src/store/store.cpp src/store/checkpoint.cpp)
+# Decision 0027: domain profiles (header-only). The planning profile is
+# embedded; style checks and structure layers live in the profile. Kept
+# interface-only so the base core layer can use it without pulling log
+# into core (profile_hash/JSON callers must link log themselves).
+onion_add_module(domain)
+target_link_libraries(domain INTERFACE nlohmann_json::nlohmann_json
+  onion::log)
 target_link_libraries(store PUBLIC onion_sqlite onion::log)
 target_link_libraries(store PUBLIC onion::core onion::platform)
 if(WIN32)
@@ -194,7 +202,7 @@ target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onio
 # Engine layer
 onion_add_compiled_module(gate src/gate/gate.cpp)
 target_link_libraries(gate PUBLIC nlohmann_json::nlohmann_json)
-target_link_libraries(gate PUBLIC onion::core onion::llm)
+target_link_libraries(gate PUBLIC onion::core onion::llm onion::domain)
 onion_add_compiled_module(sched src/sched/sched.cpp)
 target_link_libraries(sched PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(sched PUBLIC onion::core onion::gate onion::state)

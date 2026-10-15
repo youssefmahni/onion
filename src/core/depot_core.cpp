@@ -7,6 +7,8 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "domain/domain.hpp"
+
 namespace depot {
 int policy_target(int cores, double load1, double ram_avail_gb, double net_mbps,
                   double link_mbps, double gpu_pct, int prev) {
@@ -136,20 +138,7 @@ double sim_keys(const std::string& k1, const std::string& k2) {
 }
 
 std::vector<std::string> style_flags(const std::string& title) {
-    std::vector<std::string> f;
-    if (title.find('?') != std::string::npos || title.find('!') != std::string::npos)
-        f.push_back("question_or_bang");
-    if (title.empty() || !std::isupper((unsigned char)title[0])) f.push_back("not_title_case");
-    size_t words = 0; std::istringstream ss(title); std::string w;
-    while (ss >> w) ++words;
-    if (words > 8) f.push_back("too_many_words");
-    if (!title.empty() && (title.back() == '.' || title.back() == ':')) f.push_back("trailing_punct");
-    if (words > 2) {
-        std::istringstream s2(title); std::string x; bool filler = false;
-        while (s2 >> x) if (FILLER.count(lower(x))) filler = true;
-        if (filler) f.push_back("contains_filler");
-    }
-    return f;
+    return onion::domain::style_flags(title, onion::domain::planning_profile().style);
 }
 
 std::vector<int> parse_levels(const std::string& spec) {
