@@ -113,6 +113,17 @@ class JumpClock final : public onion::swim::Clock {
 };
 }  // namespace
 #endif  // ONION_CHAOS_HOOKS
+// Decision 0027: every writer command takes the exclusive data-dir lock
+// first; node run holds it for its whole lifetime. Returns nullopt (with
+// the message printed) when the lock is held.
+std::optional<onion::platform::DataDirLock> lock_data_dir(
+    const std::filesystem::path& dir) {
+  std::string error;
+  auto lock = onion::platform::DataDirLock::acquire(dir, &error);
+  if (!lock) std::cerr << error << "\n";
+  return lock;
+}
+
 std::unique_ptr<onion::state::StateWriter> open_writer(
     const std::filesystem::path& dir, std::string* error) {
   onion::platform::KeyStore store(dir / "keys");
@@ -631,6 +642,11 @@ int node_cmd(int argc, char** argv) {
     // joiner's members.json, then clone the seed's newest checkpoint
     // (manifest signature, snapshot hash and Merkle root all verified).
     const std::filesystem::path join_dir = data_dir_arg(argc, argv);
+    // Decision 0027: the join writes the data dir — the same exclusive
+    // lock as every writer command (a running node on this dir refuses
+    // the join; the lock dies with this process).
+    auto data_lock = lock_data_dir(join_dir);
+    if (!data_lock) return 1;
     const auto body = json::parse(response->body, nullptr, false);
     if (body.is_object() && body.contains("members")) {
       std::filesystem::create_directories(join_dir);
@@ -995,6 +1011,10 @@ int node_cmd(int argc, char** argv) {
   const int api_port = std::atoi(flag(argc, argv, "--api-port", "8080").c_str());
 
   std::string error;
+  // The exclusive data-dir lock lives for the whole node run (decision
+  // 0027): writer commands refuse while this process holds it.
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   auto writer = open_writer(dir, &error);
   if (!writer) {
     std::cerr << "cannot open node state: " << error << "\n";
@@ -1912,6 +1932,8 @@ int campaign_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {
@@ -2096,6 +2118,8 @@ int review_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {
@@ -2177,6 +2201,8 @@ int dev_import_cmd(int argc, char** argv) {
     return 2;
   }
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {

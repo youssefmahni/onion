@@ -23,6 +23,7 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -113,6 +114,89 @@ bool sync_directory(const std::filesystem::path& path) {
 
 void reset_sync_counts_for_test() { sync_counts = {}; }
 SyncCounts sync_counts_for_test() { return sync_counts; }
+
+DataDirLock::~DataDirLock() {
+#ifdef _WIN32
+  if (handle_) {
+    UnlockFileEx(handle_, 0, 1, 0, nullptr);
+    CloseHandle(static_cast<HANDLE>(handle_));
+  }
+#else
+  if (fd_ >= 0) ::close(fd_);
+#endif
+}
+
+DataDirLock::DataDirLock(DataDirLock&& other) noexcept {
+#ifdef _WIN32
+  handle_ = other.handle_;
+  other.handle_ = nullptr;
+#else
+  fd_ = other.fd_;
+  other.fd_ = -1;
+#endif
+}
+
+DataDirLock& DataDirLock::operator=(DataDirLock&& other) noexcept {
+  if (this == &other) return *this;
+  this->~DataDirLock();
+#ifdef _WIN32
+  handle_ = other.handle_;
+  other.handle_ = nullptr;
+#else
+  fd_ = other.fd_;
+  other.fd_ = -1;
+#endif
+  return *this;
+}
+
+std::optional<DataDirLock> DataDirLock::acquire(
+    const std::filesystem::path& data_dir, std::string* error) {
+  std::error_code ec;
+  if (!data_dir.empty() && !std::filesystem::exists(data_dir, ec) &&
+      !std::filesystem::create_directories(data_dir, ec) && ec) {
+    if (error) *error = "cannot create the data directory: " + ec.message();
+    return std::nullopt;
+  }
+  const std::filesystem::path lock_path = data_dir / "node.lock";
+#ifdef _WIN32
+  HANDLE handle = CreateFileW(lock_path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    if (error) *error = "cannot open the data-dir lock file: " + lock_path.string();
+    return std::nullopt;
+  }
+  OVERLAPPED overlapped{};
+  if (!LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                  0, 1, 0, &overlapped)) {
+    CloseHandle(handle);
+    if (error)
+      *error = "data dir is in use by a running node (lock held): " +
+               lock_path.string();
+    return std::nullopt;
+  }
+  DataDirLock lock;
+  lock.handle_ = handle;
+  return lock;
+#else
+  const int fd =
+      ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    if (error) *error = "cannot open the data-dir lock file: " + lock_path.string();
+    return std::nullopt;
+  }
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    ::close(fd);
+    if (error)
+      *error = "data dir is in use by a running node (lock held): " +
+               lock_path.string();
+    return std::nullopt;
+  }
+  DataDirLock lock;
+  lock.fd_ = fd;
+  return lock;
+#endif
+}
 
 std::filesystem::path data_dir(const std::optional<std::filesystem::path>& flag) {
   if (flag && !flag->empty()) return *flag;

@@ -176,3 +176,32 @@ TEST(PlatformUdpTest, MulticastJoinFailsGracefullyWithoutTheGroup) {
   if (!socket.join_group("239.255.77.31", &error))
     EXPECT_FALSE(error.empty());
 }
+
+TEST_F(PlatformTest, DataDirLockExcludesSecondHolderAndSurvivesRelease) {
+  // Decision 0027: the exclusive data-dir lock. A second acquisition on
+  // the same dir fails with a clear message; releasing (destructor)
+  // frees it; a moved-from holder releases; the lock file dies with the
+  // holder, never stranding the dir.
+  const auto dir = root_ / "data";
+  std::string error;
+  auto first = onion::platform::DataDirLock::acquire(dir, &error);
+  ASSERT_TRUE(first.has_value()) << error;
+
+  auto second = onion::platform::DataDirLock::acquire(dir, &error);
+  EXPECT_FALSE(second.has_value());
+  EXPECT_NE(error.find("running node"), std::string::npos);
+
+  // Move assignment releases the old handle before taking the new one.
+  onion::platform::DataDirLock third;
+  third = std::move(*first);
+  auto fourth = onion::platform::DataDirLock::acquire(dir, &error);
+  EXPECT_FALSE(fourth.has_value());
+
+  // Releasing every holder frees the lock.
+  third = onion::platform::DataDirLock{};
+  auto fifth = onion::platform::DataDirLock::acquire(dir, &error);
+  EXPECT_TRUE(fifth.has_value()) << error;
+  fifth = onion::platform::DataDirLock{};
+  auto sixth = onion::platform::DataDirLock::acquire(dir, &error);
+  EXPECT_TRUE(sixth.has_value()) << error;
+}
