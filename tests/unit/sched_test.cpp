@@ -269,29 +269,25 @@ TEST(ParseCampaign, Decision0024FieldsDefaultAndRoundTrip) {
   ASSERT_TRUE(spec.has_value()) << error;
   EXPECT_FALSE(spec->critic);                    // critic: off by default
   EXPECT_EQ(spec->children_min, 8);
-  EXPECT_DOUBLE_EQ(spec->audit_rate, 0.02);
   EXPECT_DOUBLE_EQ(spec->stop_atomic_share, 0.90);
 
   spec = onion::sched::parse_campaign(
       nlohmann::json{{"id", "n"}, {"critic", "on"}, {"children_min", 5},
-                     {"audit_rate", "0.10"}, {"stop_atomic_share", "0.75"}},
+                     {"stop_atomic_share", "0.75"}},
       &error);
   ASSERT_TRUE(spec.has_value()) << error;
   EXPECT_TRUE(spec->critic);
   EXPECT_EQ(spec->children_min, 5);
-  EXPECT_DOUBLE_EQ(spec->audit_rate, 0.10);
   EXPECT_DOUBLE_EQ(spec->stop_atomic_share, 0.75);
 
   // The record form round-trips (decision 0003: decimal strings, no floats).
   const auto json = onion::sched::campaign_spec_json(*spec);
   EXPECT_EQ(json["critic"], "on");
-  EXPECT_TRUE(json["audit_rate"].is_string());
   EXPECT_TRUE(json["stop_atomic_share"].is_string());
   const auto reparsed = onion::sched::parse_campaign(json, &error);
   ASSERT_TRUE(reparsed.has_value()) << error;
   EXPECT_TRUE(reparsed->critic);
   EXPECT_EQ(reparsed->children_min, 5);
-  EXPECT_DOUBLE_EQ(reparsed->audit_rate, 0.10);
   EXPECT_DOUBLE_EQ(reparsed->stop_atomic_share, 0.75);
 
   // Old files still parse: gate/floor are accepted and ignored.
@@ -303,8 +299,6 @@ TEST(ParseCampaign, Decision0024FieldsDefaultAndRoundTrip) {
       nlohmann::json{{"id", "n"}, {"critic", "maybe"}}, &error));
   EXPECT_FALSE(onion::sched::parse_campaign(
       nlohmann::json{{"id", "n"}, {"children_min", 2}}, &error));
-  EXPECT_FALSE(onion::sched::parse_campaign(
-      nlohmann::json{{"id", "n"}, {"audit_rate", "1.5"}}, &error));
   EXPECT_FALSE(onion::sched::parse_campaign(
       nlohmann::json{{"id", "n"}, {"stop_atomic_share", "0"}}, &error));
 }
@@ -569,30 +563,6 @@ TEST(PlanCampaign, ReportContainsTheKeyNumbers) {
   EXPECT_NE(report.find("total new_nodes=6"), std::string::npos);
   EXPECT_NE(report.find("cost peak="), std::string::npos);
   EXPECT_NE(report.find("spend/hour peak="), std::string::npos);
-}
-
-TEST(AuditSampling, DeterministicAndRateMonotonic) {
-  // Decision 0024: the sample is a pure function of (campaign, path) —
-  // every replica and every run samples the same nodes; a higher rate
-  // samples at least the same set.
-  const double rate = 0.02;
-  int low_hits = 0;
-  for (int i = 0; i < 1000; ++i) {
-    const std::string path = "P01-TK" + std::to_string(i);
-    if (onion::sched::audit_sampled("c1", path, rate)) ++low_hits;
-    EXPECT_EQ(onion::sched::audit_sampled("c1", path, rate),
-              onion::sched::audit_sampled("c1", path, rate));
-  }
-  int high_hits = 0;
-  for (int i = 0; i < 1000; ++i)
-    if (onion::sched::audit_sampled(
-            "c1", "P01-TK" + std::to_string(i), rate * 2.0))
-      ++high_hits;
-  EXPECT_GT(low_hits, 0);
-  EXPECT_GE(high_hits, low_hits);
-  // Roughly the advertised rate (within a generous band).
-  EXPECT_LT(low_hits, 80);
-  EXPECT_GT(low_hits, 4);
 }
 
 TEST(PlanLogGrowth, ProjectsMeasuredBytesPerSettledNodeWithinTolerance) {

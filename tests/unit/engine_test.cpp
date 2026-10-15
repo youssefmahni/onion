@@ -694,36 +694,6 @@ TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
   EXPECT_GT(resumed.settled, 0);
 }
 
-TEST_F(EngineTest, AuditSamplesCommittedNodesWithoutBlocking) {
-  // Decision 0024: audit_rate 1.0 samples every committed node — an
-  // AUDIT record per settle, an open non-blocking review item, and the
-  // subtree keeps expanding (the children of audited nodes settle too).
-  seed_root();
-  Budget budget("10");
-  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
-                                "dev0000000000000001", "0.001"});
-  CampaignSpec campaign = spec();
-  campaign.structure = true;
-  campaign.audit_rate = 1.0;
-  const Engine::RunResult result = engine.run(campaign, nullptr);
-  EXPECT_GT(result.settled, 0);
-  // Every committed node got an audit: sampled == settled.
-  std::string error;
-  const auto open = writer_->db().open_reviews(&error);
-  EXPECT_EQ(static_cast<std::int64_t>(open.size()), result.settled);
-  for (const onion::store::Review& review : open)
-    EXPECT_EQ(review.reason, "audit");
-  EXPECT_EQ(writer_->audits_sampled("c1"), result.settled);
-  EXPECT_EQ(writer_->audits_open("c1"), result.settled);
-  // Non-blocking: nothing in the review-pause set.
-  EXPECT_EQ(writer_->db().open_reviews(&error).size(), open.size());
-
-  // The verdict closes an audit without re-settling or tombstoning.
-  engine.review_accept(open[0].path, campaign);
-  EXPECT_EQ(writer_->audits_open("c1"), result.settled - 1);
-  EXPECT_FALSE(writer_->leaf(open[0].path));
-}
-
 TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {
   // M8 agent-exit criterion (decision 0020): a single chain halves its
   // pool per level, so it ends in an allowance-spent leaf — even though

@@ -100,13 +100,10 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
     spec.children_min = static_cast<int>(v);
   }
   try {
-    spec.audit_rate = parse_score("audit_rate", 0.02);
     spec.stop_atomic_share = parse_score("stop_atomic_share", 0.90);
   } catch (const std::exception& e) {
     return fail(e.what());
   }
-  if (spec.audit_rate < 0.0 || spec.audit_rate > 1.0)
-    return fail("audit_rate out of range 0..1");
   if (spec.stop_atomic_share <= 0.0 || spec.stop_atomic_share > 1.0)
     return fail("stop_atomic_share out of range (0, 1]");
   // M8 branch share (decision 0020): a number or an exact decimal string
@@ -213,7 +210,6 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
       {"auto_accept", spec.auto_accept},
       {"critic", spec.critic ? "on" : "off"},
       {"children_min", spec.children_min},
-      {"audit_rate", std::to_string(spec.audit_rate)},
       {"stop_atomic_share", std::to_string(spec.stop_atomic_share)}};
   if (spec.worker_candidates)
     out["worker_candidates"] = *spec.worker_candidates;
@@ -1211,17 +1207,6 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                             {"campaign", spec.id}};
         if (funnel_result.below_target) settle_payload["below_target"] = true;
         records.push_back(make_record("SETTLE", std::move(settle_payload)));
-        // B3 audit sampling (decision 0024): each committed node is
-        // sampled deterministically — BLAKE2b(campaign ‖ path) mod 10^6
-        // below audit_rate x 10^6 — so every replica samples the same
-        // nodes. A sampled node gets an AUDIT record: a NON-blocking
-        // review item (the subtree keeps expanding).
-        if (spec.audit_rate > 0.0 &&
-            audit_sampled(spec.id, ticket.path, spec.audit_rate))
-          records.push_back(make_record(
-              "AUDIT", {{"path", ticket.path},
-                        {"campaign", spec.id},
-                        {"reason", "audit"}}));
         writer.submit(state::CommitTerminal{std::move(records)});
         // Fold the settle before the next refresh: the pool ledger
         // (decision 0020) reads the attempts table, and the parent's
@@ -1326,20 +1311,6 @@ void Engine::review_accept(std::string_view path, const CampaignSpec& spec) {
       impl_->options.writer.sync();
       return;
     }
-  // B3 audit (decision 0024): the audited node is ALREADY committed and
-  // its subtree already expanded — accepting records the verdict only
-  // (the REVIEW decision closes the audit item; nothing settles twice).
-  for (const store::Review& review :
-       impl_->options.writer.db().open_reviews(&error))
-    if (review.path == path && review.reason == "audit") {
-      std::vector<log::Record> records;
-      records.push_back(make_record(
-          "REVIEW", {{"path", std::string(path)}, {"decision", "accept"},
-                     {"note", ""}}));
-      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
-      impl_->options.writer.sync();
-      return;
-    }
   std::vector<store::Node> children =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   int kept = 0;
@@ -1388,20 +1359,6 @@ void Engine::review_retry(std::string_view path, const CampaignSpec& spec,
 
 void Engine::review_reject(std::string_view path, const CampaignSpec& spec) {
   std::string error;
-  // B3 audit (decision 0024): rejecting an audit records the verdict
-  // only — the node stays (a follow-up is the operator's review retry);
-  // nothing is tombstoned.
-  for (const store::Review& review :
-       impl_->options.writer.db().open_reviews(&error))
-    if (review.path == path && review.reason == "audit") {
-      std::vector<log::Record> records;
-      records.push_back(make_record(
-          "REVIEW", {{"path", std::string(path)}, {"decision", "reject"},
-                     {"note", ""}}));
-      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
-      impl_->options.writer.sync();
-      return;
-    }
   std::vector<store::Node> subtree =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   std::vector<log::Record> records;
@@ -1740,18 +1697,6 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   if (plan.saturated)
     out << "(saturated: values clamped at int64)\n";
   return out.str();
-}
-
-bool audit_sampled(std::string_view campaign, std::string_view path,
-                   double audit_rate) {
-  const std::string joined = std::string(campaign) + "\n" + std::string(path);
-  const std::string hash = onion::log::blake2b_hex(joined);
-  // The first 6 hex chars (24 bits) as the bucket index: mod 1e6.
-  const std::uint64_t bucket =
-      std::stoull(hash.substr(0, 6), nullptr, 16) % 1000000ULL;
-  const std::int64_t threshold =
-      static_cast<std::int64_t>(audit_rate * 1000000.0);
-  return static_cast<std::int64_t>(bucket) < threshold;
 }
 
 std::map<std::string, std::int64_t> compute_starting_pools(
