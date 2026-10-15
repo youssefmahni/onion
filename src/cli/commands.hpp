@@ -8,3 +8,4 @@ int export_csv_cmd(int argc, char** argv);
 int admin_cmd(int argc, char** argv);
 int genesis_import_cmd(int argc, char** argv);
 int profile_cmd(int argc, char** argv);
+int react_convert_cmd(int argc, char** argv);

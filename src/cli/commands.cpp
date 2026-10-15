@@ -28,6 +28,7 @@
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
 #include "sync/sync.hpp"
+#include "tools/reactconv.hpp"
 #include "store/checkpoint.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
@@ -2318,6 +2319,94 @@ int dev_import_cmd(int argc, char** argv) {
 // Decision 0027: publish a domain profile. The record is signed like any
 // other (the batch signature) and distributed with the log; campaigns
 // carry its hash.
+// Decision 0027, PR3: convert RE&CT YAML action files to the dev-import
+// CSV shape (RA codes as node codes, tree react) plus the react domain
+// profile. Pure conversion lives in onion::reactconv.
+int react_convert_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot react-convert --yaml-dir <dir> "
+                 "--out <dir>\n"
+              << "\nconvert RE&CT response-action YAML files (RA codes as "
+                 "node codes, tree react) into dev-import CSVs plus "
+                 "react-profile.json.\n";
+    return 0;
+  }
+  const std::string yaml_dir = flag(argc, argv, "--yaml-dir", "");
+  const std::string out = flag(argc, argv, "--out", "");
+  if (yaml_dir.empty() || out.empty()) {
+    std::cerr << "usage: data_depot react-convert --yaml-dir <dir> "
+                 "--out <dir>\n";
+    return 2;
+  }
+  std::vector<onion::reactconv::Action> actions;
+  std::error_code ec;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(yaml_dir, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    if (name.size() < 4 || name.compare(name.size() - 4, 4, ".yml") != 0)
+      continue;
+    const auto parsed = onion::reactconv::parse_action_yaml(
+        load_file(entry.path()));
+    if (parsed) actions.push_back(*parsed);
+    else
+      std::cerr << "skipping (no id/title/stage): " << name << "\n";
+  }
+  if (actions.empty()) {
+    std::cerr << "no RE&CT actions found in " << yaml_dir << "\n";
+    return 1;
+  }
+  std::filesystem::create_directories(out, ec);
+  const onion::reactconv::Converted converted =
+      onion::reactconv::convert(actions);
+  const auto quote = [](std::string_view value) {
+    const bool needs_quoting =
+        value.find(',') != std::string_view::npos ||
+        value.find('"') != std::string_view::npos ||
+        value.find('\n') != std::string_view::npos ||
+        value.find('\r') != std::string_view::npos;
+    std::string result;
+    if (needs_quoting) {
+      result.push_back('"');
+      for (const char c : value) {
+        if (c == '"') result.push_back('"');
+        result.push_back(c);
+      }
+      result.push_back('"');
+      return result;
+    }
+    return std::string(value);
+  };
+  {
+    std::ofstream level0(std::filesystem::path(out) /
+                         "Onion - level_00.csv");
+    level0 << "code,title\n";
+    for (const auto& [code, title] : converted.stages)
+      level0 << code << "," << quote(title) << "\n";
+  }
+  {
+    std::ofstream level1(std::filesystem::path(out) /
+                         "Onion - level_01.csv");
+    level1 << "code,path,title\n";
+    for (const auto& [code, path, title] : converted.actions)
+      level1 << code << "," << quote(path) << "," << quote(title) << "\n";
+  }
+  // The react domain profile: no structure permission anywhere (every
+  // campaign result goes to review) and no deterministic style checks.
+  onion::domain::Profile react;
+  react.name = "react";
+  react.tree = "react";
+  {
+    std::ofstream profile(std::filesystem::path(out) /
+                          "react-profile.json");
+    profile << onion::domain::profile_json(react).dump(2) << "\n";
+  }
+  std::cout << "converted " << actions.size() << " actions in "
+            << converted.stages.size() << " stages to " << out << "\n";
+  return 0;
+}
+
 int profile_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot profile add --file <profile.json> "

@@ -1,0 +1,25 @@
+{
+  "id": "p12-react-pilot",
+  "scope": [
+    "PREPARATION-RA1001",
+    "PREPARATION-RA1006",
+    "PREPARATION-RA1103",
+    "PREPARATION-RA1113",
+    "PREPARATION-RA1308",
+    "PREPARATION-RA1401",
+    "IDENTIFICATION-RA2001",
+    "IDENTIFICATION-RA2101",
+    "CONTAINMENT-RA3001",
+    "CONTAINMENT-RA3101",
+    "RECOVERY-RA5001",
+    "LESSONS_LEARNED-RA6001"
+  ],
+  "tree": "react",
+  "profile_hash": "4d3d117bffaa9a33d93aa0dc718d186c2cb0183c7019f11916e10914f2bab07d",
+  "structure": false,
+  "max_attempts": 3,
+  "children_min": 3,
+  "loop_budget": 240,
+  "model": "deepseek-flash",
+  "critic": "off"
+}

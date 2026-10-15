@@ -138,6 +138,8 @@ target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)
 target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_compiled_module(store src/store/store.cpp src/store/checkpoint.cpp)
+# Decision 0027 PR3: RE&CT YAML -> dev-import CSV converter (pure core).
+onion_add_compiled_module(reactconv src/tools/reactconv.cpp)
 # Decision 0027: domain profiles (header-only). The planning profile is
 # embedded; style checks and structure layers live in the profile. Kept
 # interface-only so the base core layer can use it without pulling log
@@ -223,7 +225,7 @@ if(WIN32)
 endif()
 target_link_libraries(api PUBLIC onion::state)
 onion_add_module(cli)
-target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
+target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state onion::reactconv onion::domain)
 
 add_executable(onion_smoke tests/unit/smoke_test.cpp)
 target_link_libraries(onion_smoke PRIVATE onion::cli)
@@ -245,6 +247,11 @@ if(BUILD_TESTING)
   target_link_libraries(onion_core_test PRIVATE onion::core GTest::gtest_main)
   include(GoogleTest)
   gtest_discover_tests(onion_core_test)
+
+  add_executable(onion_reactconv_test tests/unit/reactconv_test.cpp)
+  target_link_libraries(onion_reactconv_test PRIVATE onion::reactconv
+    GTest::gtest_main)
+  gtest_discover_tests(onion_reactconv_test)
 
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
@@ -388,7 +395,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim onion::reactconv)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 if(ONION_CHAOS_HOOKS)
