@@ -74,7 +74,8 @@ def main() -> int:
         "  return assets;\n"
         "}\n"
         "\n"
-        "}  // namespace onion::cli\n"
+        "}  // namespace onion::cli\n",
+        encoding="utf-8",  # the shell contains non-ASCII (arrows etc.)
     )
     return 0
 
