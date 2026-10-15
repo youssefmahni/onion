@@ -432,3 +432,21 @@ commits 984125b, 9d47386, merge a4c2320; pushed to origin).
 **Next step:** poll `gh pr checks 52`; if TSan fails again, pull the
 job log, reproduce locally (build with ONION_ENABLE_TSAN) and fix;
 when every job passes, `gh pr merge 52 --merge`.
+
+## 2026-10-15 — PR #52 merged with owner-approved Windows exception
+
+- PR #52 merged to main as `50e4184973c0f53fcf2dc7828e6623c5ab874689`.
+  The TSan failure was not a data race: `sync.saturation_decoupled`
+  hit a missing campaign `spec` after the embedded planning profile
+  hash was incorrectly treated as an unpublished custom profile.
+  `a5942cf` resolves that path and fixes the Windows `UnlockFileEx`
+  release crash.
+- Evidence: newest PR run
+  https://github.com/youssefmahni/onion/actions/runs/38770992708 had
+  TSan, Linux, ASan/UBSan, both macOS jobs, and both legacy jobs pass.
+  The owner explicitly approved merging while its Windows job remained
+  pending.
+
+**Next step:** owner decides whether to deploy the merged work to the
+Mac fleet; the RE&CT live-LLM pilot still needs the owner's key and
+budget on a Mac copy.
