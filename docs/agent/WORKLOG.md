@@ -187,3 +187,27 @@ Proof (frozen final binary, 2026-10-13): 30/30 sync.multi_process_convergence un
 CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the slow Linux runner — the fleet's in-flight chunk work (bounded by the budget, not the deadline) drains in ~8 min there while the local 30/30 proof runs in ~90 s. The deadline is the outer safety net, NOT the progress criterion, so it moves to 720 s (ctest TIMEOUT 780); the no-progress criterion (90 s, records-or-rounds) is untouched.
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
+
+## 2026-10-15 — Fleet ACTIVE bug: root cause + repair
+
+**Root cause (two compounding bugs):**
+1. `campaign start` run while the node was live opened the data dir as a
+   second writer → interleaved batches forked #1's hash chain (batches
+   65–115). #2 quarantined everything after the join (`verify 2` = BadPrev).
+2. Checkpoints are written every 6 h / 100 k records, so #1's checkpoints
+   predated the fork — every fresh join cloned a stale chain and could
+   never verify against the live log.
+
+**Fix:** shipped `POST /api/checkpoint` (WriteCheckpoint command → writer
+thread → fresh checkpoint) on both Macs. Repaired #1: wiped oplog +
+batches table (kept the DB: 530 settles, tree, campaigns), fresh clean
+chain, forced checkpoint. #2: fresh join → clone matched → **joined:
+ACTIVE (lag 6)**. Lanes split 1,782 / 1,903. OPERATOR.md gained the two
+hard rules (no second writer on a live data dir; checkpoint before
+admitting a joiner).
+
+**Next step:** land the checkpoint endpoint + the OPERATOR.md rules via PR
+(b3-gate-funnel); also fix reload_members() wiping members-table URLs.
+NOTE: the working dir was switched to branch `dash/d0-foundation` (a
+dashboard rework in progress) — my checkpoint edits are uncommitted there;
+the earlier commits live on b3-gate-funnel.

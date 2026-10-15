@@ -1231,6 +1231,14 @@ int node_cmd(int argc, char** argv) {
        [&](std::string path, std::string) {
          return review_action(std::move(path), "reject");
        },
+       // Operator-forced checkpoint (the fleet repair, WORKLOG 2026-10-15):
+       // write it on the writer thread, then wait for the queue to drain so
+       // the response is true only once durable.
+       [&](std::string, std::string) {
+         writer->submit(onion::state::WriteCheckpoint{});
+         writer->sync();
+         return true;
+       },
        [&](bool leave) {
          leave_requested.store(leave);
          stop_flag.store(true);

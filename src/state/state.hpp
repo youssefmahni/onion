@@ -42,6 +42,11 @@ struct AppendForeign {
   log::Batch batch;
 };
 
+// Operator-forced checkpoint (the dashboard): snapshots the current fully
+// folded state, so a joiner's clone matches the LIVE chain (the 6 h / 100 k
+// record cadence alone can leave stale checkpoints after heavy activity).
+struct WriteCheckpoint {};
+
 // M8 pre-work: the push handler learns the pusher's sync address without
 // touching SQLite itself; the writer thread owns the members-table write.
 struct SetMemberSyncUrl {
@@ -104,6 +109,7 @@ class StateWriter {
   void submit(DevImport command);
   void submit(AppendForeign command);
   void submit(SetMemberSyncUrl command);
+  void submit(WriteCheckpoint command);
   // Blocks until every queued command is durable and folded.
   void sync();
   // Writes one checkpoint (VACUUM INTO + signed manifest), keeps the last 3.
@@ -254,6 +260,7 @@ class StateWriter {
       Import,
       Foreign,
       MemberUrl,
+      Checkpoint,
       Sync,
       Shutdown
     } kind;

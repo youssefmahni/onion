@@ -30,6 +30,9 @@ class Server {
     std::function<bool(std::string, std::string)> review_accept;
     std::function<bool(std::string, std::string)> review_retry;
     std::function<bool(std::string, std::string)> review_reject;
+    // Operator-forced checkpoint: snapshots the folded state so a joiner's
+    // clone matches the LIVE chain (see WORKLOG 2026-10-15 fleet repair).
+    std::function<bool(std::string, std::string)> force_checkpoint;
     std::function<void(bool leave)> stop_node;
   };
 
