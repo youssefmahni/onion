@@ -1,6 +1,7 @@
 #pragma once
 
 int node_cmd(int argc, char** argv);
+int dashboard_cmd(int argc, char** argv);
 int campaign_cmd(int argc, char** argv);
 int review_cmd(int argc, char** argv);
 int dev_import_cmd(int argc, char** argv);

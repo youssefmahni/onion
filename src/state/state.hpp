@@ -42,10 +42,11 @@ struct AppendForeign {
   log::Batch batch;
 };
 
-// Operator-forced checkpoint (decision 0027): snapshots the current fully
-// folded state on the writer thread, so a joiner's clone (or a fresh
-// import) matches the LIVE chain — the 6 h / 100 k record cadence alone
-// can leave stale checkpoints after heavy activity.
+// Operator-forced checkpoint (decision 0027; the dashboard and the CLI
+// both use it): snapshots the current fully folded state on the writer
+// thread, so a joiner's clone (or a fresh import) matches the LIVE
+// chain — the 6 h / 100 k record cadence alone can leave stale
+// checkpoints after heavy activity.
 struct WriteCheckpoint {};
 
 // M8 pre-work: the push handler learns the pusher's sync address without

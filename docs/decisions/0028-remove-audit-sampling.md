@@ -1,6 +1,10 @@
-# Decision 0026 — Remove audit sampling from the engine
+# Decision 0028 — Remove audit sampling from the engine
 
 Status: Accepted (owner directive 2026-10-15)
+
+Renumbered from 0026: the dashboard record (0026-dashboard-frontend-
+remote-bind) claimed that number in main first, and a second record
+with the same number is a defect (decision INDEX rule 1).
 
 ## Context
 

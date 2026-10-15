@@ -81,7 +81,7 @@ endif()
 onion_add_compiled_module(platform src/platform/platform.cpp)
 if(WIN32)
   # platform is static, so consumers must receive the Windows API import libs.
-  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi ws2_32)
+  target_link_libraries(platform PUBLIC Crypt32 Iphlpapi ws2_32 bcrypt)
   target_compile_definitions(platform PRIVATE
     _WIN32_WINNT=0x0A00
     NOMINMAX
@@ -401,6 +401,25 @@ target_compile_definitions(data_depot PRIVATE
 if(ONION_CHAOS_HOOKS)
   target_compile_definitions(data_depot PRIVATE ONION_CHAOS_HOOKS=1)
 endif()
+
+# Dashboard static files (plan §3.1): embedded into the binary at build time.
+# dashboard.html stays disk-loaded for now (removed in D6).
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+file(GLOB_RECURSE ONION_WEB_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/app.js"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/styles.css"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/lib/*"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/fonts/*")
+set(ONION_WEB_ASSETS_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/web_assets.cpp")
+add_custom_command(
+  OUTPUT "${ONION_WEB_ASSETS_CPP}"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_web.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/web" "${ONION_WEB_ASSETS_CPP}"
+  DEPENDS ${ONION_WEB_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_web.py"
+  VERBATIM)
+target_sources(data_depot PRIVATE "${ONION_WEB_ASSETS_CPP}")
 
 # Standalone real-DeepSeek concurrency probe (dev tool, OPT track W1).
 # Links only libcurl; not part of the engine.

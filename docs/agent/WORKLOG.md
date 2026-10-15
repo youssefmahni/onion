@@ -1,4 +1,26 @@
 # Worklog (append-only, newest at top)
+
+## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
+
+Result: PR open (dash/d0-foundation, 2 commits: preserved checkpoint
+endpoint + D0). §2 done earlier (docs/dashboard/INVENTORY.md on
+b3-gate-funnel; prerequisite gate: 0024 merged, 0025 in flight as PR #50 —
+now CI-green).
+Evidence:
+- api tests 18/18 and platform tests 12/12 locally; live-node checks:
+  one-time code -> /auth 302 + flagged cookie -> /api/v1/version 200,
+  code replay 401, POST /api/checkpoint 200 with a real checkpoint file.
+- The concurrent fleet session's uncommitted checkpoint work was
+  preserved as commit 6878b7b (its /api/checkpoint glue reconstructed;
+  the state-side WriteCheckpoint command is theirs verbatim).
+- PR #50 (prerequisite 0025) CI green on the fixed head (run 38731595992,
+  the ASan leak in the fold-idempotency test was fixed by scoping the
+  statement before writer->stop()).
+Next step: 3 green CI runs on #50 then merge; merge main into
+dash/d0-foundation and resolve the expected api.cpp/api.hpp/commands.cpp
+conflicts; then D1 (tree endpoints, counters, viewcache.db, screens 5-7).
+
+
 ## 2026-10-15 · dashboard D0 · §2 verify-and-adapt (inventories + prerequisite gate)
 
 Result: in progress
@@ -37,6 +59,7 @@ tagged `m8-rc`; recent CI runs green incl. the PR #48 main merge). The
 earlier OA-14 wording in old WORKLOG entries and REVIEW.md F-CI-1 remains
 as historical record.
 Next step: finish B3 on `b3-gate-funnel`, then B2/B5 and B6 from REVIEW.md.
+
 
 ## 2026-10-14 · M8 · local implementation complete
 
@@ -227,6 +250,32 @@ CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
 
+
+## 2026-10-15 — Fleet ACTIVE bug: root cause + repair
+
+**Root cause (two compounding bugs):**
+1. `campaign start` run while the node was live opened the data dir as a
+   second writer → interleaved batches forked #1's hash chain (batches
+   65–115). #2 quarantined everything after the join (`verify 2` = BadPrev).
+2. Checkpoints are written every 6 h / 100 k records, so #1's checkpoints
+   predated the fork — every fresh join cloned a stale chain and could
+   never verify against the live log.
+
+**Fix:** shipped `POST /api/checkpoint` (WriteCheckpoint command → writer
+thread → fresh checkpoint) on both Macs. Repaired #1: wiped oplog +
+batches table (kept the DB: 530 settles, tree, campaigns), fresh clean
+chain, forced checkpoint. #2: fresh join → clone matched → **joined:
+ACTIVE (lag 6)**. Lanes split 1,782 / 1,903. OPERATOR.md gained the two
+hard rules (no second writer on a live data dir; checkpoint before
+admitting a joiner).
+
+**Next step:** land the checkpoint endpoint + the OPERATOR.md rules via PR
+(b3-gate-funnel); also fix reload_members() wiping members-table URLs.
+NOTE: the working dir was switched to branch `dash/d0-foundation` (a
+dashboard rework in progress) — my checkpoint edits are uncommitted there;
+the earlier commits live on b3-gate-funnel.
+
+
 ## 2026-10-14 · Mac Pro deployment — first machine live (mac@192.168.1.63)
 
 Result: deployed
@@ -273,7 +322,7 @@ Next step: owner's three manual steps above; then the first real campaign (one p
 
 **Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.
 
-## 2026-10-15 — Audit sampling removed (decision 0026) + deployed
+## 2026-10-15 — Audit sampling removed (decision 0028, renumbered) + deployed
 
 Owner directive: remove audit sampling from the engine. Committed on
 b3-gate-funnel (58987bc, worktree .build-tmp/wt-audit-removal — the
@@ -282,17 +331,16 @@ gone (old files still parse, field ignored), sampling emission +
 audit_sampled() + the accept/reject audit shortcuts deleted, /api/state
 audits object removed. StateWriter keeps folding legacy AUDIT records
 (replay compatibility; existing items stay closable). Tests: sched 31,
-state 34, engine 21 green. Decision 0026 + INDEX (next 0027) written.
+state 34, engine 21 green. Decision 0028 + INDEX written (the dashboard record had claimed 0026 first).
 
 Deployed to both Macs (patch applied on #1's sources — checkpoint hook
 preserved via offset-tolerant patch; rebuilt; launchd restarted; binary
 piped to #2 through the #1 jump host). Verified: /api/state has no
 audits field on either machine, campaign p04-first running.
 
-**Next step:** PR b3-gate-funnel → main (carries 0025, 0026, tree
+**Next step:** PR b3-gate-funnel → main (carries 0025, 0027, 0028, tree
 viewer, checkpoint endpoint, help/OPERATOR.md); fix reload_members()
-URL wipe; note the 0026 numbering collision with the dash branch's
-uncommitted 0026-dashboard-frontend-remote-bind claim.
+URL wipe; 0026 was renumbered to 0028 (the dashboard record claimed 0026 first).
 
 ## 2026-10-15 — PR1(0027) lock, source, collisions, checkpoint done
 

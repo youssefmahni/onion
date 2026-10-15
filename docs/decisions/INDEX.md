@@ -38,12 +38,12 @@ Note column). Last audited 2026-10-14 against `origin/main` @ `cb0f3ab`
 | 0022 | M8 checkpoint compaction, measured growth, operator state | Accepted | — | on `m8-depth-scale`, not yet on main |
 | 0023 | Branch shares: the pool ledger (50% share) | Accepted | — | **renumbered from a second "0020"**; file `0020-branch-share-pool-ledger.md` on `m8-depth-scale` is renamed in B5 and every "decision 0020" reference in code and docs of that branch is updated |
 | 0024 | Quality gate and funnel fixes (B3) | *claimed, not yet written* | supersedes 0020; amends 0008 stop rule and 0017 gate defaults | claimed 2026-10-14 by the takeover agent |
-
 | 0025 | Branch-share allowances apply to engine-created expansion only (imported tickets never leaf as "allowance spent"); the no-progress churn guard | *claimed 2026-10-14 (Mac Pro live-test finding)* | amends 0023 (the pool ledger) |
-| 0026 | Remove audit sampling from the engine | Accepted (owner directive) | supersedes 0024's audit-sampling clauses | on b3-gate-funnel |
+| 0026 | Dashboard frontend stack (Preact+htm+uPlot, vendored, no build), 127.0.0.1-only access with SSH tunnel, and the `--allow-remote-dashboard` bind gate | **Proposed** | covers DASHBOARD_PLAN.md D-1, D-2, §3.3 | claimed 2026-10-15 (dashboard D0) |
 | 0027 | Import safety and domain profiles (RE&CT readiness) | Accepted (owner directive) | amends 0025 (source field) | on b3-gate-funnel |
+| 0028 | Remove audit sampling from the engine | Accepted (owner directive) | supersedes 0024's audit-sampling clauses; renumbered from 0026 after the dashboard record claimed it first | on b3-gate-funnel |
 
-Next free number: **0028**.
+Next free number: **0029**.
 
 ## Rules
 
