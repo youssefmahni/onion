@@ -1460,6 +1460,9 @@ void StateWriter::run() {
           statement->reset(&bind_error);
         }
         import_skipped_.store(skipped);
+        // §6.1: the import path inserts directly (it never calls fold),
+        // so the derived counters are recomputed once at the end.
+        recompute_stats(&error);
         break;
       }
       case Command::Kind::Sync:

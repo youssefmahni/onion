@@ -4,16 +4,16 @@
    history. Children load 50 at a time through /api/v1/tree/children. */
 
 const TreeScreen = ({ initialPath }) => {
-  const [path, setPath] = preact.useState(initialPath || "");
-  const [stack, setStack] = preact.useState(initialPath ? [initialPath] : []);
-  const [children, setChildren] = preact.useState([]);
-  const [cursor, setCursor] = preact.useState("");
-  const [hasMore, setHasMore] = preact.useState(false);
-  const [loading, setLoading] = preact.useState(false);
-  const [detail, setDetail] = preact.useState(null);
-  const [error, setError] = preact.useState("");
+  const [path, setPath] = preactHooks.useState(initialPath || "");
+  const [stack, setStack] = preactHooks.useState(initialPath ? [initialPath] : []);
+  const [children, setChildren] = preactHooks.useState([]);
+  const [cursor, setCursor] = preactHooks.useState("");
+  const [hasMore, setHasMore] = preactHooks.useState(false);
+  const [loading, setLoading] = preactHooks.useState(false);
+  const [detail, setDetail] = preactHooks.useState(null);
+  const [error, setError] = preactHooks.useState("");
 
-  const load = preact.useCallback(async (targetPath, reset) => {
+  const load = preactHooks.useCallback(async (targetPath, reset) => {
     setLoading(true);
     setError("");
     try {
@@ -40,7 +40,7 @@ const TreeScreen = ({ initialPath }) => {
     }
   }, [cursor]);
 
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     load(path, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path]);
@@ -89,8 +89,9 @@ const TreeScreen = ({ initialPath }) => {
         },
       ),
       hasMore &&
-        preact.h("button", { className: "load-more", onClick: () => load(path, false) },
-          "load more"),
+        preact.h("button", { className: "load-more", disabled: loading,
+          onClick: () => load(path, false) },
+          loading ? "loading…" : "load more"),
     ),
     preact.h(
       "section",
@@ -129,7 +130,7 @@ const TreeScreen = ({ initialPath }) => {
 };
 
 const TreeHistory = ({ detail }) => {
-  const [tab, setTab] = preact.useState("children");
+  const [tab, setTab] = preactHooks.useState("children");
   const attempts = detail.attempts || [];
   return preact.h(
     preact.Fragment,

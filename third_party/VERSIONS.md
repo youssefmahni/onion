@@ -13,6 +13,7 @@ All fetches use the exact archive URL and SHA-256 shown here. Licenses are recor
 | nlohmann/json | 3.11.3 | https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz | `d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d` | MIT |
 | OpenCL Headers | vendored legacy copy | `legacy/third_party/OpenCL-Headers` | N/A (copied in-repository source) | Apache-2.0 |
 | Preact (web/lib/preact.umd.js) | 10.26.9 | https://unpkg.com/preact@10.26.9/dist/preact.umd.js | `c97a23bef8301eb7bd7c912f4d7cc39df283270f6f4daaedcea7069992408839` | MIT |
+| Preact hooks (web/lib/hooks.umd.js) | 10.26.9 | https://unpkg.com/preact@10.26.9/hooks/dist/hooks.umd.js | `c2a0121123419a0788e7a3e0adde79f9f9dc9d455c918abbfe6f74651b4be054` | MIT |
 | htm (web/lib/htm.umd.js) | 3.1.1 | https://unpkg.com/htm@3.1.1/dist/htm.umd.js | `7a31776e04bd4afde0d4308177d26f377716fcf7e4bd70be590746d6aa594f08` | Apache-2.0 |
 | uPlot (web/lib/uPlot.iife.min.js, uPlot.min.css) | 1.6.31 | https://unpkg.com/uplot@1.6.31/dist/uPlot.iife.min.js · https://unpkg.com/uplot@1.6.31/dist/uPlot.min.css | `2d27e8ad3d228164525ce213f9dc716f39b4e3aee0cc773fb3491c96cf4921a2` (js) · `df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04` (css) | MIT |
 

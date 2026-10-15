@@ -260,7 +260,53 @@ nlohmann::json search(const store::Db& read, const viewcache::Cache* cache,
 nlohmann::json stats(const store::Db& read) {
   std::string error;
   nlohmann::json result;
-  const auto levels = read.level_counts(&error);
+  auto levels = read.level_counts(&error);
+  auto statuses = read.status_counts(&error);
+  // Copies imported by older binaries never ran the fold deltas: the
+  // counters are missing while the tables are not. One on-the-fly pass
+  // covers that case (the live node always has fresh counters, and the
+  // fallback is gated so the fast path never scans).
+  if (levels.empty()) {
+    auto node_total = read.prepare(
+        "SELECT COUNT(*) FROM nodes WHERE tombstone = 0;", &error);
+    std::int64_t live_nodes = 0;
+    if (node_total) {
+      std::string step_error;
+      if (node_total->step_row(&step_error))
+        live_nodes = node_total->integer(0);
+    }
+    if (live_nodes > 0) {
+      auto statement = read.prepare(
+          "SELECT layer, COUNT(*) FROM nodes WHERE tombstone = 0 GROUP BY "
+          "layer ORDER BY layer;",
+          &error);
+      if (statement) {
+        std::string step_error;
+        while (statement->step_row(&step_error))
+          levels.emplace_back(statement->integer_int(0),
+                              statement->integer(1));
+      }
+    }
+  }
+  if (statuses.empty()) {
+    auto settle_total = read.prepare("SELECT COUNT(*) FROM settles;", &error);
+    std::int64_t settles = 0;
+    if (settle_total) {
+      std::string step_error;
+      if (settle_total->step_row(&step_error)) settles = settle_total->integer(0);
+    }
+    if (settles > 0) {
+      auto statement = read.prepare(
+          "SELECT end, COUNT(*) FROM settles WHERE end IS NOT NULL AND end "
+          "!= '' GROUP BY end;",
+          &error);
+      if (statement) {
+        std::string step_error;
+        while (statement->step_row(&step_error))
+          statuses.emplace_back(statement->text(0), statement->integer(1));
+      }
+    }
+  }
   std::int64_t nodes_total = 0;
   nlohmann::json level_rows = nlohmann::json::array();
   for (const auto& [layer, count] : levels) {
@@ -270,7 +316,6 @@ nlohmann::json stats(const store::Db& read) {
   result["levels"] = std::move(level_rows);
   result["nodes_total"] = nodes_total;
 
-  const auto statuses = read.status_counts(&error);
   nlohmann::json ending_rows = nlohmann::json::array();
   std::int64_t leaves = 0;
   for (const auto& [status, count] : statuses) {

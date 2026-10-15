@@ -3,10 +3,10 @@
 /* Tree Stats (screen 7): per-level counts, endings, campaign settles. */
 
 const StatsScreen = () => {
-  const [stats, setStats] = preact.useState(null);
-  const [error, setError] = preact.useState("");
+  const [stats, setStats] = preactHooks.useState(null);
+  const [error, setError] = preactHooks.useState("");
 
-  const load = preact.useCallback(async () => {
+  const load = preactHooks.useCallback(async () => {
     try {
       const body = await fetch("/api/v1/tree/stats").then((r) => r.json());
       if (body.error) throw new Error(body.error);
@@ -16,7 +16,7 @@ const StatsScreen = () => {
     }
   }, []);
 
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     load();
     const timer = setInterval(load, 15000);
     return () => clearInterval(timer);
@@ -52,6 +52,9 @@ const StatsScreen = () => {
         preact.h("span", { className: "muted" }, "in review")),
     ),
     preact.h(
+      "div",
+      { className: "stats-tables" },
+      preact.h(
       "section",
       null,
       preact.h("h2", null, "Nodes per level"),
@@ -96,6 +99,7 @@ const StatsScreen = () => {
           ),
         ),
       ),
+    ),
     ),
     campaigns.length > 0 &&
       preact.h(

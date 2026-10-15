@@ -1437,3 +1437,39 @@ TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
   EXPECT_EQ(writer_->audits_open("mp1"), 0);
   EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
 }
+
+TEST(StateWriterDevImport, PopulatesTheFoldCounters) {
+  // The import path inserts rows directly (no fold), so §6.1's derived
+  // counters must be recomputed at the end of the import command.
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+      ("onion_import_stats_" + std::to_string(::getpid()) + "_" +
+       std::to_string(reinterpret_cast<std::uintptr_t>(&dir)));
+  fs::remove_all(dir);
+
+  onion::state::StateWriter::Options options;
+  options.data_dir = dir;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+
+  onion::state::DevImport import;
+  import.nodes = {
+      {"P01", "P01", 0, "Planning"},
+      {"IN01", "P01-IN01", 1, "Inventory"},
+      {"T01", "P01-IN01-T01", 2, "Task"},
+  };
+  writer->submit(import);
+  writer->sync();
+
+  const auto counts = writer->db().level_counts(&error);
+  ASSERT_EQ(counts.size(), 3u);
+  EXPECT_EQ(counts[0].first, 0);
+  EXPECT_EQ(counts[0].second, 1);
+  EXPECT_EQ(counts[1].second, 1);
+  EXPECT_EQ(counts[2].second, 1);
+  writer->stop();
+  std::error_code ignored;
+  fs::remove_all(dir, ignored);
+}

@@ -2671,24 +2671,49 @@ int bench_cmd(int argc, char** argv) {
     return 1;
   }
 
+  // The production configuration: the sidecar cache supplies the counts and
+  // the FTS index, exactly as `view --db` and the node serve them.
+  onion::viewcache::Cache::Options cache_options;
+  cache_options.sidecar_path =
+      std::filesystem::path(db_path).parent_path() / "viewcache.db";
+  cache_options.source_path = db_path;
+  auto cache = std::make_shared<onion::viewcache::Cache>(cache_options);
+  if (!cache->start(&error)) {
+    std::cerr << "viewcache: " << error << "\n";
+    return 1;
+  }
+  {
+    const auto build_start = std::chrono::steady_clock::now();
+    bool stale = true;
+    cache->stale(*pool.get(&error), &stale, &error);
+    if (stale && !cache->rebuild(*pool.get(&error), &error)) {
+      std::cerr << "viewcache rebuild failed: " << error << "\n";
+      return 1;
+    }
+    std::printf("viewcache build: %.1f s\n",
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - build_start)
+                    .count());
+  }
+
   onion::api::Server::Options api_options;
   api_options.port = 0;
   api_options.tree_children_json = [&](std::string path,
                                        std::string cursor, int limit) {
-    return onion::api::tree_json::children(*pool.get(&error), nullptr,
+    return onion::api::tree_json::children(*pool.get(&error), cache.get(),
                                            std::move(path),
                                            std::move(cursor), limit)
         .dump();
   };
   api_options.tree_node_json = [&](std::string path) {
-    return onion::api::tree_json::node(*pool.get(&error), nullptr,
+    return onion::api::tree_json::node(*pool.get(&error), cache.get(),
                                        std::move(path))
         .dump();
   };
   api_options.tree_search_json =
       [&](std::string query, std::string levels, std::string status,
           std::string cursor) {
-        return onion::api::tree_json::search(*pool.get(&error), nullptr,
+        return onion::api::tree_json::search(*pool.get(&error), cache.get(),
                                              std::move(query),
                                              std::move(levels),
                                              std::move(status),

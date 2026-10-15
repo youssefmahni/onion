@@ -4,19 +4,19 @@
    the path jump. '/' focuses the query box (wired in app.js). */
 
 const SearchScreen = () => {
-  const [query, setQuery] = preact.useState("");
-  const [levels, setLevels] = preact.useState("");
-  const [status, setStatus] = preact.useState("");
-  const [items, setItems] = preact.useState([]);
-  const [error, setError] = preact.useState("");
-  const [loading, setLoading] = preact.useState(false);
-  const input = preact.useRef(null);
+  const [query, setQuery] = preactHooks.useState("");
+  const [levels, setLevels] = preactHooks.useState("");
+  const [status, setStatus] = preactHooks.useState("");
+  const [items, setItems] = preactHooks.useState([]);
+  const [error, setError] = preactHooks.useState("");
+  const [loading, setLoading] = preactHooks.useState(false);
+  const input = preactHooks.useRef(null);
 
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     if (input.current) input.current.focus();
   }, []);
 
-  const run = preact.useCallback(async () => {
+  const run = preactHooks.useCallback(async () => {
     if (!query.trim()) {
       setItems([]);
       return;
@@ -38,63 +38,73 @@ const SearchScreen = () => {
     }
   }, [query, levels, status]);
 
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     const timer = setTimeout(run, 250);
     return () => clearTimeout(timer);
   }, [run]);
 
   return preact.h(
     "div",
-    null,
+    { className: "search-layout" },
     preact.h(
-      "div",
-      { className: "search-bar" },
-      preact.h("input", {
-        ref: input,
-        type: "search",
-        placeholder: "search titles and paths (prefix matches)",
-        value: query,
-        onInput: (e) => setQuery(e.target.value),
-        "aria-label": "search",
-      }),
-      preact.h("input", {
-        type: "text",
-        placeholder: "levels (e.g. 0,1,2)",
-        value: levels,
-        onInput: (e) => setLevels(e.target.value),
-        "aria-label": "level filter",
-      }),
-      preact.h(
-        "select",
-        { value: status, onChange: (e) => setStatus(e.target.value),
-          "aria-label": "status filter" },
-        preact.h("option", { value: "" }, "any status"),
-        preact.h("option", { value: "open" }, "open"),
-        preact.h("option", { value: "settled" }, "settled"),
-        preact.h("option", { value: "leaf" }, "leaf"),
-        preact.h("option", { value: "review" }, "review"),
-      ),
+      "aside",
+      { className: "search-filters" },
+      preact.h("label", null,
+        preact.h("span", { className: "muted" }, "query"),
+        preact.h("input", {
+          ref: input,
+          type: "search",
+          placeholder: "titles and paths (prefix)",
+          value: query,
+          onInput: (e) => setQuery(e.target.value),
+          "aria-label": "search",
+        })),
+      preact.h("label", null,
+        preact.h("span", { className: "muted" }, "levels"),
+        preact.h("input", {
+          type: "text",
+          placeholder: "0,1,2",
+          value: levels,
+          onInput: (e) => setLevels(e.target.value),
+          "aria-label": "level filter",
+        })),
+      preact.h("label", null,
+        preact.h("span", { className: "muted" }, "status"),
+        preact.h(
+          "select",
+          { value: status, onChange: (e) => setStatus(e.target.value),
+            "aria-label": "status filter" },
+          preact.h("option", { value: "" }, "any status"),
+          preact.h("option", { value: "open" }, "open"),
+          preact.h("option", { value: "settled" }, "settled"),
+          preact.h("option", { value: "leaf" }, "leaf"),
+          preact.h("option", { value: "review" }, "review"),
+        )),
       loading && preact.h("span", { className: "muted" }, "…"),
     ),
-    error && preact.h("p", { className: "err-text" }, error),
     preact.h(
-      VList,
-      {
-        items,
-        height: 36,
-        render: (item) =>
-          preact.h(
-            "a",
-            {
-              className: "search-row",
-              href: "#/tree/" + encodeURIComponent(item.path),
-            },
-            preact.h("span", { className: "mono" }, item.path),
-            preact.h("span", null, item.title),
-            preact.h("span", { className: "badge " + item.status }, item.status),
-            preact.h("span", { className: "muted" }, "L" + item.layer),
-          ),
-      },
+      "section",
+      { className: "search-results" },
+      error && preact.h("p", { className: "err-text" }, error),
+      preact.h(
+        VList,
+        {
+          items,
+          height: 40,
+          render: (item) =>
+            preact.h(
+              "a",
+              {
+                className: "search-row",
+                href: "#/tree/" + encodeURIComponent(item.path),
+              },
+              preact.h("span", { className: "mono" }, item.path),
+              preact.h("span", null, item.title),
+              preact.h("span", { className: "badge " + item.status }, item.status),
+              preact.h("span", { className: "muted" }, "L" + item.layer),
+            ),
+        },
+      ),
     ),
   );
 };

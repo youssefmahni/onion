@@ -5,14 +5,14 @@
    The container scrolls; rows outside the window are skipped. */
 
 const VList = ({ items, height = 40, render, overscan = 6 }) => {
-  const host = preact.useRef(null);
-  const [scrollTop, setScrollTop] = preact.useState(0);
-  const [viewHeight, setViewHeight] = preact.useState(0);
+  const host = preactHooks.useRef(null);
+  const [scrollTop, setScrollTop] = preactHooks.useState(0);
+  const [viewHeight, setViewHeight] = preactHooks.useState(0);
 
   const onScroll = () => {
     setScrollTop(host.current ? host.current.scrollTop : 0);
   };
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     if (!host.current) return;
     const resize = () => setViewHeight(host.current.clientHeight);
     resize();
