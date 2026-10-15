@@ -398,3 +398,37 @@ exceeds it).
 test import on a copy + 12-action pilot campaign with every result to
 review; then PR b3-gate-funnel → main (carries 0025-0027 + tree
 viewer + checkpoint endpoint + help/OPERATOR.md).
+
+## 2026-10-15 — PR3 done, main merged in, PR #52 open (STOP: save point)
+
+Worktree .build-tmp/wt-audit-removal, branch b3-gate-funnel (worktree
+commits 984125b, 9d47386, merge a4c2320; pushed to origin).
+
+- reactconv module + `react-convert` CLI (RE&CT YAML -> dev-import
+  CSVs, RA codes as node codes, tree react) + react-profile.json (no
+  structure permission, no style checks -> every campaign result goes
+  to review). End-to-end verified on a copy: 216 actions -> 222 nodes
+  imported (tree react), profile published (hash
+  4d3d117bffaa9a33d93aa0dc718d186c2cb0183c7019f11916e10914f2bab07d),
+  p12-react-pilot campaign started with tree+hash in the record, and
+  an unheld profile refuses. Artifacts committed: docs/react/
+  pilot-react.campaign.json + react-profile.json.
+- Fixed reload_members() url wipe (merge, not replace — the members
+  table and swim gossip keep feeding the address book).
+- Merged origin/main (dash PR #51) into b3-gate-funnel (a4c2320):
+  resolved the checkpoint-hook rename (kept `checkpoint`), platform
+  test overlap, decision INDEX: the dashboard record had claimed 0026
+  first, so audit-removal is renumbered to 0028 (file renamed, INDEX
+  next free 0029, WORKLOG references updated).
+- Post-merge local suites green: platform 13, api 19, state 37,
+  sched 32, gate 42, reactconv 5, golden 5.
+- PR #52 opened: https://github.com/youssefmahni/onion/pull/52
+  CI at last poll: Legacy Linux/macOS, macOS x86_64 pass; most "New
+  tree" jobs still running; LLM client (Linux TSan) FAILED in the
+  first run (38767852929, job 116535641045) and was pending in the
+  second run (38767884279). Logs were unavailable while the run was
+  in progress.
+
+**Next step:** poll `gh pr checks 52`; if TSan fails again, pull the
+job log, reproduce locally (build with ONION_ENABLE_TSAN) and fix;
+when every job passes, `gh pr merge 52 --merge`.
