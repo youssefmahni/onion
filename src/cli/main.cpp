@@ -481,6 +481,10 @@ const HelpEntry kNodeSubs[] = {
     {"chaos-hooks", "node chaos-hooks",
      "print 1 when the chaos test hooks are compiled in, else 0 (test "
      "harness probe)"},
+    {"checkpoint", "node checkpoint",
+     "force a checkpoint of the current state NOW (the automatic cadence "
+     "is 6 h / 100 k records; run this after an import or before "
+     "admitting a joiner so its clone matches the live chain)"},
 };
 
 const HelpEntry kCampaignSubs[] = {

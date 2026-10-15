@@ -1435,3 +1435,104 @@ TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
   EXPECT_EQ(writer_->audits_open("mp1"), 0);
   EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
 }
+
+TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollisionRefuses) {
+  using onion::state::check_import_collisions;
+  using onion::state::DevImportedNode;
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("onion_collision_test_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  StateWriter::Options options;
+  options.data_dir = dir;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer->start(&start_error)) << start_error;
+  }
+  writer->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01"}, {"layer", 0},
+                               {"title", "Initiation"},
+                               {"code", "P01"}}),
+      make_record("ADD_NODE", {{"path", "P01-IN01"}, {"layer", 1},
+                               {"title", "Identify Problem"},
+                               {"code", "IN01"}}),
+  }});
+  writer->sync();
+
+  // Identical rows: counted as duplicates, dropped, import NOT refused.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"P01", "P01", 0, "Initiation"},
+        {"IN01", "P01-IN01", 1, "Identify Problem"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_TRUE(error.empty());
+    EXPECT_TRUE(nodes.empty());
+    EXPECT_EQ(report.duplicates, 2u);
+    EXPECT_TRUE(report.rows.empty());
+    EXPECT_FALSE(report.refused);
+  }
+  // Different content under an existing path: refused without --allow-skip.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-IN01", 1, "CHANGED TITLE"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_TRUE(report.refused);
+    EXPECT_EQ(nodes.size(), 1u);  // kept: the caller refuses
+    EXPECT_NE(report.rows[0].find("different content"), std::string::npos);
+  }
+  // --allow-skip drops the colliding row but still reports it.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-IN01", 1, "CHANGED TITLE"},
+        {"IN02", "P01-IN02", 1, "Business Goals"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, true, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_FALSE(report.refused);
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes[0].code, "IN02");
+  }
+  // A code already used by another path: refused.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-SOMEWHERE-ELSE", 1, "Another Node"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_TRUE(report.refused);
+    EXPECT_NE(report.rows[0].find("already used"), std::string::npos);
+  }
+  writer->stop();
+  std::filesystem::remove_all(dir);
+}
+
+TEST_F(StateWriterTest, WriteCheckpointCommandSnapshotsTheFoldedState) {
+  // Decision 0027: the forced checkpoint runs on the writer thread and
+  // leaves a checkpoint pair in the data dir.
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer_->start(&start_error)) << start_error;
+  }
+  writer_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01"}, {"layer", 0},
+                               {"title", "Initiation"}, {"code", "P01"}}),
+  }});
+  writer_->sync();
+  const auto count_checkpoints = [&] {
+    std::size_t count = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_, ec))
+      if (!ec && entry.path().filename().string().rfind("checkpoint-", 0) == 0)
+        ++count;
+    return count;
+  };
+  const std::size_t before = count_checkpoints();
+  writer_->submit(onion::state::WriteCheckpoint{});
+  writer_->sync();
+  EXPECT_GT(count_checkpoints(), before);
+}

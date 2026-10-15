@@ -1426,6 +1426,13 @@ int node_cmd(int argc, char** argv) {
        [&](std::string path, std::string) {
          return review_action(std::move(path), "reject");
        },
+       // Force a checkpoint on the writer thread, then wait for the
+       // queue to drain so the response is true only once durable.
+       [&](std::string, std::string) {
+         writer->submit(onion::state::WriteCheckpoint{});
+         writer->sync();
+         return true;
+       },
        [&](bool leave) {
          leave_requested.store(leave);
          stop_flag.store(true);
@@ -2233,15 +2240,52 @@ int dev_import_cmd(int argc, char** argv) {
       }
     }
   }
+  // Decision 0027: collisions are a hard stop unless --allow-skip is
+  // given. A collision is (a) a path that already exists with DIFFERENT
+  // content, or (b) a code already used by another path. Every collision
+  // is reported per row to a file.
+  const bool allow_skip = has_flag(argc, argv, "--allow-skip");
+  const std::string report_path = flag(
+      argc, argv, "--collisions", (dir / "import-collisions.tsv").string());
+  std::string collision_error;
+  const onion::state::ImportCollisionReport report =
+      onion::state::check_import_collisions(writer->db(), import.nodes,
+                                            allow_skip, &collision_error);
+  if (report.refused && !collision_error.empty()) {
+    std::cerr << collision_error << "\n";
+    return 1;
+  }
+  if (!report.rows.empty()) {
+    std::ofstream report_file(report_path);
+    if (!report_file) {
+      std::cerr << "cannot write the collision report to " << report_path
+                << "\n";
+      return 1;
+    }
+    report_file << "path\tcode\treason\n";
+    for (const auto& row : report.rows) report_file << row << "\n";
+    if (report.refused) {
+      std::cerr << "import refused: " << report.rows.size()
+                << " collision(s) reported to " << report_path
+                << " (re-run with --allow-skip to import the rest)\n";
+      return 1;
+    }
+    std::cerr << report.rows.size() << " collision(s) skipped and "
+                 "reported to "
+              << report_path << "\n";
+  }
   std::cout << "importing " << import.nodes.size() << " nodes (development, "
                "unsigned)\n";
   writer->submit(std::move(import));
   writer->sync();
-  const std::size_t skipped = writer->last_import_skipped();
   std::cout << "imported\n";
-  if (skipped > 0)
-    std::cout << "skipped " << skipped
+  if (report.duplicates > 0)
+    std::cout << "skipped " << report.duplicates
               << " duplicate-path rows (kept the first row)\n";
+  // The import snapshots its own result (decision 0027): a joiner's
+  // clone includes the new tree without waiting for the 6 h cadence.
+  writer->submit(onion::state::WriteCheckpoint{});
+  writer->sync();
   return 0;
 }
 

@@ -1278,6 +1278,14 @@ void StateWriter::run() {
         }
         break;
       }
+      case Command::Kind::Checkpoint: {
+        std::string checkpoint_error;
+        if (!write_checkpoint(&checkpoint_error))
+          std::fprintf(stderr, "state writer: forced checkpoint failed: "
+                               "%s\n",
+                       checkpoint_error.c_str());
+        break;
+      }
       case Command::Kind::MemberUrl: {
         auto statement = db_.prepare(
             "UPDATE members SET sync_url=?2 WHERE device_id=?1;", &error);
@@ -1384,6 +1392,52 @@ void StateWriter::submit(CommitTerminal command) {
   queue_cv_.notify_one();
 }
 
+ImportCollisionReport check_import_collisions(
+    const store::Db& db, std::vector<DevImportedNode>& nodes,
+    bool allow_skip, std::string* error) {
+  ImportCollisionReport report;
+  auto existing_path =
+      db.prepare("SELECT code, title FROM nodes WHERE path = ?1;", error);
+  auto existing_code =
+      db.prepare("SELECT path FROM nodes WHERE code = ?1 LIMIT 1;", error);
+  if (!existing_path || !existing_code) {
+    if (error && error->empty()) *error = "cannot prepare collision checks";
+    report.refused = true;
+    return report;
+  }
+  std::vector<DevImportedNode> kept;
+  kept.reserve(nodes.size());
+  for (const auto& node : nodes) {
+    std::string step_error;
+    existing_path->reset(&step_error);
+    existing_path->bind(1, node.path, &step_error);
+    bool collides = false;
+    if (existing_path->step_row(&step_error)) {
+      if (existing_path->text(0) == node.code &&
+          existing_path->text(1) == node.title) {
+        ++report.duplicates;
+        continue;  // identical row: skip silently, like the fold would
+      }
+      collides = true;
+      report.rows.push_back(node.path + "\t" + node.code +
+                            "\tpath exists with different content");
+    }
+    existing_code->reset(&step_error);
+    existing_code->bind(1, node.code, &step_error);
+    if (!collides && existing_code->step_row(&step_error)) {
+      collides = true;
+      report.rows.push_back(node.path + "\t" + node.code +
+                            "\tcode already used by " +
+                            existing_code->text(0));
+    }
+    if (collides && allow_skip) continue;  // dropped from the import
+    kept.push_back(node);
+  }
+  nodes = std::move(kept);
+  report.refused = !report.rows.empty() && !allow_skip;
+  return report;
+}
+
 void StateWriter::submit(DevImport command) {
   std::lock_guard lock(queue_mutex_);
   Command queued;
@@ -1398,6 +1452,15 @@ void StateWriter::submit(AppendForeign command) {
   Command queued;
   queued.kind = Command::Kind::Foreign;
   queued.foreign = std::move(command.batch);
+  queue_.push_back(std::move(queued));
+  queue_cv_.notify_one();
+}
+
+void StateWriter::submit(WriteCheckpoint command) {
+  (void)command;
+  std::lock_guard lock(queue_mutex_);
+  Command queued;
+  queued.kind = Command::Kind::Checkpoint;
   queue_.push_back(std::move(queued));
   queue_cv_.notify_one();
 }

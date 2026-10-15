@@ -36,6 +36,9 @@ class Server {
     std::function<bool(std::string, std::string)> review_accept;
     std::function<bool(std::string, std::string)> review_retry;
     std::function<bool(std::string, std::string)> review_reject;
+    // Force a checkpoint from the node's fully folded state (writer
+    // thread) — used after an import or before admitting a joiner.
+    std::function<bool(std::string, std::string)> checkpoint;
     std::function<void(bool leave)> stop_node;
   };
 

@@ -272,3 +272,24 @@ Next step: owner's three manual steps above; then the first real campaign (one p
 **Finding (real bug, to fix in the PR):** `reload_members()` (commands.cpp, sync thread) replaces `member_urls` from the static members.json every round, wiping URLs the main loop had merged from the members table (the M7 "deterministic fallback" for joined devices). Symptom: the seed never pulls a joined device — rounds verdict `answered=1/2 majority=no`, vector stuck at 2. Workaround: list both members with `url`/`swim` in the seed's members.json. After that: rounds completing, lanes split ~50/50 (158,298 / 158,961 tickets), vector 913/958 both ways, 110 settles, $0.35.
 
 **Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.
+
+## 2026-10-15 — Audit sampling removed (decision 0026) + deployed
+
+Owner directive: remove audit sampling from the engine. Committed on
+b3-gate-funnel (58987bc, worktree .build-tmp/wt-audit-removal — the
+dash work in the main working dir untouched): CampaignSpec.audit_rate
+gone (old files still parse, field ignored), sampling emission +
+audit_sampled() + the accept/reject audit shortcuts deleted, /api/state
+audits object removed. StateWriter keeps folding legacy AUDIT records
+(replay compatibility; existing items stay closable). Tests: sched 31,
+state 34, engine 21 green. Decision 0026 + INDEX (next 0027) written.
+
+Deployed to both Macs (patch applied on #1's sources — checkpoint hook
+preserved via offset-tolerant patch; rebuilt; launchd restarted; binary
+piped to #2 through the #1 jump host). Verified: /api/state has no
+audits field on either machine, campaign p04-first running.
+
+**Next step:** PR b3-gate-funnel → main (carries 0025, 0026, tree
+viewer, checkpoint endpoint, help/OPERATOR.md); fix reload_members()
+URL wipe; note the 0026 numbering collision with the dash branch's
+uncommitted 0026-dashboard-frontend-remote-bind claim.

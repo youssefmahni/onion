@@ -173,6 +173,7 @@ bool Server::start(std::string* error) {
   bind_post("/api/review/accept", hook(impl_->options.review_accept));
   bind_post("/api/review/retry", hook(impl_->options.review_retry));
   bind_post("/api/review/reject", hook(impl_->options.review_reject));
+  bind_post("/api/checkpoint", hook(impl_->options.checkpoint));
   bind_post("/api/stop", [this](std::string body, std::string) {
     bool leave = false;
     const auto parsed = nlohmann::json::parse(body, nullptr, false);
