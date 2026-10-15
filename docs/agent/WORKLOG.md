@@ -1,4 +1,24 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
+
+Result: PR open (dash/d0-foundation, 2 commits: preserved checkpoint
+endpoint + D0). §2 done earlier (docs/dashboard/INVENTORY.md on
+b3-gate-funnel; prerequisite gate: 0024 merged, 0025 in flight as PR #50 —
+now CI-green).
+Evidence:
+- api tests 18/18 and platform tests 12/12 locally; live-node checks:
+  one-time code -> /auth 302 + flagged cookie -> /api/v1/version 200,
+  code replay 401, POST /api/checkpoint 200 with a real checkpoint file.
+- The concurrent fleet session's uncommitted checkpoint work was
+  preserved as commit 6878b7b (its /api/checkpoint glue reconstructed;
+  the state-side WriteCheckpoint command is theirs verbatim).
+- PR #50 (prerequisite 0025) CI green on the fixed head (run 38731595992,
+  the ASan leak in the fold-idempotency test was fixed by scoping the
+  statement before writer->stop()).
+Next step: 3 green CI runs on #50 then merge; merge main into
+dash/d0-foundation and resolve the expected api.cpp/api.hpp/commands.cpp
+conflicts; then D1 (tree endpoints, counters, viewcache.db, screens 5-7).
+
 ## 2026-10-14 · M8 · local implementation complete
 
 Result: all planned implementation areas are in place locally: branch shares
