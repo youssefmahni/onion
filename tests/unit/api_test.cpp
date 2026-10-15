@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <httplib.h>
@@ -45,7 +46,12 @@ class ApiTest : public ::testing::Test {
   void TearDown() override {
     if (server_) server_->stop();
     if (writer_) writer_->stop();
-    std::filesystem::remove_all(dir_);
+    // The per-thread read-only pool keeps its handles until thread exit,
+    // so the remove can fail on Windows while they drain; the runner's
+    // temp cleanup reclaims the directory (same policy as the state
+    // tests).
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
   }
 
   std::string origin() const {
