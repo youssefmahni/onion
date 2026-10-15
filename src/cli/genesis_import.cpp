@@ -126,6 +126,15 @@ bool write_proposal(const Corpus& corpus, const std::filesystem::path& path) {
 }  // namespace
 
 int genesis_import_cmd(int argc, char** argv) {
+  for (int i = 2; i < argc; ++i)
+    if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+      std::cout << "usage: data_depot genesis-import --root <corpus-copy> "
+                   "--data-dir <dir> [--propose <file>] [--resolution "
+                   "<file>]\n"
+                << "\nimport a corpus with an optional proposal/resolution "
+                   "pair (genesis tooling).\n";
+      return 0;
+    }
   const std::string root = flag(argc, argv, "--root", "");
   const std::string data_dir = flag(argc, argv, "--data-dir", "");
   if (root.empty() || data_dir.empty()) {

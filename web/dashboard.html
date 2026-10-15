@@ -6,18 +6,53 @@
 <title>Onion — node</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 60rem; }
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 70rem; }
   h1 { font-size: 1.25rem; }
   section { border: 1px solid #ccc; border-radius: 6px; padding: .75rem 1rem; margin: 1rem 0; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid #ddd; }
   button { margin-right: .4rem; }
   .error { color: #c33; }
+  input { padding: .3rem .5rem; }
+
+  /* ---- tree ---- */
+  #tree { margin-top: .5rem; font-size: .92rem; }
+  #tree ul { list-style: none; margin: 0; padding-left: 1.1rem; border-left: 1px solid #e3e3e3; }
+  #tree > ul { padding-left: 0; border-left: none; }
+  .trow { display: flex; align-items: center; gap: .3rem; padding: 1px 0; white-space: nowrap; }
+  .trow:hover { background: #f3f3f3; }
+  @media (prefers-color-scheme: dark) { .trow:hover { background: #2a2a2a; } }
+  .twist { cursor: pointer; width: 1.1rem; text-align: center; color: #888; user-select: none; flex: none; }
+  .twist.spacer { cursor: default; }
+  .twist.loading { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .ttitle { overflow: hidden; text-overflow: ellipsis; }
+  .tcode { color: #999; font-size: .8rem; flex: none; }
+  .badge { font-size: .68rem; padding: 0 .35rem; border-radius: 8px; flex: none; }
+  .b-settled { background: #e6f4ea; color: #1e7e34; }
+  .b-leaf    { background: #fdecea; color: #c0392b; }
+  .b-open    { background: #eaf2fd; color: #1a56db; }
+  .b-atomic  { background: #fff3cd; color: #8a6d00; }
+  .b-more    { background: #eee; color: #666; }
+  .tmeta { color: #aaa; font-size: .72rem; flex: none; }
+  .treerow-loadmore { color: #1a56db; cursor: pointer; padding-left: 1.1rem; }
 </style>
 </head>
 <body>
 <h1>Onion — local node</h1>
 <div id="token-error" class="error"></div>
+
+<section>
+  <h2>Knowledge tree</h2>
+  <p>
+    <input id="tree-search" placeholder="filter by title / code / path" size="28">
+    <button id="tree-expand-all">expand all loaded</button>
+    <button id="tree-collapse-all">collapse all</button>
+    <button id="tree-reload">reload</button>
+    <span id="tree-stats" class="tmeta"></span>
+  </p>
+  <div id="tree"><span class="tmeta">loading…</span></div>
+</section>
 
 <section>
   <h2>Campaigns</h2>
@@ -78,6 +113,253 @@ async function post(path, body) {
   const response = await fetch(path, { method: "POST", headers: headers(), body: JSON.stringify(body) });
   return response.ok;
 }
+
+// ------------------------------------------------------------------ tree
+
+const treeCache = new Map();   // path -> node (children array, has_more, offset)
+const expanded = new Set();    // paths whose children render
+let treeRoots = [];            // root node paths, in display order
+let treeFilter = "";
+
+async function fetchTree(path, depth, offset) {
+  const params = new URLSearchParams({ depth });
+  if (path) params.set("path", path);
+  if (offset) params.set("offset", offset);
+  const response = await fetch("/api/tree?" + params);
+  if (!response.ok) throw new Error("tree request failed");
+  return response.json();
+}
+
+function mergeTree(payload) {
+  const visit = (node) => {
+    const cached = treeCache.get(node.path);
+    if (!cached) {
+      treeCache.set(node.path, node);
+      (node.children || []).forEach(visit);
+      return;
+    }
+    // Merge: refresh settle badges, append children we did not have yet.
+    cached.settled = node.settled; cached.kept = node.kept;
+    cached.atomic = node.atomic; cached.attempts = node.attempts;
+    cached.leaf = node.leaf;
+    if (node.children && node.children.length) {
+      for (const child of node.children) {
+        if (!cached.children.some((c) => c.path === child.path))
+          cached.children.push(child);
+      }
+      cached.children.forEach(visit);
+    }
+    cached.child_count = node.child_count;
+    cached.has_more = node.has_more;
+    if (node.offset !== undefined) cached.offset = node.offset;
+  };
+  const nodes = payload.nodes || (payload.node ? [payload.node] : []);
+  for (const node of nodes) {
+    const known = treeCache.get(node.path);
+    if (!known) treeRoots.push(node.path);
+    visit(node);
+  }
+}
+
+async function ensureChildren(path) {
+  // Children load at depth 2 so one expand shows two levels.
+  let node = treeCache.get(path);
+  if (node && (node.children.length > 0 || (node.has_more === false)))
+    return node;
+  const payload = await fetchTree(path, 2, 0);
+  mergeTree(payload);
+  return treeCache.get(path);
+}
+
+function matches(node) {
+  if (!treeFilter) return false;
+  const needle = treeFilter.toLowerCase();
+  return node.title.toLowerCase().includes(needle) ||
+         (node.code || "").toLowerCase().includes(needle) ||
+         node.path.toLowerCase().includes(needle);
+}
+
+function renderTree() {
+  const root = document.getElementById("tree");
+  root.innerHTML = "";
+  const stats = document.getElementById("tree-stats");
+  const loaded = treeCache.size;
+  stats.textContent = loaded ? `${loaded} nodes loaded · ${treeRoots.length} roots` : "";
+
+  const hasDescendantMatch = (node) => {
+    if (matches(node)) return true;
+    for (const child of node.children || [])
+      if (hasDescendantMatch(child)) return true;
+    return false;
+  };
+
+  const renderNode = (node, depth) => {
+    const li = document.createElement("li");
+    const row = document.createElement("div");
+    row.className = "trow";
+    const count = Number(node.child_count || (node.children || []).length);
+
+    const twist = document.createElement("span");
+    twist.className = "twist";
+    if (count > 0 || node.has_more) {
+      const open = expanded.has(node.path);
+      twist.textContent = open ? "▾" : "▸";
+      twist.title = open ? "collapse" : "expand";
+      twist.onclick = async () => {
+        if (expanded.has(node.path)) {
+          expanded.delete(node.path);
+        } else {
+          twist.textContent = "…"; twist.classList.add("loading");
+          try {
+            await ensureChildren(node.path);
+            expanded.add(node.path);
+          } catch {
+            /* keep collapsed */
+          }
+          twist.classList.remove("loading");
+        }
+        renderTree();
+      };
+    } else {
+      twist.className += " spacer";
+      twist.textContent = "·";
+    }
+    row.appendChild(twist);
+
+    const title = document.createElement("span");
+    title.className = "ttitle";
+    title.textContent = node.title;
+    title.title = node.path;
+    row.appendChild(title);
+
+    const code = document.createElement("span");
+    code.className = "tcode";
+    code.textContent = node.code || "";
+    row.appendChild(code);
+
+    const meta = document.createElement("span");
+    meta.className = "tmeta";
+    meta.textContent = `L${node.layer}`;
+    row.appendChild(meta);
+
+    if (node.settled) {
+      const badge = document.createElement("span");
+      if (node.leaf) { badge.className = "badge b-leaf"; badge.textContent = "leaf"; }
+      else { badge.className = "badge b-settled"; badge.textContent = `✓ ${node.kept} kept`; }
+      if (node.atomic) badge.textContent += " · atomic";
+      if (node.attempts) badge.textContent += ` · ${node.attempts} att`;
+      badge.title = `settled by the campaign; ${node.kept} children kept`;
+      row.appendChild(badge);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "badge b-open";
+      badge.textContent = "open";
+      row.appendChild(badge);
+    }
+
+    li.appendChild(row);
+    const showChildren = expanded.has(node.path) && !treeFilter;
+    if (showChildren && node.children.length) {
+      const ul = document.createElement("ul");
+      for (const child of node.children) ul.appendChild(renderNode(child, depth + 1));
+      li.appendChild(ul);
+    }
+    if (showChildren && node.has_more) {
+      const more = document.createElement("div");
+      more.className = "treerow-loadmore";
+      more.textContent = `+ load more (${count} total)`;
+      more.onclick = async () => {
+        const payload = await fetchTree(node.path, 1, Number(node.offset || node.children.length));
+        mergeTree(payload);
+        renderTree();
+      };
+      li.appendChild(more);
+    }
+    return li;
+  };
+
+  const ul = document.createElement("ul");
+  if (treeFilter) {
+    // Filtered mode: show matching nodes and their ancestors.
+    const walk = (node) => {
+      const keep = matches(node) || (node.children || []).some(hasDescendantMatch);
+      if (!keep) return null;
+      const li = document.createElement("li");
+      const row = document.createElement("div");
+      row.className = "trow";
+      const title = document.createElement("span");
+      title.className = "ttitle";
+      title.textContent = node.title;
+      title.title = node.path;
+      row.appendChild(title);
+      const code = document.createElement("span");
+      code.className = "tcode";
+      code.textContent = node.code || "";
+      row.appendChild(code);
+      li.appendChild(row);
+      const kids = (node.children || []).map(walk).filter(Boolean);
+      if (kids.length) {
+        const childUl = document.createElement("ul");
+        kids.forEach((k) => childUl.appendChild(k));
+        li.appendChild(childUl);
+      }
+      return li;
+    };
+    for (const rootPath of treeRoots) {
+      const node = treeCache.get(rootPath);
+      if (!node) continue;
+      const rendered = walk(node);
+      if (rendered) ul.appendChild(rendered);
+    }
+  } else {
+    for (const rootPath of treeRoots) {
+      const node = treeCache.get(rootPath);
+      if (!node) continue;
+      ul.appendChild(renderNode(node, 0));
+    }
+  }
+  root.appendChild(ul);
+}
+
+async function initTree() {
+  try {
+    const payload = await fetchTree("", 2, 0);
+    mergeTree(payload);
+  } catch {
+    document.getElementById("tree").textContent = "tree unavailable";
+  }
+  renderTree();
+}
+
+document.getElementById("tree-expand-all").onclick = () => {
+  // Expand everything already loaded, breadth-first (children load on demand).
+  const paths = [...expanded];
+  const visit = (node) => {
+    if (!node) return;
+    if ((node.child_count || 0) > 0 || node.children.length) expanded.add(node.path);
+    for (const child of node.children || []) visit(child);
+  };
+  treeRoots.forEach((p) => visit(treeCache.get(p)));
+  renderTree();
+};
+document.getElementById("tree-collapse-all").onclick = () => {
+  expanded.clear();
+  renderTree();
+};
+document.getElementById("tree-reload").onclick = () => {
+  treeCache.clear(); treeRoots = []; expanded.clear();
+  initTree();
+};
+let searchTimer = null;
+document.getElementById("tree-search").oninput = (event) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    treeFilter = event.target.value.trim();
+    renderTree();
+  }, 200);
+};
+
+// ------------------------------------------------------------------ state
 
 function render(state) {
   const campaigns = document.getElementById("campaigns");
@@ -184,6 +466,19 @@ async function refresh() {
 document.getElementById("stop").onclick = () => post("/api/stop", {}).then(refresh);
 refresh();
 setInterval(refresh, 5000);
+initTree();
+// Live settle badges: re-fetch expanded subtrees on a slow poll.
+setInterval(async () => {
+  if (expanded.size === 0 || treeFilter) return;
+  const paths = [...expanded].slice(0, 40);   // cap the poll fan-out
+  for (const path of paths) {
+    try {
+      const payload = await fetchTree(path, 1, 0);
+      mergeTree(payload);
+    } catch { /* transient */ }
+  }
+  renderTree();
+}, 15000);
 </script>
 </body>
 </html>

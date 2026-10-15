@@ -2,8 +2,11 @@
 
 ## Current
 
-- Dashboard (DASHBOARD_PLAN.md): D0 PR #51 open (`dash/d0-foundation`) — decision 0026, sign-in/sessions, cross-site guards, CSP, embedded shell, bind gate. Prerequisite PR #50 (0025 allowance-leaf fix) CI-green, accumulating green runs before merge. Next: merge #50, merge main into the D0 branch, then D1.
-- Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed.
+- Dashboard (DASHBOARD_PLAN.md): D0 PR #51 open (`dash/d0-foundation`) — decision 0026, sign-in/sessions, cross-site guards, CSP, embedded shell, bind gate. Prerequisite PR #50 (0025 allowance fix) MERGED.
+- Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed; CI green on the recent b3 runs and the main merge (PR #48).
+- Landed: branch-share pools and no-spend depth checkpoints; 30-day compact checkpoint summaries with exact totals; measured log-growth projection; L6 light-funnel default; `/api/state` and dashboard lanes, claims/steals, backlog, spend rate, disk and quality observability.
+- Next: finish B3 on `b3-gate-funnel` (gate/funnel/stop-rule findings), then B2/B5 (mp quiescence CI fix, F-TEST-1) and B6 (security hardening) from REVIEW.md, then M9. OA-15 (Linux join) and OA-16 (Mac power pull) remain M7 owner live checks.
+
 
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
 - Landed so far: signed LAN beacon + `node run` swim wiring (decision 0013 canonical signing over the updates payload, signer/verifier hooks, tolerant UDP bind so co-located nodes survive; ASAN smoke of two real nodes exchanging over UDP clean) — CI green 8/8 (run 38160064783, includes the multi-process test); three review rounds, all findings fixed (stack-use-after-scope signer capture, malformed-datagram sig/ts crash, vacuous signing test, doc drift)

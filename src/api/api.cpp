@@ -37,8 +37,8 @@ struct Server::Impl {
   // auth_mutex; the pending code is one-shot and short-lived, sessions
   // expire after session_ttl of inactivity.
   std::mutex auth_mutex;
-  std::map<std::string, std::chrono::steady_clock::time_point> pending_codes;
-  std::map<std::string, Session> sessions;
+  std::map<std::string, std::chrono::steady_clock::time_point> pending_codes{};
+  std::map<std::string, Session> sessions{};
 };
 
 namespace {
@@ -148,7 +148,7 @@ nlohmann::json body_or_error(const httplib::Request& request,
 }
 
 Server::Server(Options options)
-    : impl_(new Impl{std::move(options), nullptr, {}, false, 0}) {}
+    : impl_(new Impl{std::move(options)}) {}
 Server::~Server() { stop(); }
 
 std::string Server::issue_auth_code() {
@@ -224,6 +224,7 @@ bool Server::start(std::string* error) {
           "application/json");
     }
   });
+
 
   // Embedded static files (web/ at build time): / serves index.html; the
   // rest are served by name. ETag = content hash; always revalidated.
@@ -323,6 +324,7 @@ bool Server::start(std::string* error) {
 
   impl_->server->Get("/", serve_static);
   impl_->server->Get(R"(/(.+))", serve_static);
+
   const auto bind_post = [this](const char* path,
                                 std::function<bool(std::string, std::string)> action) {
     impl_->server->Post(

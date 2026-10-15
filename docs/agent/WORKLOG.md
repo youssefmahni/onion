@@ -1,4 +1,5 @@
 # Worklog (append-only, newest at top)
+
 ## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
 
 Result: PR open (dash/d0-foundation, 2 commits: preserved checkpoint
@@ -18,6 +19,47 @@ Evidence:
 Next step: 3 green CI runs on #50 then merge; merge main into
 dash/d0-foundation and resolve the expected api.cpp/api.hpp/commands.cpp
 conflicts; then D1 (tree endpoints, counters, viewcache.db, screens 5-7).
+
+
+## 2026-10-15 · dashboard D0 · §2 verify-and-adapt (inventories + prerequisite gate)
+
+Result: in progress
+Evidence:
+- §2.1 prerequisites: the quality-gate change (decision 0024, critic off by
+  default, deterministic gate, verified-atomic stop rule) is MERGED on
+  origin/main (58945d7 via PR #48, 7f7889c). The allowance-leaf fix for
+  imported tickets (decision 0025, src/sched/sched.cpp:932 "imported tickets
+  are never leafed by allowance") is NOT merged: it rides on the local,
+  unpushed commit 260093d on `b3-gate-funnel` (bundled with the CLI --help
+  work, the tree viewer and docs). Per §2.1 it must merge first.
+- §2.2–2.4 written to docs/dashboard/INVENTORY.md: full route table
+  (/api/state, /api/tree, /, 7 authed POSTs), the token/Origin/Content-Type
+  mechanism, the store schema (no reserves/claims/invites/evictions tables;
+  they are in-memory or files), the missing dashboard inputs (stats counters,
+  viewcache.db, metrics.db, event feed, per-device OS/name), and the
+  read-only connections CONFIRMED PRESENT (StateWriter::read_db, per-thread
+  map, store::Db::open_readonly) — §2.4 needs no new pool.
+- §2.5 plan adjustments recorded there: (1) httplib is built without zlib
+  (CMakeLists.txt:208) so §3.1 gzip needs a vendored deflate or a decision
+  record to drop it; (2) /api/state is unauthenticated and must keep working
+  through D0; (3) web/ is disk-loaded (ONION_WEB_DIR), embedding is new;
+  (4) no `dashboard` CLI command exists yet.
+Next step: merge the 0025 allowance-leaf prerequisite (full local ctest on
+b3-gate-funnel, push, PR, 3 green CI runs, merge), then open `dash/d0-foundation`
+from fresh origin/main for D0 (decision record, bind gate, sign-in, CSP,
+embedded files, /api/v1 skeleton, empty shell).
+
+## 2026-10-14 · docs · OA-14 withdrawn by the owner
+
+Result: done. The owner confirmed the repo is public and there is no GitHub
+Actions billing problem, so OA-14 (billing blocking CI) was removed:
+OWNER_ACTIONS.md entry deleted; PROGRESS.md, TRACEABILITY.md and
+gates/M8.md updated to the real state (M8 merged as PR #49 `f21d23d`,
+tagged `m8-rc`; recent CI runs green incl. the PR #48 main merge). The
+earlier OA-14 wording in old WORKLOG entries and REVIEW.md F-CI-1 remains
+as historical record.
+Next step: finish B3 on `b3-gate-funnel`, then B2/B5 and B6 from REVIEW.md.
+
 
 ## 2026-10-14 · M8 · local implementation complete
 
@@ -208,6 +250,7 @@ CI note (2026-10-14): the mp test's outer deadline (360 s) was too tight for the
 
 Next step: CI green on PR #41 (the consolidated pre-M8 PR; #40 folded in), 3 green runs, merge, then M8.
 
+
 ## 2026-10-15 — Fleet ACTIVE bug: root cause + repair
 
 **Root cause (two compounding bugs):**
@@ -231,3 +274,51 @@ admitting a joiner).
 NOTE: the working dir was switched to branch `dash/d0-foundation` (a
 dashboard rework in progress) — my checkpoint edits are uncommitted there;
 the earlier commits live on b3-gate-funnel.
+
+
+## 2026-10-14 · Mac Pro deployment — first machine live (mac@192.168.1.63)
+
+Result: deployed
+Evidence:
+- Intel Xeon E5-1650 v2, macOS 12.7.6 (matches the CI Intel/macOS-12 build). cmake 3.29.3 + ninja 1.11.1 installed in ~/bin (PATH in .zshrc/.bash_profile). Source at ~/onion (origin/main @ 7f7889c, m8-rc + b3 audit).
+- Release binary built: macos-release preset, -DCMAKE_OSX_ARCHITECTURES=x86_64 -DONION_ENABLE_OPENCL=OFF. NOTE: test targets fail to build with Apple clang 14 (gate_test.cpp:441 — C++20 structured-binding capture; CI's newer Xcode accepts it). App target builds clean. Recorded for a follow-up patch on main.
+- Corpus imported: 316,133 nodes from the owner's PlanningProcess CSVs (131 duplicated paths resolved via the propose/approve flow), Merkle VERIFIED. Data dir ~/Library/Application Support/Onion (~220 MB).
+- Node RUNNING: nohup + node run with --price-in 0.30 --price-cache 0.006 --price-out 1.20 --budget-usd 100, API serving /api/state (lanes, claims, disk growth, merkle). Profile chose SERVER rules (base_weight 1, ceiling 2000) — correct for a Mac Pro; OA-12's "laptop rules" text predates server-class hardware.
+- launchd: user-agent plist written at ~/Library/LaunchAgents/com.onion.node.plist, but the headless SSH user has no GUI domain (bootstrap gui/uid → 125), so it does not auto-load. Owner step: sudo LaunchDaemon (UserName=mac) or a GUI login + launchctl load.
+- Owner manual steps remaining: (1) node key set deepseek-key <key> + restart, (2) sudo LaunchDaemon for reboot persistence, (3) first campaign plan/start, (4) firewall allow for 7946/7947 when the fleet joins.
+
+Next step: owner's three manual steps above; then the first real campaign (one phase, small budget).
+
+## 2026-10-14 — Knowledge tree viewer (dashboard) + Mac live check
+
+**Done:**
+- 0025 deployed to the Mac Pro and verified live: campaign `p01-first` (scope P01, budget 50, deepseek-flash) settled 25 nodes with $0.12 real spend — no mass "allowance spent" leafing (before the fix: 30,794 zero-attempt leaves). Root cause of the first stalled restart: the node must run with `--base-url https://api.deepseek.com --model deepseek-flash` (missing flags → "provider unavailable").
+- Knowledge tree viewer: new `GET /api/tree?path=<p>&depth=<n>&offset=<k>` (lazy subtree, per-node 200-child cap with `has_more`, pagination; reads via the read-only connection so polls never serialize behind writer). Provider `tree_json` in commands.cpp; route + exception guard in api.cpp; hook in api.hpp Options.
+- Dashboard: "Knowledge tree" section with expand/collapse, lazy loading (children fetch at depth 2 on expand), live settle badges (15 s poll of expanded subtrees, capped fan-out), client-side filter with ancestor highlight, expand/collapse-all, reload, "+ load more" pagination.
+- Fixed two real bugs found while building it: (1) json* frame slots into children arrays dangle on reallocation (batched push, slots after); (2) `sqlite3_step` auto-resets on DONE, so the post-loop "clipped" probe replayed row 1 — probe only when the loop stops at the cap.
+- Tests: api_test.cpp +TreeEndpointPassesPathAndDepthToTheProvider (7/7 pass). Local UI smoke-tested in-browser against a fixture corpus (expand/collapse/search/load-more verified via DOM + network log).
+- Deployed to the Mac: sources + web/ rsynced, rebuilt, node restarted; `/api/tree` serves the live corpus (P01 now 37 children), dashboard serves the tree over LAN.
+
+**Evidence:** Mac `curl /api/tree` output (P01 child_count 37, settled badges), /api/state settled 25 spend 0.121, LAN 200 on "/" with "Knowledge tree", api_test 7/7.
+
+**Next step:** run the full local ctest + push the 0025 + tree work through a PR (branch `b3-gate-funnel`, all CI jobs), then re-run the full suite on CI before merge.
+
+## 2026-10-14 — Two-Mac-Pro fleet formed
+
+**Done:**
+- Mac #2 (192.168.1.57, wiped home dir, no dev tools) provisioned with #1's compiled binary (identical x86_64 macOS 12.7.6) — no toolchain needed.
+- Fleet flow: #2 `node identity` → #1 `node invite --pubkey <hex>` → #2 `node join --token @file --seed 192.168.1.63:7947` → members.json written + checkpoint cloned (316k-node tree synced, 29 settles visible).
+- Fixed along the way: #1's node must run with `--host <LAN IP>` (not 0.0.0.0) so the join response advertises a reachable sync URL; #1 needed `--members ~/members.json` self-listing for the sync server to start (it only binds with a members list — the join endpoint lives there); the CLI-written CAMPAIGN record folds only at node startup (restart required to raise the budget 50→1000, decision 0010 resume).
+- Fleet live: #1 40 settles / $0.22, #2 29 settles / $0.14, lanes split by weighted rendezvous, #2 pulls #1 (rounds completing), members-table url fallback makes joined devices reachable.
+- #2 still JOINING on #1's side until lag < 100 ops (automatic).
+
+**Evidence:** /api/state on both (settles, spend, lanes 267/234 split on #2), members table on #1 with #2's sync_url 192.168.1.57:7947, swim groups 2 members.
+
+**Next step:** full local ctest + PR for 0025 + tree viewer + fleet tooling changes (b3-gate-funnel → CI).
+
+## 2026-10-14 — Fleet sync URL bug found + worked around
+
+**Finding (real bug, to fix in the PR):** `reload_members()` (commands.cpp, sync thread) replaces `member_urls` from the static members.json every round, wiping URLs the main loop had merged from the members table (the M7 "deterministic fallback" for joined devices). Symptom: the seed never pulls a joined device — rounds verdict `answered=1/2 majority=no`, vector stuck at 2. Workaround: list both members with `url`/`swim` in the seed's members.json. After that: rounds completing, lanes split ~50/50 (158,298 / 158,961 tickets), vector 913/958 both ways, 110 settles, $0.35.
+
+**Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.
+

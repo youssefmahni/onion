@@ -66,6 +66,37 @@ TEST_F(ApiTest, StateEndpointServesJson) {
   EXPECT_NE(response->body.find("\"campaigns\""), std::string::npos);
 }
 
+TEST_F(ApiTest, TreeEndpointPassesPathAndDepthToTheProvider) {
+  server_->stop();
+  Server::Options options;
+  options.port = 0;
+  options.token = "test-token";
+  options.dashboard_html = "<html>dashboard</html>";
+  options.writer = writer_.get();
+  std::string captured_path = "unset";
+  int captured_depth = -1;
+  int captured_offset = -1;
+  options.tree_json = [&](std::string path, int depth, int offset) {
+    captured_path = path;
+    captured_depth = depth;
+    captured_offset = offset;
+    return std::string("{\"node\":{\"path\":\"P01\"}}");
+  };
+  server_ = std::make_unique<Server>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(server_->start(&error)) << error;
+  port_ = server_->bound_port();
+
+  httplib::Client client("127.0.0.1", port_);
+  const auto response = client.Get("/api/tree?path=P01&depth=3&offset=7");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(captured_path, "P01");
+  EXPECT_EQ(captured_depth, 3);
+  EXPECT_EQ(captured_offset, 7);
+  EXPECT_NE(response->body.find("\"node\""), std::string::npos);
+}
+
 TEST_F(ApiTest, DashboardServesAtRoot) {
   httplib::Client client("127.0.0.1", port_);
   const auto response = client.Get("/");

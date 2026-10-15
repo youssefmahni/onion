@@ -787,11 +787,13 @@ TEST(StateWriterFoldIdempotency, BothOriginsAttemptOneCountBothSpends) {
   }
   writer->sync();
   EXPECT_EQ(writer->db().spend_usd(&error), "0.002");
-  auto statement = writer->db().prepare(
-      "SELECT COUNT(*) FROM attempts;", &error);
-  ASSERT_TRUE(statement);
-  ASSERT_TRUE(statement->step_row(&error));
-  EXPECT_EQ(statement->integer_int(0), 2);
+  {
+    auto statement = writer->db().prepare(
+        "SELECT COUNT(*) FROM attempts;", &error);
+    ASSERT_TRUE(statement);
+    ASSERT_TRUE(statement->step_row(&error));
+    EXPECT_EQ(statement->integer_int(0), 2);
+  }
   writer->stop();
   // The remove can fail on Windows while the SQLite handles drain; the
   // runner's temp cleanup reclaims the directory, so the failure is ignored.

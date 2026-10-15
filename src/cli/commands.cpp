@@ -1,3 +1,4 @@
+#include "cli.hpp"
 #include "commands.hpp"
 #include "genesis_import.hpp"
 
@@ -201,6 +202,154 @@ std::uintmax_t directory_bytes(const std::filesystem::path& root) {
   return total;
 }
 
+// The lazy knowledge-tree provider for the dashboard. One subtree per
+// request: children of `root` down `depth` levels, capped at 200 children
+// per node (has_more says the cap clipped) — a 316k-node corpus stays a
+// handful of indexed lookups instead of a full scan.
+json tree_json(const onion::store::Db& read, std::string root, int depth,
+               int offset) {
+  depth = std::max(0, std::min(depth, 6));
+  offset = std::max(0, offset);
+  constexpr int kMaxChildren = 200;
+  std::string error;
+  json result = json::object();
+  auto children_stmt = read.prepare(
+      "SELECT id, code, path, layer, title, hlc FROM nodes "
+      "WHERE parent_id = ?1 AND tombstone = 0 ORDER BY layer, id "
+      "LIMIT ?2 OFFSET ?3;",
+      &error);
+  auto child_count = read.prepare(
+      "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1 AND tombstone = 0;",
+      &error);
+  auto settle_stmt = read.prepare(
+      "SELECT kept, atomic, attempts, score FROM settles WHERE path = ?1;",
+      &error);
+  if (!children_stmt || !child_count || !settle_stmt) {
+    result["error"] = error.empty() ? "tree statements unavailable" : error;
+    return result;
+  }
+  const auto settle_for = [&](std::string_view path, json& node) {
+    std::string step_error;
+    settle_stmt->reset(&step_error);
+    settle_stmt->bind(1, std::string(path), &step_error);
+    if (!settle_stmt->step_row(&step_error)) return;
+    node["settled"] = true;
+    node["kept"] = settle_stmt->integer_int(0);
+    node["atomic"] = settle_stmt->integer_int(1);
+    node["attempts"] = settle_stmt->integer_int(2);
+    node["leaf"] = settle_stmt->integer_int(0) == 0;  // kept == 0
+  };
+  // Frames: the JSON slot to fill, the node id, and the remaining levels.
+  struct Frame {
+    json* slot;
+    std::int64_t id;
+    int remaining;
+  };
+  std::vector<Frame> frames;
+  const auto make_node = [&](std::string_view code, std::string_view path,
+                             int layer, std::string_view title) {
+    json node;
+    node["code"] = code;
+    node["path"] = path;
+    node["layer"] = layer;
+    node["title"] = title;
+    node["children"] = json::array();
+    settle_for(path, node);
+    return node;
+  };
+  std::string bind_error;
+  if (root.empty()) {
+    auto roots = read.prepare(
+        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "WHERE parent_id IS NULL AND tombstone = 0 ORDER BY layer, id "
+        "LIMIT ?1;",
+        &error);
+    if (!roots) {
+      result["error"] = error;
+      return result;
+    }
+    roots->bind(1, kMaxChildren, &bind_error);
+    std::string step_error;
+    json nodes = json::array();
+    std::vector<std::int64_t> root_ids;
+    while (roots->step_row(&step_error)) {
+      const std::int64_t id = roots->integer(0);
+      root_ids.push_back(id);
+      nodes.push_back(make_node(roots->text(1), roots->text(2),
+                                roots->integer_int(3), roots->text(4)));
+    }
+    result["nodes"] = std::move(nodes);
+    if (depth > 0)
+      for (std::size_t i = 0; i < root_ids.size(); ++i)
+        frames.push_back(Frame{&result["nodes"][i], root_ids[i], depth});
+  } else {
+    auto node_stmt = read.prepare(
+        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "WHERE path = ?1 AND tombstone = 0;",
+        &error);
+    if (!node_stmt) {
+      result["error"] = error;
+      return result;
+    }
+    node_stmt->bind(1, root, &bind_error);
+    std::string step_error;
+    if (!node_stmt->step_row(&step_error)) {
+      result["error"] = "node not found";
+      return result;
+    }
+    const std::int64_t id = node_stmt->integer(0);
+    result["node"] = make_node(node_stmt->text(1), node_stmt->text(2),
+                               node_stmt->integer_int(3), node_stmt->text(4));
+    if (depth > 0) frames.push_back(Frame{&result["node"], id, depth});
+  }
+  std::size_t cursor = 0;
+  while (cursor < frames.size()) {
+    const Frame frame = frames[cursor++];
+    std::string step_error;
+    children_stmt->reset(&step_error);
+    children_stmt->bind(1, frame.id, &step_error);
+    children_stmt->bind(2, kMaxChildren + 1, &step_error);
+    // `offset` only applies to the FIRST (requested) frame — deeper
+    // frames paginate from 0 so the subtree stays complete.
+    children_stmt->bind(3, cursor == 1 ? offset : 0, &step_error);
+    int rows = 0;
+    // Batch first: json* slots into a parent's children array must not
+    // be taken while the array can still reallocate (each frame pushes
+    // its batch in one go, then takes stable pointers).
+    std::vector<std::pair<json, std::int64_t>> batch;
+    while (rows < kMaxChildren && children_stmt->step_row(&step_error)) {
+      ++rows;
+      const std::int64_t child_id = children_stmt->integer(0);
+      batch.emplace_back(
+          make_node(children_stmt->text(1), children_stmt->text(2),
+                    children_stmt->integer_int(3), children_stmt->text(4)),
+          child_id);
+    }
+    // sqlite3_step AUTO-RESETS the statement when it returns DONE, so
+    // probing after the loop replays row 1. The statement is mid-result
+    // only when the loop stopped at the cap: probe exactly then.
+    bool clipped = false;
+    if (rows == kMaxChildren)
+      clipped = children_stmt->step_row(&step_error);
+    // Two phases: push every child first (the array may reallocate on
+    // each push), and only then take slots into the final array.
+    for (auto& [child, child_id] : batch)
+      frame.slot->at("children").push_back(std::move(child));
+    if (frame.remaining > 1)
+      for (std::size_t i = 0; i < batch.size(); ++i)
+        frames.push_back(Frame{&frame.slot->at("children")[i],
+                               batch[i].second, frame.remaining - 1});
+    child_count->reset(&step_error);
+    child_count->bind(1, frame.id, &step_error);
+    std::int64_t count = 0;
+    if (child_count->step_row(&step_error)) count = child_count->integer(0);
+    (*frame.slot)["child_count"] = count;
+    (*frame.slot)["has_more"] = clipped || count > rows;
+    (*frame.slot)["offset"] = offset + rows;
+  }
+  return result;
+}
+
 json state_json(onion::state::StateWriter& writer, int api_port,
                 bool* running,
                 const std::vector<onion::sched::LaneMember>& lane_members,
@@ -232,6 +381,7 @@ json state_json(onion::state::StateWriter& writer, int api_port,
     json entry;
     entry["id"] = campaign.id;
     entry["state"] = campaign.state;
+    entry["reason"] = campaign.reason;
     entry["reserved"] = writer.reserved_total(campaign.id);
     // The uncapped fold for the budget-overshoot check (decision 0014):
     // at most one chunk per device beyond the budget.
@@ -379,6 +529,11 @@ json state_json(onion::state::StateWriter& writer, int api_port,
 }  // namespace
 
 int node_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    const std::string sub =
+        (argc >= 3 && argv[2][0] != '-') ? argv[2] : "";
+    return onion::cli::print_cli_help("node", sub) ? 0 : 2;
+  }
   // --- subcommands that don't run the node ---
   if (argc >= 3 && std::string(argv[2]) == "chaos-hooks") {
     // The scenario tests probe this to decide between running the
@@ -698,6 +853,7 @@ int node_cmd(int argc, char** argv) {
       json entry;
       entry["id"] = campaign.id;
       entry["state"] = campaign.state;
+    entry["reason"] = campaign.reason;
       try {
         entry["spec"] = json::parse(campaign.spec);
       } catch (const std::exception&) {
@@ -838,8 +994,7 @@ int node_cmd(int argc, char** argv) {
     return 0;
   }
   if (argc < 3 || std::string(argv[2]) != "run") {
-    std::cerr << "usage: data_depot node run --data-dir <dir> --base-url <url>"
-                 " [--model <id>] [--api-port 8080] [--key-file <path>]\n";
+    onion::cli::print_cli_help("node", "");
     return 2;
   }
   const std::filesystem::path dir = data_dir_arg(argc, argv);
@@ -861,19 +1016,34 @@ int node_cmd(int argc, char** argv) {
     return 1;
   }
 
-  // The DeepSeek key: environment first (development fallback), then the
-  // OS key store. Never printed.
+  // The DeepSeek key: environment first (development fallback), then
+  // --key-file (a plain-text file holding the API key, one line), then
+  // the OS key store. Never printed.
   std::string key;
   if (const char* env = std::getenv("DEEPSEEK_API_KEY")) key = env;
-  else {
+  if (key.empty()) {
+    const std::string key_file = flag(argc, argv, "--key-file", "");
+    if (!key_file.empty()) {
+      std::ifstream key_stream(key_file);
+      if (!key_stream) {
+        std::cerr << "cannot read --key-file " << key_file << "\n";
+        return 1;
+      }
+      std::getline(key_stream, key);
+      while (!key.empty() && (key.back() == '\n' || key.back() == '\r' ||
+                              key.back() == ' '))
+        key.pop_back();
+    }
+  }
+  if (key.empty()) {
     const auto stored = key_store.get("deepseek-key");
     if (stored) key = *stored;
   }
   if (key.empty() && !base_url.empty() &&
       base_url.find("127.0.0.1") == std::string::npos &&
       base_url.find("localhost") == std::string::npos) {
-    std::cerr << "no DeepSeek key: set DEEPSEEK_API_KEY or store it with "
-                 "'node key set'\n";
+    std::cerr << "no DeepSeek key: set DEEPSEEK_API_KEY, pass --key-file, "
+                 "or store it with 'node key set'\n";
   }
 
   // The profile feeds the concurrency defaults: the client's in-flight
@@ -1243,6 +1413,13 @@ int node_cmd(int argc, char** argv) {
     }
     return state_json(*writer, api_port, &running, lanes,
                       sync_rounds_completed.load()).dump();
+  };
+  // The lazy tree provider: handler-thread reads through the read-only
+  // connection, so a tree poll never serializes behind writer
+  // transactions (same rule as state_json).
+  api_options.tree_json = [&](std::string path, int depth, int offset) {
+    return tree_json(writer->read_db(), std::move(path), depth, offset)
+        .dump();
   };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
@@ -1774,6 +1951,11 @@ if (!members_path.empty()) reload_members();
 }
 
 int campaign_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    const std::string sub =
+        (argc >= 3 && argv[2][0] != '-') ? argv[2] : "";
+    return onion::cli::print_cli_help("campaign", sub) ? 0 : 2;
+  }
   if (argc < 3) {
     std::cerr << "usage: data_depot campaign start <file> | plan <file> | pause <id> | "
                  "resume <id> | stop <id> [--data-dir <dir>] [--yes]\n";
@@ -1953,6 +2135,11 @@ int campaign_cmd(int argc, char** argv) {
 }
 
 int review_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    const std::string sub =
+        (argc >= 3 && argv[2][0] != '-') ? argv[2] : "";
+    return onion::cli::print_cli_help("review", sub) ? 0 : 2;
+  }
   if (argc < 3) {
     std::cerr << "usage: data_depot review list | accept <path> | retry <path>"
                  " | reject <path> [--note <text>] [--data-dir <dir>]\n";
@@ -2027,6 +2214,13 @@ int review_cmd(int argc, char** argv) {
 }
 
 int dev_import_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot dev-import --root <corpus-copy> "
+                 "[--data-dir <dir>]\n"
+              << "\nimport a development corpus (per-layer CSVs named "
+                 "\"Onion - level_NN.csv\") into the data dir.\n";
+    return 0;
+  }
   const std::string root = flag(argc, argv, "--root", "");
   if (root.empty()) {
     std::cerr << "usage: data_depot dev-import --root <corpus-copy> "
@@ -2077,6 +2271,12 @@ int dev_import_cmd(int argc, char** argv) {
 }
 
 int export_csv_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot export-csv --out <dir> [--data-dir "
+                 "<dir>] [--max-layer 9]\n"
+              << "\nexport the knowledge tree to per-layer CSVs.\n";
+    return 0;
+  }
   const std::string out = flag(argc, argv, "--out", "");
   if (out.empty()) {
     std::cerr << "usage: data_depot export-csv --out <dir> [--data-dir <dir>] "
@@ -2103,6 +2303,12 @@ int export_csv_cmd(int argc, char** argv) {
 // ------------------------------------------------------------------ admin
 
 int admin_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot admin keygen --out <path>\n"
+              << "\ngenerate the admin key pair. The admin key must never "
+                 "live inside the data directory.\n";
+    return 0;
+  }
   const std::string action = argc >= 3 ? argv[2] : "";
   if (action != "keygen") {
     std::cerr << "usage: data_depot admin keygen --out <path>\n";
