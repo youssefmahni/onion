@@ -532,3 +532,77 @@ a {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+
+/* D3 campaigns */
+.campaigns-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.2fr);
+  gap: 20px;
+}
+
+.campaigns-list,
+.campaigns-detail {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+}
+
+.campaigns-list tr.selected td {
+  background: var(--panel);
+}
+
+.campaigns-list tr {
+  cursor: pointer;
+}
+
+.campaigns-list textarea {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: inherit;
+}
+
+.plan-report {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.message {
+  color: var(--accent);
+}
+
+.campaigns-detail button {
+  background: var(--panel);
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+  margin-right: 8px;
+}
+
+.campaigns-detail button:hover:not(:disabled) {
+  background: var(--ink);
+  color: #fffdf9;
+}
+
+.campaigns-detail button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@media (max-width: 900px) {
+  .campaigns-layout {
+    grid-template-columns: 1fr;
+  }
+}

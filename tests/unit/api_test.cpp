@@ -771,3 +771,93 @@ TEST_F(ApiDashTest, StreamServesSummaryEvents) {
   ::close(fd);
 #endif  // !_WIN32
 }
+
+// ---------------------------------------------------------------- D3 (§4.3)
+
+#include "api/campaign_json.hpp"
+
+TEST_F(ApiTest, CampaignProvidersReturnListAndDetail) {
+  // Fold one campaign record through the writer.
+  onion::log::Record record;
+  record.type = "CAMPAIGN";
+  record.payload = {{"id", "c1"},
+                    {"spec", {{"id", "c1"}, {"loop_budget", "100"}}},
+                    {"state", "running"}};
+  writer_->submit(onion::state::CommitTerminal{{record}});
+  writer_->sync();
+
+  const auto list = onion::api::campaign_json::list(*writer_);
+  ASSERT_TRUE(list.contains("items"));
+  ASSERT_EQ(list["items"].size(), 1u);
+  EXPECT_EQ(list["items"][0]["id"], "c1");
+  EXPECT_EQ(list["items"][0]["state"], "running");
+  EXPECT_TRUE(list["items"][0].contains("budget_used_usd"));
+
+  const auto detail = onion::api::campaign_json::detail(*writer_, "c1");
+  EXPECT_EQ(detail["id"], "c1");
+  EXPECT_TRUE(detail.contains("settles_by_end"));
+  EXPECT_TRUE(detail.contains("settles_per_level"));
+
+  const auto missing = onion::api::campaign_json::detail(*writer_, "nope");
+  EXPECT_EQ(missing["error"], "not found");
+}
+
+TEST_F(ApiTest, CampaignPlanReturnsAProjectionWithoutWrites) {
+  const auto plan = onion::api::campaign_json::plan(
+      *writer_,
+      nlohmann::json{{"id", "c9"}, {"scope", nlohmann::json::array()},
+                     {"loop_budget", 100}});
+  EXPECT_TRUE(plan.contains("projected"));
+  EXPECT_TRUE(plan.contains("report"));
+  EXPECT_GT(plan["projected"]["total_attempts"].get<std::int64_t>(), 0);
+  // Nothing was folded by a plan.
+  const auto list = onion::api::campaign_json::list(*writer_);
+  EXPECT_EQ(list["items"].size(), 0u);
+}
+
+TEST_F(ApiDashTest, CampaignWriteRoutesNeedTheFullGuard) {
+  server_->stop();
+  Server::Options options;
+  options.port = 0;
+  options.token = "test-token";
+  options.writer = writer_.get();
+  options.dashboard_auth = true;
+  options.campaign_action_json = [](std::string id, std::string action,
+                                    std::string body) {
+    (void)body;
+    return std::string("{\"op_id\":\"op-1-" + id + "-" + action + "\"}");
+  };
+  server_ = std::make_unique<Server>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(server_->start(&error)) << error;
+  port_ = server_->bound_port();
+  const std::string cookie = sign_in();
+  const std::string origin = "http://127.0.0.1:" + std::to_string(port_);
+
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}, {"Origin", origin},
+                              {"Content-Type", "application/json"}});
+  // No X-Onion-Request → 403.
+  auto refused = client.Post("/api/v1/campaigns/c1/pause", "{}",
+                             "application/json");
+  ASSERT_TRUE(refused);
+  EXPECT_EQ(refused->status, 403);
+
+  // Full guard + idempotency key → 202, and a repeat returns the SAME op.
+  client.set_default_headers({{"Cookie", cookie},
+                              {"Origin", origin},
+                              {"X-Onion-Request", "1"},
+                              {"Content-Type", "application/json"},
+                              {"Idempotency-Key", "k-1"}});
+  auto accepted = client.Post("/api/v1/campaigns/c1/pause", "{}",
+                              "application/json");
+  ASSERT_TRUE(accepted);
+  EXPECT_EQ(accepted->status, 202);
+  EXPECT_NE(accepted->body.find("op-1-c1-pause"), std::string::npos);
+
+  auto repeat = client.Post("/api/v1/campaigns/c1/pause", "{}",
+                            "application/json");
+  ASSERT_TRUE(repeat);
+  EXPECT_EQ(repeat->status, 202);
+  EXPECT_EQ(repeat->body, accepted->body);
+}

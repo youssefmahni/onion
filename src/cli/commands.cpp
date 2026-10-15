@@ -30,6 +30,7 @@
 
 #include "api/api.hpp"
 #include "api/alerts.hpp"
+#include "api/campaign_json.hpp"
 #include "api/control_json.hpp"
 #include "api/tree_json.hpp"
 #include "core/depot_core.hpp"
@@ -1659,6 +1660,201 @@ int node_cmd(int argc, char** argv) {
     return onion::api::control_json::spend_series(*metrics_store, range)
         .dump();
   };
+
+  // D3 campaigns (plan §4.1/§4.3). plan-before-start: the projection is
+  // returned first with a plan_id (valid 10 minutes); starting needs a
+  // recent plan_id for the SAME spec. Every action writes the same signed
+  // records the CLI writes (no new write paths), submits+syncs so the 202
+  // is true only once durable, and emits an `op` frame on the stream.
+  struct PlanTicket {
+    std::string spec_hash;
+    std::chrono::steady_clock::time_point expires;
+  };
+  std::mutex plan_mutex;
+  std::map<std::string, PlanTicket> plan_tickets;
+  std::atomic<std::uint64_t> op_counter{0};
+  const auto mint_op_id = [&]() {
+    return "op-" + std::to_string(++op_counter) + "-" +
+           onion::log::blake2b_hex(
+               std::to_string(std::chrono::steady_clock::now()
+                                  .time_since_epoch()
+                                  .count()))
+               .substr(0, 8);
+  };
+  const auto campaign_record = [&](std::string id, std::string state,
+                                   nlohmann::json spec) {
+    return make_record("CAMPAIGN", {{"id", id},
+                                    {"spec", spec},
+                                    {"state", state}});
+  };
+  onion::api::Server* server_ptr = nullptr;  // set after construction
+  api_options.campaign_list_json = [&]() {
+    return onion::api::campaign_json::list(*writer).dump();
+  };
+  api_options.campaign_detail_json = [&](std::string id) {
+    return onion::api::campaign_json::detail(*writer, std::move(id)).dump();
+  };
+  api_options.campaign_plan_json = [&](std::string body) {
+    const auto spec_json = nlohmann::json::parse(body, nullptr, false);
+    nlohmann::json result =
+        onion::api::campaign_json::plan(*writer, spec_json);
+    if (result.contains("error")) return result.dump();
+    std::string plan_id;
+    try {
+      plan_id = "plan-" + onion::log::blake2b_hex(
+                              onion::platform::secure_random(16))
+                              .substr(0, 16);
+    } catch (const std::exception&) {
+      return nlohmann::json{{"error", "cannot mint plan id"}}.dump();
+    }
+    {
+      std::lock_guard lock(plan_mutex);
+      plan_tickets[plan_id] = PlanTicket{
+          onion::log::blake2b_hex(spec_json.dump()),
+          std::chrono::steady_clock::now() + std::chrono::minutes(10)};
+    }
+    result["plan_id"] = plan_id;
+    return result.dump();
+  };
+  api_options.campaign_action_json =
+      [&](std::string id, std::string action, std::string body) {
+        nlohmann::json result;
+        nlohmann::json parsed = nlohmann::json::parse(body, nullptr, false);
+        if (parsed.is_discarded()) parsed = nlohmann::json::object();
+        const auto finish = [&](const std::string& op_id, bool applied) {
+          server_ptr->push_stream("op", nlohmann::json{{"op_id", op_id},
+                                                  {"status", applied
+                                                                 ? "applied"
+                                                                 : "rejected"}}
+                                       .dump());
+          return result.dump();
+        };
+
+        if (action == "start") {
+          // plan-before-start: a recent plan_id for the same spec.
+          const std::string plan_id = parsed.value("plan_id", "");
+          const auto spec_json = parsed.value("spec", nlohmann::json::object());
+          const std::string spec_hash =
+              onion::log::blake2b_hex(spec_json.dump());
+          {
+            std::lock_guard lock(plan_mutex);
+            const auto found = plan_tickets.find(plan_id);
+            if (found == plan_tickets.end() ||
+                found->second.spec_hash != spec_hash ||
+                std::chrono::steady_clock::now() > found->second.expires) {
+              result["error"] =
+                  "start requires a recent plan for this exact spec "
+                  "(POST /api/v1/campaigns/plan first)";
+              return result.dump();
+            }
+            plan_tickets.erase(found);
+          }
+          std::string parse_error;
+          const auto spec = onion::sched::parse_campaign(spec_json,
+                                                         &parse_error);
+          if (!spec) {
+            result["error"] =
+                parse_error.empty() ? "invalid spec" : parse_error;
+            return result.dump();
+          }
+          auto with_pools = *spec;
+          std::string pool_error;
+          with_pools.pools = onion::sched::compute_starting_pools(
+              *writer, *spec, &pool_error);
+          const std::string op_id = mint_op_id();
+          writer->submit(onion::state::CommitTerminal{{campaign_record(
+              with_pools.id, "running",
+              onion::sched::campaign_spec_json(with_pools))}});
+          writer->sync();
+          result["op_id"] = op_id;
+          return finish(op_id, true);
+        }
+
+        const auto existing = writer->campaign(id);
+        if (!existing) {
+          result["error"] = "campaign not found";
+          return result.dump();
+        }
+        nlohmann::json spec =
+            nlohmann::json::parse(existing->spec, nullptr, false);
+        if (spec.is_discarded()) spec = nlohmann::json::object();
+
+        if (action == "pause" || action == "resume") {
+          if (existing->state == "stopped") {
+            result["error"] = "campaign is stopped";
+            return result.dump();
+          }
+          const std::string target =
+              action == "pause" ? "paused" : "running";
+          const std::string op_id = mint_op_id();
+          writer->submit(onion::state::CommitTerminal{
+              {campaign_record(id, target, spec)}});
+          writer->sync();
+          result["op_id"] = op_id;
+          return finish(op_id, true);
+        }
+        if (action == "stop") {
+          // Typed confirmation, checked on the server (never only the UI).
+          if (parsed.value("confirm", "") != id) {
+            result["error"] = "stop needs \"confirm\": the campaign id";
+            return result.dump();
+          }
+          const std::string op_id = mint_op_id();
+          writer->submit(onion::state::CommitTerminal{
+              {campaign_record(id, "stopped", spec)}});
+          writer->sync();
+          result["op_id"] = op_id;
+          return finish(op_id, true);
+        }
+        if (action == "budget") {
+          const std::int64_t current =
+              spec.value("loop_budget", std::int64_t{0});
+          std::int64_t target_budget = current;
+          if (parsed.contains("add_attempts"))
+            target_budget = current + parsed["add_attempts"].get<std::int64_t>();
+          else if (parsed.contains("new_budget"))
+            target_budget = parsed["new_budget"].get<std::int64_t>();
+          const std::int64_t reserved = writer->reserved_total(id);
+          if (target_budget < reserved) {
+            result["error"] =
+                "budget would fall below the reserved " +
+                std::to_string(reserved);
+            return result.dump();
+          }
+          spec["loop_budget"] = target_budget;
+          const std::string op_id = mint_op_id();
+          writer->submit(onion::state::CommitTerminal{
+              {campaign_record(id, existing->state, spec)}});
+          writer->sync();
+          result["op_id"] = op_id;
+          return finish(op_id, true);
+        }
+        if (action == "settings") {
+          // The only mutable field today: loop_budget (the budget action
+          // is the blessed path; this PATCH exists for the other knobs as
+          // they land).
+          static const char* const kMutable[] = {"loop_budget"};
+          bool changed = false;
+          for (const char* key : kMutable) {
+            if (parsed.contains(key)) {
+              spec[key] = parsed[key];
+              changed = true;
+            }
+          }
+          if (!changed) {
+            result["error"] = "no mutable field in the patch";
+            return result.dump();
+          }
+          const std::string op_id = mint_op_id();
+          writer->submit(onion::state::CommitTerminal{
+              {campaign_record(id, existing->state, spec)}});
+          writer->sync();
+          result["op_id"] = op_id;
+          return finish(op_id, true);
+        }
+        result["error"] = "unknown campaign action";
+        return result.dump();
+      };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
   };
@@ -1690,6 +1886,7 @@ int node_cmd(int argc, char** argv) {
     stop_flag.store(true);
   };
   onion::api::Server server(std::move(api_options));
+  server_ptr = &server;
 
   if (!server.start(&error)) {
     std::cerr << error << "\n";

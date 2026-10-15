@@ -71,6 +71,15 @@ class Server {
     std::function<std::string(std::string range)> spend_json;
     // SSE stream of summary/alert/event/op frames (plan §4.2).
     bool stream_enabled{false};
+    // D3 campaign providers (absent hooks answer 404).
+    std::function<std::string()> campaign_list_json;
+    std::function<std::string(std::string id)> campaign_detail_json;
+    // plan-before-start: returns 200 + projection + plan_id (no writes).
+    std::function<std::string(std::string body)> campaign_plan_json;
+    // pause|resume|budget|settings|stop|start: returns 202 {op_id} JSON.
+    std::function<std::string(std::string id, std::string action,
+                              std::string body)>
+        campaign_action_json;
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;
@@ -97,6 +106,9 @@ class Server {
   // auth_code_ttl and works exactly once. Returns an empty string if the
   // OS CSPRNG fails; the caller prints the URL only on success.
   std::string issue_auth_code();
+
+  // Pushes one SSE frame to every stream subscriber (op events, D3+).
+  void push_stream(std::string event, std::string data);
 
  private:
   struct Impl;

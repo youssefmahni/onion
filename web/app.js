@@ -11,7 +11,7 @@ const root = document.getElementById("screen");
 
 const SCREEN_DEFS = [
   ["control", "Control center", ""],
-  ["campaigns", "Campaigns", "List, details, projection, plan-before-start. (arrives in D3)"],
+  ["campaigns", "Campaigns", ""],
   ["fleet", "Fleet", "Members, lanes, invitations, evictions. (arrives in D5)"],
   ["review", "Review queue", "Items by reason, attempts, accept/retry/leaf. (arrives in D4)"],
 ];
@@ -47,6 +47,9 @@ function route() {
   switch (screen) {
     case "control":
       render(preact.h(ControlScreen, null));
+      break;
+    case "campaigns":
+      render(preact.h(CampaignsScreen, null));
       break;
     case "tree": {
       const path = rest ? decodeURIComponent(rest) : "";

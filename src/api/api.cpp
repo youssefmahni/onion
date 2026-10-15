@@ -53,6 +53,7 @@ struct Server::Impl {
   std::mutex stream_mutex;
   std::vector<std::weak_ptr<Subscriber>> subscribers;
   std::int64_t stream_event_seq{0};
+  std::map<std::string, std::pair<int, std::string>> idempotent;
   std::thread stream_thread;
   std::atomic<bool> stream_running{false};
 };
@@ -501,6 +502,67 @@ bool Server::start(std::string* error) {
                                                 httplib::Response& response) {
     return tree_guard(request, response);
   };
+  // §5.3: mutating /api/v1 requests need session/token + the dashboard's
+  // own Origin + X-Onion-Request + JSON, plus an Idempotency-Key whose
+  // repeats return the stored first response.
+  const auto authorized_v1 = [this](const httplib::Request& request,
+                                    httplib::Response& response) -> bool {
+    set_csp(response);
+    if (!authenticated(request)) {
+      response.status = 401;
+      response.set_content("{\"error\":\"not authenticated\"}",
+                           "application/json");
+      return false;
+    }
+    const std::string expected = "http://127.0.0.1:" +
+                                 std::to_string(impl_->port.load());
+    if (!request.has_header("Origin") ||
+        request.get_header_value("Origin") != expected) {
+      response.status = 403;
+      response.set_content("{\"error\":\"foreign origin\"}",
+                           "application/json");
+      return false;
+    }
+    if (!request.has_header("X-Onion-Request") ||
+        request.get_header_value("X-Onion-Request") != "1") {
+      response.status = 403;
+      response.set_content("{\"error\":\"missing X-Onion-Request\"}",
+                           "application/json");
+      return false;
+    }
+    const std::string content_type =
+        request.has_header("Content-Type")
+            ? request.get_header_value("Content-Type")
+            : std::string{};
+    if (content_type.find("application/json") == std::string::npos) {
+      response.status = 415;
+      response.set_content("{\"error\":\"content type must be application/json\"}",
+                           "application/json");
+      return false;
+    }
+    if (request.has_header("Idempotency-Key") &&
+        !request.get_header_value("Idempotency-Key").empty()) {
+      const std::string key = request.get_header_value("Idempotency-Key");
+      std::lock_guard lock(impl_->auth_mutex);
+      const auto found = impl_->idempotent.find(key);
+      if (found != impl_->idempotent.end()) {
+        response.status = found->second.first;
+        response.set_content(found->second.second, "application/json");
+        return false;  // handled: the caller must not run the action
+      }
+    }
+    return true;
+  };
+  const auto record_idempotent = [this](const httplib::Request& request,
+                                        int status, const std::string& body) {
+    if (!request.has_header("Idempotency-Key")) return;
+    const std::string key = request.get_header_value("Idempotency-Key");
+    if (key.empty()) return;
+    std::lock_guard lock(impl_->auth_mutex);
+    impl_->idempotent[key] = {status, body};
+    while (impl_->idempotent.size() > 1000) impl_->idempotent.erase(
+        impl_->idempotent.begin());
+  };
   const auto control_get =
       [this, control_guard](const char* path,
                             std::function<std::string()> provider) {
@@ -627,6 +689,134 @@ bool Server::start(std::string* error) {
           return true;
         });
   });
+
+  // D3 campaigns (plan §4.1/§4.3): reads and plan-before-start actions.
+  impl_->server->Get("/api/v1/campaigns",
+                     [this, control_guard](const httplib::Request& request,
+                                           httplib::Response& response) {
+    if (!control_guard(request, response)) return;
+    if (!impl_->options.campaign_list_json) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no provider\"}",
+                           "application/json");
+      return;
+    }
+    try {
+      response.set_content(impl_->options.campaign_list_json(),
+                           "application/json");
+    } catch (const std::exception& exception) {
+      response.status = 500;
+      response.set_content(
+          std::string("{\"error\":\"") + exception.what() + "\"}",
+          "application/json");
+    }
+  });
+  impl_->server->Get(
+      R"(/api/v1/campaigns/(.+))",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.campaign_detail_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        const std::string id = request.matches[1].str();
+        try {
+          response.set_content(impl_->options.campaign_detail_json(id),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Post(
+      "/api/v1/campaigns/plan",
+      [this, authorized_v1](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.campaign_plan_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.campaign_plan_json(request.body),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  const auto campaign_action_route =
+      [this, authorized_v1, record_idempotent](
+          const std::string& path, const std::string& action) {
+        impl_->server->Post(
+            path,
+            [this, authorized_v1, record_idempotent, action](
+                const httplib::Request& request, httplib::Response& response) {
+              if (!authorized_v1(request, response)) return;
+              if (!impl_->options.campaign_action_json) {
+                response.status = 404;
+                response.set_content("{\"error\":\"no provider\"}",
+                                     "application/json");
+                return;
+              }
+              const std::string id =
+                  request.matches.empty()
+                      ? std::string{}
+                      : request.matches[1].str();
+              try {
+                const std::string body =
+                    impl_->options.campaign_action_json(id, action,
+                                                        request.body);
+                record_idempotent(request, 202, body);
+                response.status = 202;
+                response.set_content(body, "application/json");
+              } catch (const std::exception& exception) {
+                response.status = 500;
+                response.set_content(
+                    std::string("{\"error\":\"") + exception.what() +
+                        "\"}",
+                    "application/json");
+              }
+            });
+      };
+  impl_->server->Post(
+      "/api/v1/campaigns",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.campaign_action_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body = impl_->options.campaign_action_json(
+              "", "start", request.body);
+          record_idempotent(request, 202, body);
+          response.status = 202;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  campaign_action_route(R"(/api/v1/campaigns/(.+)/pause)", "pause");
+  campaign_action_route(R"(/api/v1/campaigns/(.+)/resume)", "resume");
+  campaign_action_route(R"(/api/v1/campaigns/(.+)/budget)", "budget");
+  campaign_action_route(R"(/api/v1/campaigns/(.+)/settings)", "settings");
+  campaign_action_route(R"(/api/v1/campaigns/(.+)/stop)", "stop");
 
   impl_->server->Get("/", serve_static);
   impl_->server->Get(R"(/(.+))", serve_static);
@@ -847,6 +1037,28 @@ void Server::stop() {
   impl_->running.store(false);
   if (impl_->server) impl_->server->stop();
   if (impl_->thread.joinable()) impl_->thread.join();
+}
+
+void Server::push_stream(std::string event, std::string data) {
+  if (!impl_->stream_running.load()) return;
+  std::vector<std::shared_ptr<Impl::Subscriber>> live;
+  {
+    std::lock_guard lock(impl_->stream_mutex);
+    for (auto& weak : impl_->subscribers)
+      if (auto sub = weak.lock()) live.push_back(sub);
+  }
+  const std::string frame =
+      "event: " + event + "\ndata: " + data + "\n\n";
+  for (const auto& sub : live) {
+    std::lock_guard lock(sub->mutex);
+    if (sub->closed) continue;
+    if (sub->frames.size() < 64) {
+      sub->frames.push_back(frame);
+      sub->cv.notify_all();
+    } else {
+      sub->closed = true;
+    }
+  }
 }
 
 int Server::bound_port() const { return impl_->port.load(); }
