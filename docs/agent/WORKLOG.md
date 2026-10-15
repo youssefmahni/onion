@@ -1,4 +1,33 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D2 · control center done locally (GitHub deferred by owner)
+
+Result: complete on `dash/d2-control` (23ba6fa, stacked on d1; no GitHub
+operations per the owner).
+Evidence:
+- Exit criteria met: live numbers update within 3 s (SSE summary every
+  2 s — verified in the browser, "last sync 30 s ago" -> "36 s ago" over
+  7 s); each §4.4 alert raised AND cleared in unit tests (churn pause,
+  forks, budget, SUSPECT/DEAD members, sync lag, disk<10%, review
+  backlog, breaker).
+- metrics.db (§6.3): 30 s sampler (rowid deltas + client in-flight +
+  profile limit, 7-day retention), spend hour buckets split peak/off-peak
+  per the price schedule, 10k-event activity ring from the fold hook.
+- /api/v1/summary|alerts|events|metrics/speed|metrics/spend + GET
+  /api/v1/stream (SSE hub with backpressure drops); all guarded.
+- Screen 1 with uPlot charts (speed + spend, range switches), alert
+  actions, campaign/fleet tables, recent activity; zero console errors.
+- Fixed en route: D2 routes were swallowed by the D1 static catch-all
+  (registered before it now); metrics store decl was scattered by a bad
+  merge-edit (commands.cpp restored + rewired); platform::disk_total_gb
+  added so the disk alert uses the real volume; Statement::bind_double
+  named overload (int ambiguity).
+- p95_ms/errors in the speed series remain 0 until D3 plumbs a latency
+  feed — documented deviation.
+- Tests local: api 31/31, metrics 4/4, viewcache 4/4, state 35/35,
+  platform 12/12, store 10/10, sched/log/gate/sync/swim green.
+Next step: owner merges PR #53 (D1) then the D2 branch; D3 (campaigns
+reads/actions, plan-before-start, latency feed for p95, screen 2).
+
 ## 2026-10-15 · dashboard D1 · FINAL (local) — owner deferred the GitHub merge
 
 Result: D1 complete locally on `dash/d1-tree` (head 86b842f, committed,
