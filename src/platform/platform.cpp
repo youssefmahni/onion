@@ -10,6 +10,7 @@
 #include <iterator>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@
 #include <iphlpapi.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -512,6 +514,32 @@ std::string os_name() {
 #else
   return "linux";
 #endif
+}
+
+std::string secure_random(std::size_t bytes) {
+  std::string out(bytes, '\0');
+#ifdef _WIN32
+  if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(out.data()),
+                      static_cast<ULONG>(bytes),
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+    throw std::runtime_error("secure_random: BCryptGenRandom failed");
+#else
+  const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    throw std::runtime_error("secure_random: cannot open /dev/urandom");
+  std::size_t done = 0;
+  while (done < bytes) {
+    const ssize_t read_count =
+        ::read(fd, out.data() + done, bytes - done);
+    if (read_count <= 0) {
+      ::close(fd);
+      throw std::runtime_error("secure_random: read failed");
+    }
+    done += static_cast<std::size_t>(read_count);
+  }
+  ::close(fd);
+#endif
+  return out;
 }
 
 std::optional<double> total_ram_gb() {

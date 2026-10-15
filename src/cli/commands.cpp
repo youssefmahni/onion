@@ -40,6 +40,11 @@
 #include "state/state.hpp"
 #include "store/store.hpp"
 
+// The build-time embedded web assets (generated web_assets.cpp, plan §3.1).
+namespace onion::cli {
+const std::map<std::string, onion::api::StaticFile>& web_assets();
+}
+
 namespace {
 
 using nlohmann::json;
@@ -923,6 +928,28 @@ int node_cmd(int argc, char** argv) {
   std::unique_ptr<onion::sync::SyncServer> sync_server;
   const std::string members_path = flag(argc, argv, "--members", "");
   const std::string self_host = flag(argc, argv, "--host", "127.0.0.1");
+  // Decision 0026: the dashboard HTTP surface binds loopback by default.
+  // A non-loopback host needs --allow-remote-dashboard (with a warning);
+  // remote use otherwise goes through an SSH tunnel.
+  const bool allow_remote_dashboard =
+      has_flag(argc, argv, "--allow-remote-dashboard");
+  const bool loopback_host =
+      self_host == "127.0.0.1" || self_host == "localhost" ||
+      self_host == "::1" || self_host == "[::1]";
+  if (!loopback_host && !allow_remote_dashboard) {
+    std::cerr << "--host " << self_host << " would expose the control "
+                 "dashboard to the network. Refusing to bind; either pass "
+                 "--allow-remote-dashboard (the dashboard is then reachable "
+                 "by anyone who can reach the port) or keep the loopback "
+                 "default and use an SSH tunnel:\n"
+                 "  ssh -L 8080:127.0.0.1:8080 <host>\n";
+    return 2;
+  }
+  if (!loopback_host) {
+    std::cerr << "warning: --allow-remote-dashboard exposes the control "
+                 "dashboard on " << self_host << "; anyone who can reach "
+                 "the port and obtain the sign-in code controls this node\n";
+  }
   const int self_sync_port = std::atoi(flag(argc, argv, "--sync-port", "7947").c_str());
   const int self_swim_port =
       parse_port(flag(argc, argv, "--swim-port", "7946"), 7946);
@@ -1198,57 +1225,71 @@ int node_cmd(int argc, char** argv) {
   std::atomic<bool> sync_stop{false};
   std::thread sync_thread;
 
-  onion::api::Server server(
-      {api_port,
-       token,
-       load_file(std::filesystem::path(ONION_WEB_DIR) / "dashboard.html"),
-       writer.get(),
-       [&]() {
-         bool running = !stop_flag.load();
-         std::vector<onion::sched::LaneMember> lanes;
-         {
-           std::lock_guard fleet_lock(fleet_mutex);
-           lanes = lane_members;
-         }
-         return state_json(*writer, api_port, &running, lanes,
-                           sync_rounds_completed.load()).dump();
-       },
-       [&](std::string id, std::string) {
-         return campaign_action(std::move(id), "paused");
-       },
-       [&](std::string id, std::string) {
-         return campaign_action(std::move(id), "running");
-       },
-       [&](std::string id, std::string) {
-         return campaign_action(std::move(id), "stopped");
-       },
-       [&](std::string path, std::string) {
-         return review_action(std::move(path), "accept");
-       },
-       [&](std::string path, std::string) {
-         return review_action(std::move(path), "retry");
-       },
-       [&](std::string path, std::string) {
-         return review_action(std::move(path), "reject");
-       },
-       // Operator-forced checkpoint (the fleet repair, WORKLOG 2026-10-15):
-       // write it on the writer thread, then wait for the queue to drain so
-       // the response is true only once durable.
-       [&](std::string, std::string) {
-         writer->submit(onion::state::WriteCheckpoint{});
-         writer->sync();
-         return true;
-       },
-       [&](bool leave) {
-         leave_requested.store(leave);
-         stop_flag.store(true);
-       }});
+  onion::api::Server::Options api_options;
+  api_options.port = api_port;
+  api_options.host = self_host;
+  api_options.token = token;
+  api_options.dashboard_html =
+      load_file(std::filesystem::path(ONION_WEB_DIR) / "dashboard.html");
+  api_options.writer = writer.get();
+  api_options.dashboard_auth = true;
+  api_options.static_files = onion::cli::web_assets();
+  api_options.state_json = [&]() {
+    bool running = !stop_flag.load();
+    std::vector<onion::sched::LaneMember> lanes;
+    {
+      std::lock_guard fleet_lock(fleet_mutex);
+      lanes = lane_members;
+    }
+    return state_json(*writer, api_port, &running, lanes,
+                      sync_rounds_completed.load()).dump();
+  };
+  api_options.campaign_pause = [&](std::string id, std::string) {
+    return campaign_action(std::move(id), "paused");
+  };
+  api_options.campaign_resume = [&](std::string id, std::string) {
+    return campaign_action(std::move(id), "running");
+  };
+  api_options.campaign_stop = [&](std::string id, std::string) {
+    return campaign_action(std::move(id), "stopped");
+  };
+  api_options.review_accept = [&](std::string path, std::string) {
+    return review_action(std::move(path), "accept");
+  };
+  api_options.review_retry = [&](std::string path, std::string) {
+    return review_action(std::move(path), "retry");
+  };
+  api_options.review_reject = [&](std::string path, std::string) {
+    return review_action(std::move(path), "reject");
+  };
+  // Operator-forced checkpoint (the fleet repair, WORKLOG 2026-10-15):
+  // write it on the writer thread, then wait for the queue to drain so
+  // the response is true only once durable.
+  api_options.force_checkpoint = [&](std::string, std::string) {
+    writer->submit(onion::state::WriteCheckpoint{});
+    writer->sync();
+    return true;
+  };
+  api_options.stop_node = [&](bool leave) {
+    leave_requested.store(leave);
+    stop_flag.store(true);
+  };
+  onion::api::Server server(std::move(api_options));
+
   if (!server.start(&error)) {
     std::cerr << error << "\n";
     return 1;
   }
   std::cout << "node listening on 127.0.0.1:" << server.bound_port()
             << " data=" << dir << "\n";
+  // §5.1: the one-time sign-in code for the dashboard (valid 2 minutes,
+  // one shot). The sync server and scripts keep using the device token.
+  const std::string auth_code = server.issue_auth_code();
+  if (!auth_code.empty()) {
+    std::cout << "dashboard: http://127.0.0.1:" << server.bound_port()
+              << "/auth?code=" << auth_code << "  (one-time, valid 2 min; "
+                 "or run 'data_depot dashboard' for a fresh code)\n";
+  }
 
   // M7: the device's reachable addresses, written once per run into the
   // log (the deterministic discovery channel — gossip refreshes between
@@ -2116,5 +2157,46 @@ int admin_cmd(int argc, char** argv) {
 #endif
   std::cout << "public key: " << file["public_key_hex"].get<std::string>() << "\n";
   std::cout << "keep this file offline, outside every machine's data directory\n";
+  return 0;
+}
+
+// `data_depot dashboard` (plan §5.1): ask the running node for a fresh
+// one-time sign-in code over the device-token channel and print the URL.
+int dashboard_cmd(int argc, char** argv) {
+  const int port = parse_port(flag(argc, argv, "--api-port", "8080"), 8080);
+  const std::filesystem::path dir = data_dir_arg(argc, argv);
+  onion::platform::KeyStore store(dir / "keys");
+  const std::string token = api_token(store);
+  httplib::Client client(
+      ("http://127.0.0.1:" + std::to_string(port)).c_str());
+  client.set_connection_timeout(3, 0);
+  client.set_read_timeout(5, 0);
+  const httplib::Headers headers = {
+      {"X-Onion-Token", token},
+      {"Origin", "http://127.0.0.1:" + std::to_string(port)},
+      {"Content-Type", "application/json"}};
+  const auto response =
+      client.Post("/api/dashboard/auth-code", headers, "{}",
+                  "application/json");
+  if (!response) {
+    std::cerr << "no running node answered on port " << port << "\n";
+    return 1;
+  }
+  if (response->status == 409) {
+    std::cerr << "this node does not serve the dashboard (old binary?)\n";
+    return 1;
+  }
+  if (response->status != 200) {
+    std::cerr << "the node refused the request (status " << response->status
+              << ")\n";
+    return 1;
+  }
+  const auto body = nlohmann::json::parse(response->body, nullptr, false);
+  if (body.is_discarded() || !body.contains("url")) {
+    std::cerr << "unexpected response from the node\n";
+    return 1;
+  }
+  std::cout << "dashboard (one-time, valid 2 minutes):\n  "
+            << body["url"].get<std::string>() << "\n";
   return 0;
 }

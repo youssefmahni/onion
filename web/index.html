@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Onion — Control dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="shell-header">
+    <a class="brand" href="#/control">Onion</a>
+    <nav aria-label="Main">
+      <a href="#/control" data-nav="control">Control</a>
+      <a href="#/campaigns" data-nav="campaigns">Campaigns</a>
+      <a href="#/fleet" data-nav="fleet">Fleet</a>
+      <a href="#/review" data-nav="review">Review</a>
+      <a href="#/tree/" data-nav="tree">Tree</a>
+      <a href="#/search" data-nav="search">Search</a>
+      <a href="#/stats" data-nav="stats">Stats</a>
+    </nav>
+    <span id="conn" class="conn" role="status" aria-live="polite"></span>
+  </header>
+  <main id="screen" class="screen" tabindex="-1"></main>
+  <footer class="shell-footer">
+    <span id="version"></span>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>

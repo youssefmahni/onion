@@ -393,12 +393,13 @@ int llm_main(int argc, char** argv) {
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr
-        << "usage: data_depot llm|node|campaign|review|dev-import|export-csv ...\n";
+        << "usage: data_depot llm|node|dashboard|campaign|review|dev-import|export-csv ...\n";
     return 2;
   }
   const std::string command(argv[1]);
   if (command == "llm") return llm_main(argc, argv);
   if (command == "node") return node_cmd(argc, argv);
+  if (command == "dashboard") return dashboard_cmd(argc, argv);
   if (command == "campaign") return campaign_cmd(argc, argv);
   if (command == "review") return review_cmd(argc, argv);
   if (command == "dev-import") return dev_import_cmd(argc, argv);

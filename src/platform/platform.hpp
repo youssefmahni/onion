@@ -52,6 +52,11 @@ std::optional<double> total_ram_gb();
 std::optional<double> disk_free_gb(const std::filesystem::path& path);
 std::optional<double> link_speed_mbps();     // the default-route interface
 
+// Cryptographically secure random bytes from the OS CSPRNG (/dev/urandom on
+// POSIX, BCryptGenRandom on Windows). Throws std::runtime_error if the OS
+// source cannot be read.
+std::string secure_random(std::size_t bytes);
+
 // Raises the Unix soft descriptor limit to the hard limit where permitted, then
 // returns the usable number of simultaneous outbound requests (64 descriptors
 // remain reserved for logs, listeners, and other engine resources).
