@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   hlc       INTEGER NOT NULL,
   tombstone INTEGER NOT NULL DEFAULT 0,
   source    TEXT NOT NULL DEFAULT '',
-  tree      TEXT NOT NULL DEFAULT ''
+  tree      TEXT NOT NULL DEFAULT '',
+  sibling_order INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
 CREATE TABLE IF NOT EXISTS settles   (path TEXT PRIMARY KEY, kept INT, atomic INT, attempts INT, score TEXT,
@@ -84,6 +85,20 @@ bool has_checkpoint_summaries(sqlite3* handle) {
   const bool exists = sqlite3_step(statement) == SQLITE_ROW;
   sqlite3_finalize(statement);
   return exists;
+}
+
+bool add_column_if_missing(sqlite3* handle, const char* statement,
+                           std::string_view description,
+                           std::string* error) {
+  char* errmsg = nullptr;
+  if (sqlite3_exec(handle, statement, nullptr, nullptr, &errmsg) == SQLITE_OK)
+    return true;
+  const bool duplicate =
+      errmsg != nullptr && std::strstr(errmsg, "duplicate column") != nullptr;
+  sqlite3_free(errmsg);
+  if (duplicate) return true;
+  set_error(error, handle, description);
+  return false;
 }
 
 }  // namespace
@@ -299,12 +314,36 @@ bool Db::open(std::string* error) {
   sqlite3_exec(handle_,
                "ALTER TABLE campaigns ADD COLUMN reason TEXT;",
                nullptr, nullptr, nullptr);
-  // Decision 0027: nodes carry their source ("import" | "engine") and
-  // their domain tree (empty = planning).
-  sqlite3_exec(handle_,
-               "ALTER TABLE nodes ADD COLUMN source TEXT; "
-               "ALTER TABLE nodes ADD COLUMN tree TEXT NOT NULL DEFAULT '';",
-               nullptr, nullptr, nullptr);
+  // Decision 0027 / 0029: nodes carry their source, domain tree, and an
+  // explicit order where their profile requires ordered children.  Each
+  // column must migrate independently: SQLite stops a multi-statement ALTER
+  // batch at the first already-present column.
+  if (!add_column_if_missing(handle_, "ALTER TABLE nodes ADD COLUMN source TEXT;",
+                             "cannot migrate nodes.source", error) ||
+      !add_column_if_missing(handle_,
+                             "ALTER TABLE nodes ADD COLUMN tree TEXT NOT NULL "
+                             "DEFAULT '';",
+                             "cannot migrate nodes.tree", error) ||
+      !add_column_if_missing(
+          handle_, "ALTER TABLE nodes ADD COLUMN sibling_order INTEGER NOT "
+                   "NULL DEFAULT -1;",
+          "cannot migrate nodes.sibling_order", error))
+    return false;
+  // The earlier additive migrations did not bump the schema stamp. The
+  // column is idempotently present after the ALTER above, so every known
+  // older database can advance to the v2 ordered-child schema.
+  {
+    std::optional<Statement> stamp = prepare(
+        "UPDATE schema_version SET version=?1 WHERE version < ?1;", error);
+    if (!stamp) return false;
+    std::string stamp_error;
+    if (!stamp->bind(1, static_cast<std::int64_t>(kSchemaVersion),
+                     &stamp_error) ||
+        stamp->step(&stamp_error) || !stamp_error.empty()) {
+      set_error(error, handle_, "cannot stamp schema version");
+      return false;
+    }
+  }
   {
     std::optional<Statement> maybe = prepare(
         "INSERT INTO schema_version(version) SELECT ? WHERE NOT EXISTS "
@@ -375,12 +414,49 @@ Node read_node(Statement& stmt) {
   node.tombstone = stmt.integer_int(8);
   node.source = stmt.text(9);
   node.tree = stmt.text(10);
+  node.sibling_order = stmt.integer_int(11);
   return node;
 }
 
 constexpr const char* kNodeColumns =
     "id, code, path, parent_id, layer, title, origin, hlc, tombstone, "
-    "source, tree";
+    "source, tree, sibling_order";
+
+// Decision 0029: nodes that carry an explicit order are listed under their
+// parent path by that order (a procedure's steps stay in execution order).
+// Rows without one keep the plain path order the query already produced, and
+// a set with no ordered row is not touched at all, so every planning listing
+// stays exactly as it was.
+void apply_sibling_order(std::vector<Node>* nodes) {
+  if (std::none_of(nodes->begin(), nodes->end(),
+                   [](const Node& node) { return node.sibling_order >= 0; }))
+    return;
+  std::vector<std::pair<std::string, std::size_t>> keyed;
+  keyed.reserve(nodes->size());
+  for (std::size_t i = 0; i < nodes->size(); ++i) {
+    const Node& node = (*nodes)[i];
+    if (node.sibling_order < 0) {
+      keyed.emplace_back(node.path, i);
+      continue;
+    }
+    const std::size_t dash = node.path.rfind('-');
+    char order[16];
+    std::snprintf(order, sizeof(order), "%07d", node.sibling_order);
+    keyed.emplace_back(
+        (dash == std::string::npos ? std::string{}
+                                   : node.path.substr(0, dash + 1)) + order,
+        i);
+  }
+  std::stable_sort(keyed.begin(), keyed.end(),
+                   [](const auto& a, const auto& b) {
+                     return a.first < b.first;
+                   });
+  std::vector<Node> sorted;
+  sorted.reserve(nodes->size());
+  for (const auto& [key, index] : keyed)
+    sorted.push_back(std::move((*nodes)[index]));
+  *nodes = std::move(sorted);
+}
 
 }  // namespace
 
@@ -431,14 +507,17 @@ std::vector<Node> Db::nodes_at_layer(int layer, std::string* error,
       error);
   if (!stmt) return {};
   std::string step_error;
+  const std::string tree_value(tree == kPlanningTreeFilter ? std::string_view{}
+                                                           : tree);
   if (!stmt->bind(1, static_cast<std::int64_t>(layer), &step_error) ||
-      (filter_tree && !stmt->bind(2, std::string(tree), &step_error))) {
+      (filter_tree && !stmt->bind(2, tree_value, &step_error))) {
     set_error(error, handle_, "layer bind failed");
     return {};
   }
   std::vector<Node> nodes;
   while (stmt->step_row(&step_error)) nodes.push_back(read_node(*stmt));
   if (!step_error.empty()) set_error(error, handle_, "layer query failed");
+  apply_sibling_order(&nodes);
   return nodes;
 }
 
@@ -686,6 +765,34 @@ bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
     set_error(error, nullptr, "cannot create export directory");
     return false;
   }
+  // Decision 0029: the sibling_order column is written only when an
+  // exported node carries an explicit order, so a planning export keeps its
+  // original columns byte for byte (the dev-import accepts both shapes).
+  bool ordered = false;
+  {
+    // Same scope as the rows below: the exported layers and the tree filter.
+    std::optional<Statement> probe = prepare(
+        std::string("SELECT 1 FROM nodes WHERE sibling_order >= 0 AND "
+                    "tombstone = 0 AND layer <= ?1") +
+            (tree.empty() ? "" : " AND tree = ?2") + " LIMIT 1;",
+        error);
+    if (!probe) return false;
+    std::string probe_error;
+    const std::string probe_tree(tree == kPlanningTreeFilter
+                                     ? std::string_view{}
+                                     : tree);
+    if (!probe->bind(1, static_cast<std::int64_t>(std::min(max_layer, 9)),
+                     &probe_error) ||
+        (!tree.empty() && !probe->bind(2, probe_tree, &probe_error))) {
+      set_error(error, handle_, "export probe bind failed");
+      return false;
+    }
+    ordered = probe->step_row(&probe_error);
+    if (!probe_error.empty()) {
+      set_error(error, handle_, "export probe failed");
+      return false;
+    }
+  }
   for (int layer = 0; layer <= max_layer && layer <= 9; ++layer) {
     std::vector<Node> nodes = nodes_at_layer(layer, error, tree);
     if (!error->empty()) return false;
@@ -696,16 +803,21 @@ bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
       set_error(error, nullptr, "cannot write export file");
       return false;
     }
+    const auto order_suffix = [&](const Node& node) {
+      return ordered ? "," + std::to_string(node.sibling_order)
+                     : std::string{};
+    };
     if (layer == 0) {
-      out << "code,title\n";
+      out << "code,title" << (ordered ? ",sibling_order" : "") << "\n";
       for (const Node& node : nodes) {
-        out << node.code << "," << csv_field(node.title) << "\n";
+        out << node.code << "," << csv_field(node.title)
+            << order_suffix(node) << "\n";
       }
     } else {
-      out << "code,path,title\n";
+      out << "code,path,title" << (ordered ? ",sibling_order" : "") << "\n";
       for (const Node& node : nodes) {
         out << node.code << "," << csv_field(node.path) << ","
-            << csv_field(node.title) << "\n";
+            << csv_field(node.title) << order_suffix(node) << "\n";
       }
     }
   }

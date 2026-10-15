@@ -214,6 +214,19 @@ The profile carries nothing that identifies the machine beyond what the fleet ne
 
 **A wrong profile** (a bug or a bad override) only changes that device's own share. The speed factor and the quality guard correct it within minutes.
 
+## Domain profiles
+
+A *domain profile* (decisions 0027 and 0029) is the knowledge domain's contract, and is a different thing from a member profile. One signed `PROFILE` record per tree is distributed with the log, stored content-addressed (blake2b over its canonical JSON), and a campaign record carries its hash; a device that does not hold that exact profile pauses the campaign. The embedded **planning profile** has none of the rich fields below, keeps its original canonical form and hash, and is the default: every planning behaviour is unchanged.
+
+A non-planning profile (`docs/react.domain-profile.json` is the first) declares:
+
+- **Levels.** `levels.max` is the deepest level (a node there is closed as a leaf without a call); `definitions[]` give each level a name, `children_are` guidance, an optional child range `{min, max}` and an `ordered_children` flag. A level deeper than the last definition repeats it up to `max`. A range or an order is rejected where the children are imported.
+- **Style levels.** `style_levels[]` bind title rules (word and character limits, capitalisation, punctuation set, code spans, emoji, trailing period) to levels. The gate enforces every mechanically checkable rule in code and renders the same rules into `{title_rules}`, so the prompt and the checks cannot disagree. A semantic `shape` is prompt text only.
+- **Prompts.** All seven stage templates, using only the placeholders each stage is given; JSON output formats stay in code.
+- **Structure.** Which layers need the structure permission, which are imported, and the depth from which the light funnel runs.
+
+A profile is validated strictly when it is loaded (when it is published, folded, or read by the converter): unknown fields, wrong types, unknown or missing placeholders, ranges on imported levels, style rules for levels the engine never generates, layers past `levels.max`, and oversized documents are refused. The profile's per-level child range replaces the campaign's generic target for that ticket, including the exhausted-attempts floor.
+
 ## Storage
 
 Log segment files are the source of truth and the unit of sync; SQLite is the local store every component reads; CSVs and Parquet are exports only. All of it lives in the OS data directory from the platform layer.
@@ -244,7 +257,10 @@ CREATE TABLE nodes (
   title     TEXT NOT NULL,
   origin    TEXT NOT NULL,         -- device_id
   hlc       INTEGER NOT NULL,      -- hybrid logical clock of the winning write
-  tombstone INTEGER NOT NULL DEFAULT 0
+  tombstone INTEGER NOT NULL DEFAULT 0,
+  source    TEXT NOT NULL DEFAULT '', -- import or engine
+  tree      TEXT NOT NULL DEFAULT '', -- empty is the planning tree
+  sibling_order INTEGER NOT NULL DEFAULT -1 -- ordered profile children; -1 is legacy
 );
 CREATE INDEX nodes_parent ON nodes(parent_id);
 CREATE TABLE settles   (path TEXT PRIMARY KEY, kept INT, atomic INT, attempts INT, score TEXT,
@@ -302,10 +318,10 @@ Every state change is a record. All records of one commit go into one signed, ha
 | `CLAIM` | path, lease length, renewal count | A device stealing a ticket from another lane |
 | `REEXPAND` | path, reason | A review retry or forced re-run of a settled node |
 | `ATTEMPT` | path, attempt number, score, checks passed, input / cached / output tokens, cost, campaign, issues (at most 1,000 characters) | Every attempt, kept or discarded |
-| `ADD_NODE` | path, layer, title, legacy? | Commit of the accepted attempt, ingest, genesis import |
+| `ADD_NODE` | path, layer, title, source?, tree?, sibling_order? | Commit of the accepted attempt, ingest, genesis import |
 | `CRITIQUE` | path, score, issues, remove[], add[] | Commit of the accepted attempt |
 | `ATOMIC` | path, verified | Commit of the accepted attempt |
-| `SETTLE` | path, kept, atomic, attempts, score, end (children, cannot split, allowance spent), campaign | Commit, always last in its batch |
+| `SETTLE` | path, kept, atomic, attempts, score, end (children, cannot split, allowance spent, profile depth limit), campaign | Commit, always last in its batch |
 | `NEEDS_REVIEW` | path, reason (below floor, structure work, depth checkpoint) | A worker or the scheduler, instead of `SETTLE` |
 | `REVIEW` | path, decision (accept, retry, reject), note | You, from any device |
 | `RETITLE` | path, title | `llm` sweep (lane owner), ingest merges |
@@ -407,7 +423,8 @@ You tell the whole fleet what to build with a signed `CAMPAIGN` record, created 
 | Light funnel | Depth from which a lighter funnel runs (2 to 3 aspects, one trim) | L8 |
 | Critic model | Model for the critique agent | same as Model |
 | Auto-accept reviews | Accept review items left untouched for N days (optional) | off |
-| Structure | Whether nodes at L1 to L3 may be expanded (always reviewed) | no |
+| Structure | Profile-defined levels that may be expanded (always reviewed) | no |
+| Review all | Send every accepted child set to review instead of auto-settling | off |
 | Spillover | Whether devices with budget take over tickets of devices without | allowed |
 | Model | DeepSeek model id | `deepseek-flash` |
 
@@ -458,7 +475,11 @@ The `+ 0.5` keeps `h` strictly between 0 and 1, so the logarithm is always defin
 
 **New children.** After a commit, the device pushes each new non-atomic child straight to its lane owner, so the next level starts at once instead of waiting for the 15 s sync round.
 
-**Structure work.** Expanding an L1, L2 or L3 node creates tasks, sub-tasks or TDs. It runs only when the campaign allows it, and its result always goes to review before its children become tickets. L0 phases are never generated.
+**Structure work.** A profile declares which imported or high-level layers may
+be expanded.  It runs only when the campaign allows it, and its result always
+goes to review before its children become tickets.  The embedded planning
+profile retains its historical L1--L3 rules; a domain profile may declare a
+different set.
 
 **Collisions.** If two devices still take the same ticket in the same moment, both commits merge: children are deduped by canonical title and the higher-scoring `SETTLE` wins. The cost is one duplicated node, never corrupt data.
 
@@ -470,7 +491,7 @@ A node's children are kept only after they pass a gate. A worker tries up to 3 t
 
 1. **Pre-check.** A short call (at most 400 tokens) asks whether the node splits into at least 3 distinct parts. A clear no makes it a leaf at once (end = cannot split), without running the funnel. This keeps leaves cheap; without it, every leaf would cost 3 full attempts.
 2. **Attempt.** Run the funnel for the node: planner, workers, dedup, trims, critique, synthesizer. From the campaign's light-funnel depth onward, a lighter funnel runs (2 to 3 aspects, one trim). Its durable `ATTEMPT` audit record contains no children; children are committed only in the terminal batch after the gate decides.
-3. **Checks that do not depend on the model's judgement.** The reply is complete (`finish_reason` = `stop`) and valid JSON; 3 to 100 children; no child repeats the node, an ancestor, a sibling or an existing child (canonical title); every title passes the style gates.
+3. **Checks that do not depend on the model's judgement.** The reply is complete (`finish_reason` = `stop`) and valid JSON; the profile's child range (or the campaign default when the profile has none); no child repeats the node, an ancestor, a sibling or an existing child (canonical title); every title passes the level's style gates.
 4. **Score.** The critique score of the attempt, from the campaign's critic model.
 5. **Decide.**
    - Checks pass and score ≥ 0.7: commit this attempt.
@@ -512,6 +533,12 @@ The tree has no fixed depth limit. Four rules end every branch, so it always sto
 - SQLite is the store from the start of the rebuild; the 10 fixed level CSV files cannot hold unlimited depth, so they are an export only.
 - The loader's fixed list of 10 level files and the `path_segments >= 10` guard are removed.
 - Dashboards draw as many rings or levels as the tree actually has.
+- When a domain profile marks a parent's children as ordered (decision 0029),
+  the signed `ADD_NODE` record carries a zero-based `sibling_order`. The fold
+  stores it; the CSV export adds a `sibling_order` column only when an exported
+  node has one (a planning export keeps its original columns); `/api/tree`
+  returns and orders children by it. Scheduling, ticket order and the Merkle
+  leaves keep reading plain path order, and legacy nodes (`-1`) sort as before.
 - Paths grow longer: with 64-bit ids, a 20-level path can pass 350 characters. SQLite handles that; its path index grows accordingly.
 
 ## LLM provider, keys and budgets

@@ -140,6 +140,7 @@ target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_compiled_module(store src/store/store.cpp src/store/checkpoint.cpp)
 # Decision 0027 PR3: RE&CT YAML -> dev-import CSV converter (pure core).
 onion_add_compiled_module(reactconv src/tools/reactconv.cpp)
+target_link_libraries(reactconv PUBLIC nlohmann_json::nlohmann_json)
 # Decision 0027: domain profiles (header-only). The planning profile is
 # embedded; style checks and structure layers live in the profile. Kept
 # interface-only so the base core layer can use it without pulling log
@@ -291,6 +292,13 @@ if(BUILD_TESTING)
   target_link_libraries(onion_profile_test PRIVATE onion::profile GTest::gtest_main)
   gtest_discover_tests(onion_profile_test)
 
+  add_executable(onion_domain_test tests/unit/domain_test.cpp)
+  target_link_libraries(onion_domain_test PRIVATE onion::domain onion::gate
+    GTest::gtest_main)
+  target_compile_definitions(onion_domain_test PRIVATE
+    ONION_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  gtest_discover_tests(onion_domain_test)
+
   add_executable(onion_swim_test tests/unit/swim_test.cpp)
   target_link_libraries(onion_swim_test PRIVATE onion::swim GTest::gtest_main)
   gtest_discover_tests(onion_swim_test)
@@ -397,7 +405,8 @@ add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
 target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim onion::reactconv)
 target_compile_definitions(data_depot PRIVATE
-  ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
+  ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web"
+  ONION_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 if(ONION_CHAOS_HOOKS)
   target_compile_definitions(data_depot PRIVATE ONION_CHAOS_HOOKS=1)
 endif()

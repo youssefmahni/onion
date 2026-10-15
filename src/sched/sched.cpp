@@ -77,6 +77,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   // select the same funnel at L6.
   spec.light_funnel_from = value.value("light_funnel_from", 6);
   spec.structure = value.value("structure", false);
+  spec.review_all = value.value("review_all", false);
   spec.spillover = value.value("spillover", true);
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
@@ -228,6 +229,9 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   out["branch_share"] = std::to_string(spec.branch_share);
   if (!spec.tree.empty()) out["tree"] = spec.tree;
   if (!spec.profile_hash.empty()) out["profile_hash"] = spec.profile_hash;
+  // Emitted only when set, so a planning campaign's record keeps its
+  // historical shape.
+  if (spec.review_all) out["review_all"] = true;
   if (spec.depth_checkpoint_every > 0) {
     out["depth_checkpoint_from"] = spec.depth_checkpoint_from;
     out["depth_checkpoint_every"] = spec.depth_checkpoint_every;
@@ -575,7 +579,11 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     funnel_options.synth_max_children = *spec.synth_max_children;
   funnel_options.compact_output = spec.compact_output;
   funnel_options.verify_atomic = spec.verify_atomic;
-  if (spec.cache_prefix)
+  // The planning cache prefix names planning-domain noun phrases. A signed
+  // profile owns its own prompt contract, so never inject that stale prefix
+  // into a non-planning campaign.
+  if (spec.cache_prefix &&
+      !(profile.document.is_object() && profile.document.contains("prompts")))
     funnel_options.cache_prefix =
         // Shared fixed block (~120 tokens): identical for every funnel
         // call, so the provider's automatic prefix cache can hit on every
@@ -1110,9 +1118,37 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       impl_->options.budget.settle(*reservation, "0");
       continue;
     }
-    // The light funnel runs from the campaign's light-funnel depth.
+    // A domain profile's levels.max is a real depth limit: a node already at
+    // the deepest level is closed without a call (the planning profile
+    // declares none, so its tree keeps growing as before).
+    if (profile.max_level >= 0 && ticket.layer >= profile.max_level) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "SETTLE", {{"path", ticket.path},
+                     {"kept", 0},
+                     {"atomic", 0},
+                     {"attempts", 0},
+                     {"score", "0"},
+                     {"end", "profile depth limit"},
+                     {"campaign", spec.id}})}});
+      writer.sync();
+      impl_->options.budget.settle(*reservation, "0");
+      result.leaves++;
+      continue;
+    }
+    // Profile semantics override generic campaign fallbacks per ticket.
     gate::FunnelOptions ticket_options = funnel_options;
-    ticket_options.light = ticket.layer >= spec.light_funnel_from;
+    const int light_funnel_from =
+        profile.light_funnel_from.value_or(spec.light_funnel_from);
+    ticket_options.light = ticket.layer >= light_funnel_from;
+    if (const auto range =
+            onion::domain::child_range_for_parent(profile, ticket.layer)) {
+      ticket_options.params.children_min = range->min;
+      ticket_options.params.fallback_min = range->min;
+      ticket_options.synth_target_min = range->min;
+      ticket_options.synth_target_max = range->max;
+      ticket_options.synth_max_children = range->max;
+    }
+    if (profile.atomic_verify) ticket_options.verify_atomic = *profile.atomic_verify;
     gate::Funnel funnel(ticket_options);
     const gate::NodeContext context = build_context(writer, *node, &error);
     gate::FunnelResult funnel_result = funnel.run(context, impl_->options.ask);
@@ -1151,7 +1187,10 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                                        std::string reason) {
       std::vector<log::Record> records;
       std::vector<std::string> new_ids;
-      for (const gate::Child& child : chosen.children) {
+      const bool ordered = onion::domain::ordered_children_for_parent(
+          profile, ticket.layer);
+      for (std::size_t i = 0; i < chosen.children.size(); ++i) {
+        const gate::Child& child = chosen.children[i];
         const std::string id = node_ids_->allocate();
         new_ids.push_back(id);
         records.push_back(make_record(
@@ -1160,6 +1199,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                          {"title", child.title},
                          {"source", "engine"}}));
         if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
+        if (ordered)
+          records.back().payload["sibling_order"] = static_cast<std::int64_t>(i);
       }
       records.push_back(make_record(
           "CRITIQUE", {{"path", ticket.path},
@@ -1178,6 +1219,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           child_node.path = ticket.path + "-" + new_ids[i];
           child_node.layer = ticket.layer + 1;
           child_node.title = chosen.children[i].title;
+          if (ordered) child_node.sibling_order = static_cast<int>(i);
           node_cache.push_back(std::move(child_node));
         }
       }
@@ -1214,8 +1256,9 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
             if (layer == ticket.layer) return true;
           return false;
         }();
-        if (!spec.structure && needs_structure) {
-          emit_needs_review(chosen, "structure disallowed");
+        if (spec.review_all || (!spec.structure && needs_structure)) {
+          emit_needs_review(chosen, spec.review_all ? "campaign review all"
+                                                     : "structure disallowed");
           break;
         }
         int atomic = 0;
@@ -1223,7 +1266,10 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           if (child.atomic) atomic++;
         std::vector<log::Record> records;
         std::vector<std::string> new_ids;
-        for (const gate::Child& child : chosen.children) {
+        const bool ordered = onion::domain::ordered_children_for_parent(
+            profile, ticket.layer);
+        for (std::size_t i = 0; i < chosen.children.size(); ++i) {
+          const gate::Child& child = chosen.children[i];
           const std::string id = node_ids_->allocate();
           new_ids.push_back(id);
           records.push_back(make_record(
@@ -1231,6 +1277,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                            {"layer", ticket.layer + 1},
                            {"title", child.title}}));
           if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
+          if (ordered)
+            records.back().payload["sibling_order"] = static_cast<std::int64_t>(i);
           if (child.atomic)
             records.push_back(make_record(
                 "ATOMIC", {{"path", ticket.path + "-" + id},
@@ -1264,6 +1312,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
             child_node.path = ticket.path + "-" + new_ids[i];
             child_node.layer = ticket.layer + 1;
             child_node.title = chosen.children[i].title;
+            if (ordered) child_node.sibling_order = static_cast<int>(i);
             node_cache.push_back(std::move(child_node));
           }
         }
@@ -1325,15 +1374,29 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   const bool fleet = !live_lane_members().empty();
   if (result.end_reason == "stop rule" ||
       (result.end_reason == "drained" && !fleet)) {
+    // The fold replaces the stored spec with this record's, so a domain
+    // campaign (a named tree, a non-planning profile or review_all) must
+    // restate its whole spec or the stop would erase its tree binding. A
+    // planning campaign keeps its historical seven-key stop record, so its
+    // records stay byte-identical (decision 0029).
+    const bool domain_campaign =
+        !spec.tree.empty() || spec.review_all ||
+        (!spec.profile_hash.empty() &&
+         spec.profile_hash !=
+             onion::domain::profile_hash(onion::domain::planning_profile()));
+    const nlohmann::json stop_spec =
+        domain_campaign
+            ? campaign_spec_json(spec)
+            : nlohmann::json{{"scope", spec.scope},
+                             {"loop_budget", spec.loop_budget},
+                             {"mode", spec.mode},
+                             {"gate", std::to_string(spec.gate)},
+                             {"floor", std::to_string(spec.floor)},
+                             {"chunk", spec.chunk},
+                             {"model", spec.model}};
     writer.submit(state::CommitTerminal{{make_record(
         "CAMPAIGN", {{"id", spec.id},
-                     {"spec", {{"scope", spec.scope},
-                               {"loop_budget", spec.loop_budget},
-                               {"mode", spec.mode},
-                               {"gate", std::to_string(spec.gate)},
-                               {"floor", std::to_string(spec.floor)},
-                               {"chunk", spec.chunk},
-                               {"model", spec.model}}},
+                     {"spec", stop_spec},
                      {"state", "stopped"}})}});
     writer.sync();
   }

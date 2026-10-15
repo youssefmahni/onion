@@ -1,0 +1,227 @@
+{
+  "name": "react",
+  "tree": "react",
+  "description": "Incident-response knowledge tree built on the RE&CT framework (Apache-2.0, atc-project/atc-react). Stages, categories and response actions are imported; the engine expands each action into environments, ordered steps and single operations.",
+  "persona": "You build a hierarchical incident-response knowledge base for defenders, organised by the RE&CT framework: response stages, then categories, then response actions. Below each response action, nodes decompose into the environments where the action is performed, then the ordered steps of the procedure, then single operations. All content is defensive. Answer with strict JSON only: no prose, no markdown fences.",
+  "system_prompt": "You are a careful incident-response knowledge curator. Accuracy matters more than volume: never invent commands, flags, menu paths, API names or product features. When you are not certain of exact syntax, describe the operation at the level you are certain of, for example the console action, instead of guessing. Use placeholders such as <IP>, <domain>, <hostname>, <user>, <hash> instead of real values, and never include credentials. Prefer evidence-preserving and reversible operations, and make destructive ones explicit. Answer only with the JSON object requested.",
+  "levels": {
+    "max": 9,
+    "label_format": "L%d",
+    "import_csv_pattern": "ReACT - level_%02d.csv",
+    "import_codes": {
+      "stage": "S<digit>",
+      "category": "C<digit>",
+      "action": "RA<id>",
+      "example_path": "S3-C1-RA3101"
+    },
+    "definitions": [
+      {
+        "level": 0,
+        "name": "Stage",
+        "source": "import",
+        "children_are": "Categories of response actions (fixed by the RE&CT framework; imported, never generated)."
+      },
+      {
+        "level": 1,
+        "name": "Category",
+        "source": "import",
+        "children_are": "Response actions (fixed by the RE&CT framework; imported, never generated)."
+      },
+      {
+        "level": 2,
+        "name": "Response Action",
+        "source": "import",
+        "children_are": "Environments: the specific platforms, products or services where this response action is performed, such as an operating system, a firewall or email-gateway product, an identity provider, an EDR or SIEM product, or a cloud or SaaS service. Name the real product or platform.",
+        "children": {
+          "min": 3,
+          "max": 10
+        }
+      },
+      {
+        "level": 3,
+        "name": "Environment",
+        "children_are": "Steps: the ordered steps to perform this response action in this environment, from preparation and evidence preservation, through execution, to verification and, where relevant, rollback.",
+        "children": {
+          "min": 3,
+          "max": 10
+        },
+        "ordered_children": true
+      },
+      {
+        "level": 4,
+        "name": "Step",
+        "children_are": "Operations: the individual operations that make up this step: single commands, queries, API calls, console actions or checks, each with an observable result.",
+        "children": {
+          "min": 2,
+          "max": 6
+        }
+      },
+      {
+        "level": 5,
+        "name": "Operation",
+        "children_are": "Sub-operations, only when this operation still bundles several actions; otherwise none.",
+        "children": {
+          "min": 2,
+          "max": 4
+        }
+      },
+      {
+        "level": 6,
+        "name": "Sub-operation",
+        "children_are": "Sub-operations, only when this operation still bundles several actions; otherwise none.",
+        "children": {
+          "min": 2,
+          "max": 4
+        }
+      }
+    ]
+  },
+  "structure": {
+    "structure_layers": [
+      0,
+      1
+    ],
+    "imported_layers": [
+      0,
+      1,
+      2
+    ],
+    "light_funnel_from": 5
+  },
+  "atomic": {
+    "definition": "A single operation performed by one responder in one tool: one command, query, API call, console action or verification check, with an observable result, that cannot be split into smaller meaningful operations.",
+    "verify": true,
+    "expected_from_level": 4
+  },
+  "style_levels": [
+    {
+      "levels": [
+        3
+      ],
+      "shape": "noun phrase naming the real product or platform",
+      "min_words": 1,
+      "max_words": 6,
+      "max_chars": 60,
+      "title_case": false,
+      "keep_product_capitalisation": true,
+      "starts_with_capital_or_product": true,
+      "no_questions": true,
+      "no_emoji": true,
+      "no_trailing_period": true,
+      "allowed_punctuation": "-./()&+"
+    },
+    {
+      "levels": [
+        4
+      ],
+      "shape": "imperative verb phrase",
+      "min_words": 2,
+      "max_words": 12,
+      "max_chars": 100,
+      "title_case": false,
+      "starts_with_capital": true,
+      "no_questions": true,
+      "no_emoji": true,
+      "no_trailing_period": true,
+      "allowed_punctuation": "-./()&+,:'<>"
+    },
+    {
+      "levels": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "shape": "imperative phrase; may contain one command or query in backticks",
+      "min_words": 2,
+      "max_words": 20,
+      "max_chars": 160,
+      "title_case": false,
+      "starts_with_capital": true,
+      "no_questions": true,
+      "no_emoji": true,
+      "no_trailing_period": true,
+      "allow_code_span": true,
+      "allowed_punctuation": "`<>-_./:\\\"'=$|,()[]*%@#+&;~"
+    }
+  ],
+  "prompts": {
+    "precheck": "Node: {level_name} {path}: \"{title}\".\nAncestors: {ancestors}.\nIts children would be: {child_level_guidance}\nCan this node be split into at least {children_min} distinct, non-overlapping children of that kind? Answer no if the node is already a single operation (one command, query, console action or check), or if any split would only rephrase it.",
+    "planner": "Node: {level_name} {path}: \"{title}\".\nAncestors: {ancestors}.\nExisting children: {existing_children}.\nIts children are: {child_level_guidance}\nList {n_aspects_min} to {n_aspects_max} aspects that together cover every child this node needs. Aspects are dimensions of this node itself, for example operating-system families, network or security product families, identity providers, cloud and SaaS platforms, or procedure phases (prepare, execute, verify, roll back). Never use related topics, threat intelligence, attacker techniques or other response actions as aspects.",
+    "worker": "Node: {level_name} {path}: \"{title}\".\nAncestors: {ancestors}.\nAspect: {aspect}.\nChildren are: {child_level_guidance}\nList up to {n_items} candidate children for this aspect. Each must be a real, distinct {child_level_name} that belongs directly under this node and follows the title rules: {title_rules}. Do not repeat the node, its ancestors, its siblings ({siblings}) or its existing children. Do not include other response actions, related topics or explanations.",
+    "trimmer": "Node: {level_name} {path}: \"{title}\".\nChildren are: {child_level_guidance}\nCandidates: {candidates}\nKeep only the best {keep}: the most widely used, correct and distinct ones, covering the whole node with no overlap. Return titles verbatim; do not rephrase, merge or invent.",
+    "critique": "Node: {level_name} {path}: \"{title}\".\nChildren are: {child_level_guidance}\nCandidate set: {candidates}\nScore the set from 0 to 1 against the anchors below, judging: (1) correctness: real products and real operations, no invented syntax; (2) coverage of the node without gaps; (3) no overlap or duplicates; (4) the right level: each candidate is a {child_level_name}, not a parent or grandchild; (5) safety: destructive operations are explicit and evidence is preserved; (6) the title rules: {title_rules}. List concrete issues, and which candidates to remove or add.\nAnchors:\n{critique_anchors}",
+    "synthesizer": "Node: {level_name} {path}: \"{title}\".\nAncestors: {ancestors}.\nChildren are: {child_level_guidance}\nCandidate pool: {candidates}\nReviewer notes: {critique_issues}\nWhy the previous attempt failed: {retry_reasons}\nChoose the final children: between {children_min} and {children_max}, never more, and never pad to reach a number. Every title must follow the title rules: {title_rules}. When the children are procedure steps, return them in execution order. Label a child atomic only if it matches this definition: {atomic_definition}",
+    "atomic_verification": "Node: {level_name} {path}: \"{title}\".\nThese children were labelled atomic: {labelled}\nDefinition: {atomic_definition}\nFor each one, decide whether it truly matches the definition. Be conservative: a child that bundles more than one operation, more than one tool, or a decision is not atomic."
+  },
+  "critique_anchors": [
+    {
+      "score": "0.8",
+      "node": "RA3101 Block external IP address",
+      "children": [
+        "Windows Defender Firewall",
+        "Linux nftables",
+        "Palo Alto Networks NGFW",
+        "AWS Security Groups",
+        "Azure Network Security Groups",
+        "Cisco Secure Firewall"
+      ],
+      "why": "Real, distinct environments at the right level, covering endpoint, network and cloud, with no overlap."
+    },
+    {
+      "score": "0.5",
+      "node": "RA3101 Block external IP address",
+      "children": [
+        "Windows Firewall",
+        "Firewall",
+        "Cloud",
+        "Block the IP quickly",
+        "Linux"
+      ],
+      "why": "Vague and overlapping (Firewall vs Windows Firewall), too broad (Cloud, Linux), and one child is an action, not an environment."
+    },
+    {
+      "score": "0.2",
+      "node": "RA3101 Block external IP address",
+      "children": [
+        "Threat Intelligence",
+        "Phishing Analysis",
+        "Incident Report",
+        "Malware Sandbox"
+      ],
+      "why": "Related topics, not environments where this action is performed."
+    }
+  ],
+  "placeholders": [
+    "title",
+    "path",
+    "level",
+    "level_name",
+    "child_level_name",
+    "child_level_guidance",
+    "ancestors",
+    "siblings",
+    "existing_children",
+    "aspect",
+    "n_aspects_min",
+    "n_aspects_max",
+    "n_items",
+    "candidates",
+    "keep",
+    "critique_issues",
+    "critique_anchors",
+    "retry_reasons",
+    "children_min",
+    "children_max",
+    "labelled",
+    "atomic_definition",
+    "title_rules"
+  ],
+  "engine_contract_notes": [
+    "The engine appends the exact JSON output format to every prompt; profiles never define JSON keys, so the parsers stay in code.",
+    "{title_rules} is generated by the engine from style_levels for the child level, so the prompt and the deterministic checks can never disagree.",
+    "{critique_issues} and {retry_reasons} are filled with 'none' when empty; the critic stays off unless the campaign turns it on.",
+    "Needs engine support beyond the first profile proposal: per-level style rules (style_levels), per-level child ranges (levels.definitions[].children), and preserving child order when ordered_children is true."
+  ]
+}

@@ -32,16 +32,17 @@ class StoreTest : public ::testing::Test {
   }
 
   void insert_node(std::string code, std::string path, int layer,
-                   std::string title, std::int64_t parent_id = -1) {
+                   std::string title, std::int64_t parent_id = -1,
+                   int sibling_order = -1) {
     std::string error;
     std::string sql = "INSERT INTO nodes(id, code, path, parent_id, layer, "
-                      "title, origin, hlc) VALUES (";
+                      "title, origin, hlc, sibling_order) VALUES (";
     sql += std::to_string(next_id_++);
     sql += ", '" + code + "', '" + path + "', ";
     if (parent_id >= 0) sql += std::to_string(parent_id);
     else sql += "NULL";
     sql += ", " + std::to_string(layer) + ", '" + title +
-           "', 'dev', 1);";
+           "', 'dev', 1, " + std::to_string(sibling_order) + ");";
     ASSERT_TRUE(db().exec(sql, &error)) << error;
   }
 
@@ -109,6 +110,93 @@ TEST_F(StoreTest, CsvExportMatchesLegacyShape) {
   EXPECT_EQ(line, "code,path,title");
   std::getline(level1, line);
   EXPECT_EQ(line, "IN01,P01-IN01,\"In, With \"\"Comma\"\"\"");
+}
+
+TEST_F(StoreTest, CsvExportPreservesSiblingOrder) {
+  // The explicit order deliberately disagrees with the path order
+  // (A < B by path, but B is the first step): only a real ordering passes.
+  insert_node("P01", "P01", 0, "Phase", -1, 0);
+  insert_node("A", "P01-A", 1, "Verify the block", 1, 1);
+  insert_node("B", "P01-B", 1, "Preserve evidence", 1, 0);
+  std::string error;
+  ASSERT_TRUE(db().export_csv(dir_ / "ordered-export", 1, &error)) << error;
+  std::string line;
+  std::ifstream level0(dir_ / "ordered-export" / "Onion - level_00.csv");
+  std::getline(level0, line);
+  EXPECT_EQ(line, "code,title,sibling_order");
+  std::getline(level0, line);
+  EXPECT_EQ(line, "P01,Phase,0");
+  std::ifstream level1(dir_ / "ordered-export" / "Onion - level_01.csv");
+  std::getline(level1, line);
+  EXPECT_EQ(line, "code,path,title,sibling_order");
+  std::getline(level1, line);
+  EXPECT_EQ(line, "B,P01-B,Preserve evidence,0");
+  std::getline(level1, line);
+  EXPECT_EQ(line, "A,P01-A,Verify the block,1");
+}
+
+TEST_F(StoreTest, PlanningOnlyExportKeepsItsShapeNextToAnOrderedNamedTree) {
+  insert_node("P01", "P01", 0, "Phase");
+  insert_node("IN01", "P01-IN01", 1, "In", 1);
+  insert_node("S1", "S1", 0, "Preparation");
+  insert_node("C0", "S1-C0", 1, "General", 3, 0);  // only layer 1 is ordered
+  std::string error;
+  ASSERT_TRUE(db().exec("UPDATE nodes SET tree='react' WHERE path LIKE 'S1%';",
+                        &error))
+      << error;
+
+  const auto read_first_lines = [&](const std::string& out,
+                                    const std::string& file) {
+    std::ifstream stream(dir_ / out / file);
+    std::string header, row;
+    std::getline(stream, header);
+    std::getline(stream, row);
+    return std::make_pair(header, row);
+  };
+  // --tree planning: only the planning rows, in the ORIGINAL columns, even
+  // though an ordered react node exists in the same database.
+  ASSERT_TRUE(db().export_csv(dir_ / "plan", 1, &error,
+                              onion::store::kPlanningTreeFilter))
+      << error;
+  EXPECT_EQ(read_first_lines("plan", "Onion - level_00.csv"),
+            std::make_pair(std::string("code,title"),
+                           std::string("P01,Phase")));
+  EXPECT_EQ(read_first_lines("plan", "Onion - level_01.csv").first,
+            "code,path,title");
+  // The named tree carries the column once an exported layer has an order.
+  ASSERT_TRUE(db().export_csv(dir_ / "react", 1, &error, "react")) << error;
+  EXPECT_EQ(read_first_lines("react", "Onion - level_00.csv").first,
+            "code,title,sibling_order");
+  // ... but not when --max-layer stops short of every ordered node.
+  ASSERT_TRUE(db().export_csv(dir_ / "react0", 0, &error, "react")) << error;
+  EXPECT_EQ(read_first_lines("react0", "Onion - level_00.csv").first,
+            "code,title");
+  // The listing filter agrees.
+  const auto planning_roots =
+      db().nodes_at_layer(0, &error, onion::store::kPlanningTreeFilter);
+  ASSERT_EQ(planning_roots.size(), 1u);
+  EXPECT_EQ(planning_roots[0].code, "P01");
+}
+
+TEST_F(StoreTest, SiblingOrderOnlyAffectsLayerListingsNotSchedulingQueries) {
+  insert_node("P01", "P01", 0, "Phase");
+  insert_node("A", "P01-A", 1, "Second step", 1, 1);
+  insert_node("B", "P01-B", 1, "First step", 1, 0);
+  std::string error;
+  const auto layer = db().nodes_at_layer(1, &error);
+  ASSERT_EQ(layer.size(), 2u) << error;
+  EXPECT_EQ(layer[0].code, "B");  // by sibling_order
+  EXPECT_EQ(layer[1].code, "A");
+  // Ticket scheduling and the Merkle leaves read path order; ordered
+  // children must never change what the planning flow sees.
+  const auto all = db().all_nodes(&error);
+  ASSERT_EQ(all.size(), 3u);
+  EXPECT_EQ(all[1].code, "A");
+  EXPECT_EQ(all[2].code, "B");
+  const auto prefix = db().nodes_with_path_prefix("P01", &error);
+  ASSERT_EQ(prefix.size(), 3u);
+  EXPECT_EQ(prefix[1].code, "A");
+  EXPECT_EQ(prefix[2].code, "B");
 }
 
 TEST_F(StoreTest, RejectsNewerSchema) {

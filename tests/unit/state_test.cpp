@@ -92,6 +92,36 @@ TEST_F(StateWriterTest, TerminalBatchCommitsDurablyAndFolds) {
   EXPECT_EQ(writer_->segments().total_batches(), 1u);
 }
 
+TEST_F(StateWriterTest, OrderedChildrenSurviveSignedCommitAndFold) {
+  std::string error;
+  ASSERT_TRUE(writer_->start(&error)) << error;
+  writer_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "S3-C1-RA3101"},
+                               {"layer", 2},
+                               {"title", "Block External IP Address"},
+                               {"tree", "react"}}),
+      // The explicit order CONTRADICTS both the path order (TK1 < TK2) and
+      // the record order: only a real sibling_order sort lists "Prepare
+      // Evidence" first.
+      make_record("ADD_NODE", {{"path", "S3-C1-RA3101-TK1"},
+                               {"layer", 3}, {"title", "Verify Block"},
+                               {"tree", "react"}, {"sibling_order", 1}}),
+      make_record("ADD_NODE", {{"path", "S3-C1-RA3101-TK2"},
+                               {"layer", 3}, {"title", "Prepare Evidence"},
+                               {"tree", "react"}, {"sibling_order", 0}}),
+  }});
+  writer_->sync();
+
+  std::string query_error;
+  const auto nodes = writer_->db().nodes_at_layer(3, &query_error, "react");
+  ASSERT_TRUE(query_error.empty()) << query_error;
+  ASSERT_EQ(nodes.size(), 2u);
+  EXPECT_EQ(nodes[0].title, "Prepare Evidence");
+  EXPECT_EQ(nodes[0].sibling_order, 0);
+  EXPECT_EQ(nodes[1].title, "Verify Block");
+  EXPECT_EQ(nodes[1].sibling_order, 1);
+}
+
 TEST_F(StateWriterTest, AttemptsGroupCommitIntoOneBatch) {
   std::string error;
   ASSERT_TRUE(writer_->start(&error)) << error;
@@ -1558,7 +1588,9 @@ TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollision
     EXPECT_EQ(nodes.size(), 1u);
     EXPECT_EQ(nodes[0].tree, "react");
   }
-  // The same code inside the same tree still collides.
+  // Decision 0029 (amends 0027 for NAMED trees only): in a domain tree a
+  // code is unique among the siblings of one parent, because RE&CT's C1 is a
+  // category local to its stage. The planning rule above is unchanged.
   {
     writer->submit(CommitTerminal{{
         make_record("ADD_NODE", {{"path", "R01"}, {"layer", 0},
@@ -1566,12 +1598,40 @@ TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollision
                                  {"code", "R01"}, {"tree", "react"}}),
     }});
     writer->sync();
-    std::vector<DevImportedNode> nodes = {
-        {"R01", "R01-OTHER", 1, "Other React Node", "react"}};
-    std::string error;
-    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
-    EXPECT_TRUE(report.refused);
-    EXPECT_EQ(report.rows.size(), 1u);
+    // The same code under two different stage parents is valid.
+    {
+      std::vector<DevImportedNode> nodes = {
+          {"C1", "S1-C1", 1, "Network", "react"},
+          {"C1", "S3-C1", 1, "Network", "react"}};
+      std::string error;
+      const auto report =
+          check_import_collisions(writer->db(), nodes, false, &error);
+      EXPECT_FALSE(report.refused);
+      EXPECT_TRUE(report.rows.empty());
+      EXPECT_EQ(nodes.size(), 2u);
+    }
+    // The same code under one parent, inside one import, collides.
+    {
+      std::vector<DevImportedNode> nodes = {
+          {"C1", "S1-C1", 1, "Network", "react"},
+          {"C1", "S1-OTHER", 1, "Other React Node", "react"}};
+      std::string error;
+      const auto report =
+          check_import_collisions(writer->db(), nodes, false, &error);
+      EXPECT_TRUE(report.refused);
+      EXPECT_EQ(report.rows.size(), 1u);
+    }
+    // A sibling code already in the store (same parent, here the root)
+    // collides too.
+    {
+      std::vector<DevImportedNode> nodes = {
+          {"R01", "R02", 0, "Another Root", "react"}};
+      std::string error;
+      const auto report =
+          check_import_collisions(writer->db(), nodes, false, &error);
+      EXPECT_TRUE(report.refused);
+      EXPECT_EQ(report.rows.size(), 1u);
+    }
   }
   // The folded node carries its tree.
   {

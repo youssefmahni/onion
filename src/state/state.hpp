@@ -66,6 +66,9 @@ struct DevImportedNode {
   // Decision 0027: the domain tree the node belongs to (empty = the
   // planning tree).
   std::string tree;
+  // Decision 0029: optional zero-based input order among siblings. -1 asks
+  // the importer to derive the stable order from the CSV row sequence.
+  int sibling_order{-1};
 };
 
 struct DevImport {
@@ -74,8 +77,10 @@ struct DevImport {
 
 // Decision 0027: the import collision pre-check, shared by the CLI and
 // the tests. A collision is (a) a path that already exists with
-// DIFFERENT content, or (b) a code already used by another path. Rows
-// identical to an existing node are counted as duplicates and dropped.
+// DIFFERENT content, or (b) a code already used by a sibling path. Codes are
+// scoped to their direct parent so RE&CT's C<digit> categories can repeat
+// under distinct stages. Rows identical to an existing node are counted as
+// duplicates and dropped.
 // With allow_skip=false every colliding row is reported and KEPT in
 // `nodes` (the caller refuses the import); with allow_skip=true the
 // colliding rows are reported and DROPPED from `nodes`.

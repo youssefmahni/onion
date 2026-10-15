@@ -16,7 +16,11 @@ namespace onion::store {
 inline constexpr std::string_view component_name{"store"};
 
 // Schema version stamped into schema_version; bumping it selects a migration.
-inline constexpr int kSchemaVersion = 1;
+inline constexpr int kSchemaVersion = 2;
+
+// The export/listing filter name for the planning tree, whose stored tree
+// value is the empty string (domain::parse_profile reserves the name).
+inline constexpr std::string_view kPlanningTreeFilter{"planning"};
 
 struct Node {
   std::int64_t id{};
@@ -37,6 +41,9 @@ struct Node {
   // and the dashboard filter by tree, and node codes may repeat across
   // different trees.
   std::string tree;
+  // Decision 0029: zero-based order among a parent's children. -1 means
+  // a legacy/unordered record and falls back to stable path ordering.
+  int sibling_order{-1};
 };
 
 struct Settle {
@@ -167,6 +174,8 @@ class Db {
   // Typed helpers.
   std::optional<Node> node_by_path(std::string_view path, std::string* error) const;
   std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error) const;
+  // `tree` empty = every tree; kPlanningTreeFilter = the planning tree only
+  // (stored as tree ""); any other value = that named tree.
   std::vector<Node> nodes_at_layer(int layer, std::string* error,
                                    std::string_view tree = "") const;
   std::vector<Node> all_nodes(std::string* error) const;
