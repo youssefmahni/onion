@@ -320,3 +320,33 @@ style checks move into the profile; expandable_layers ->
 structure_layers; nodes.tree field (codes may repeat across trees);
 planning profile embedded default byte-identical (golden + engine
 tests unchanged). Then RE&CT converter + test import + 12-action pilot.
+
+## 2026-10-15 — PR2(0027) domain profiles: tree, profile module, records
+
+On b3-gate-funnel, worktree .build-tmp/wt-audit-removal:
+- de5be5e nodes.tree (empty = planning): column + fold + dev-import
+  --tree + export-csv --tree + /api/tree node field + CampaignSpec.tree
+  emitted on every ADD_NODE; code collisions scoped per tree. Tests:
+  state 36, sched 32, store 10, api 7.
+- 1f0c5de onion::domain module (header-only): StyleChecks/Profile,
+  embedded planning_profile() with today's rules byte-identical;
+  depot::style_flags delegates to it; gate::run_checks takes the
+  profile's style; FunnelOptions.profile defaults to planning.
+  core 67, gate 42 green.
+- 0527e69 PROFILE records fold into content-addressed domain_profiles
+  (hash = blake2b over canonical JSON); `profile add` CLI publishes a
+  signed record; campaigns carry profile_hash (empty = planning);
+  campaign start refuses unheld profiles; the engine pauses a campaign
+  whose profile is missing; structure gate keys on profile
+  structure_layers (planning = layers 0..2, the L1..L3 rule).
+  state 37, sched 32, gate 42 green.
+
+Byte-identical proof: onion_golden_test 5/5 and the engine structure
+test pass unchanged (the full engine suite is skipped under the
+owner's 1-minute test cap — the 300-node offline campaign alone
+exceeds it).
+
+**Next step:** RE&CT converter (RA codes as node codes, tree react) +
+test import on a copy + 12-action pilot campaign with every result to
+review; then PR b3-gate-funnel → main (carries 0025-0027 + tree
+viewer + checkpoint endpoint + help/OPERATOR.md).
