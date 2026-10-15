@@ -99,11 +99,15 @@ class Statement {
 
   bool bind(int index, std::string_view value, std::string* error);
   bool bind(int index, std::int64_t value, std::string* error);
+  // Named (not an overload): `bind(3, 1.5)` would make the int64 call
+  // ambiguous for plain ints.
+  bool bind_double(int index, double value, std::string* error);
   bool step(std::string* error);          // false at SQLITE_DONE
   bool step_row(std::string* error);      // false at SQLITE_DONE, error->set
   void reset(std::string* error);
 
   std::string text(int column) const;
+  double real(int column) const;
   std::string blob(int column) const;  // raw bytes (BLOB-safe)
   int column_count() const;
   std::int64_t integer(int column) const;

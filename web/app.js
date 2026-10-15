@@ -10,7 +10,7 @@ let versionInfo = "";
 const root = document.getElementById("screen");
 
 const SCREEN_DEFS = [
-  ["control", "Control center", "Alerts, live numbers, charts, activity. (arrives in D2)"],
+  ["control", "Control center", ""],
   ["campaigns", "Campaigns", "List, details, projection, plan-before-start. (arrives in D3)"],
   ["fleet", "Fleet", "Members, lanes, invitations, evictions. (arrives in D5)"],
   ["review", "Review queue", "Items by reason, attempts, accept/retry/leaf. (arrives in D4)"],
@@ -45,6 +45,9 @@ function route() {
   }
 
   switch (screen) {
+    case "control":
+      render(preact.h(ControlScreen, null));
+      break;
     case "tree": {
       const path = rest ? decodeURIComponent(rest) : "";
       render(preact.h(TreeScreen, { initialPath: path }));
@@ -60,6 +63,7 @@ function route() {
       const def = SCREEN_DEFS.find((entry) => entry[0] === screen);
       if (def) stub(def[0], def[1], def[2]);
       else stub("control", "Onion", "unknown route — pick a screen above");
+      break;
     }
   }
   document.title = "Onion — Control dashboard";

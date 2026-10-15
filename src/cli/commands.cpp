@@ -29,6 +29,8 @@
 #include <vector>
 
 #include "api/api.hpp"
+#include "api/alerts.hpp"
+#include "api/control_json.hpp"
 #include "api/tree_json.hpp"
 #include "core/depot_core.hpp"
 #include "profile/profile.hpp"
@@ -46,6 +48,7 @@
 #include "log/invite.hpp"
 #include "state/state.hpp"
 #include "store/store.hpp"
+#include "metrics/metrics.hpp"
 #include "viewcache/viewcache.hpp"
 
 // The build-time embedded web assets (generated web_assets.cpp, plan §3.1).
@@ -1026,8 +1029,18 @@ int node_cmd(int argc, char** argv) {
       onion::viewcache::Cache::Options{dir / "viewcache.db", dir / "onion.db"});
   std::string cache_error;
   view_cache->start(&cache_error);  // best effort; rebuild reports errors
+
+  // metrics.db (plan §6.3): speed samples, spend buckets, activity ring.
+  auto metrics_store = std::make_shared<onion::metrics::Store>(
+      onion::metrics::Store::Options{dir / "metrics.db"});
+  if (!metrics_store->start(&cache_error))
+    std::fprintf(stderr, "metrics: %s\n", cache_error.c_str());
   auto writer = open_writer(
       dir, &error, [&](const onion::log::Record& record) {
+        if (record.type == "CAMPAIGN" || record.type == "MEMBER_ADD" ||
+            record.type == "MEMBER_EVICT" || record.type == "MEMBER_LEAVE")
+          metrics_store->append_event(record.type, record.payload.dump(),
+                                      &cache_error);
         if (record.type != "ADD_NODE" && record.type != "TOMBSTONE") return;
         std::lock_guard lock(cache_mutex);
         if (cache_notes.size() >= 10000) return;
@@ -1099,8 +1112,63 @@ int node_cmd(int argc, char** argv) {
   // The device's USD budget (F-BUD-1): every ticket's reservation settles
   // with its real cost, so this cap now binds. Default 1000 keeps the old
   // headroom for existing deployments.
-  onion::llm::Budget budget(flag(argc, argv, "--budget-usd", "1000"));
+  const std::string budget_usd = flag(argc, argv, "--budget-usd", "1000");
+  onion::llm::Budget budget(budget_usd);
   const onion::gate::SyncAsk ask = sync_ask(client);
+
+  // The metrics sampler (plan §6.3): one speed sample every 30 s from the
+  // folded state (rowid deltas) and the client's live in-flight count.
+  std::atomic<std::int64_t> last_settle_rowid{0};
+  std::atomic<std::int64_t> last_tokens_out{0};
+  std::atomic<bool> metrics_baseline{false};
+  std::atomic<bool> metrics_stop{false};
+  std::thread metrics_thread([&] {
+    const auto tick = [&]() {
+      std::string metric_error;
+      const onion::store::Db& read = writer->read_db();
+      auto settle_row =
+          read.prepare("SELECT MAX(rowid) FROM settles;", &metric_error);
+      auto attempt_row = read.prepare(
+          "SELECT COALESCE(SUM(tokens_out), 0) FROM attempts;",
+          &metric_error);
+      std::int64_t settle_max = 0, tokens = 0;
+      if (settle_row) {
+        std::string step_error;
+        if (settle_row->step_row(&step_error))
+          settle_max = settle_row->integer(0);
+      }
+      if (attempt_row) {
+        std::string step_error;
+        if (attempt_row->step_row(&step_error)) tokens = attempt_row->integer(0);
+      }
+      const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+      onion::metrics::Store::SpeedSample sample;
+      sample.ts = now;
+      sample.inflight = client.in_flight();
+      sample.limit = static_cast<std::int64_t>(profile_limit);
+      if (metrics_baseline.exchange(true)) {
+        const double window = 30.0;  // ticks every 30 s
+        sample.answers_ps =
+            std::max<std::int64_t>(0, settle_max - last_settle_rowid.load()) /
+            window;
+        sample.out_tokens_ps =
+            std::max<std::int64_t>(0, tokens - last_tokens_out.load()) / window;
+      }
+      last_settle_rowid.store(settle_max);
+      last_tokens_out.store(tokens);
+      // p95_ms and errors stay 0 until the campaign work plumbs a latency
+      // feed (D3) — documented in WORKLOG.
+      metrics_store->record_speed(sample, &metric_error);
+    };
+    while (!metrics_stop.load()) {
+      for (int i = 0; i < 30 && !metrics_stop.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (!metrics_stop.load()) tick();
+    }
+  });
+
 
   // Optional per-1M-token prices (USD), peak triplet (decision 0004: no
   // implicit defaults; node.conf arrives in M5).
@@ -1423,6 +1491,10 @@ int node_cmd(int argc, char** argv) {
   // only mutation path.
   std::mutex fleet_mutex;
   std::atomic<std::uint64_t> sync_rounds_completed{0};
+  std::atomic<std::int64_t> last_sync_round_at{
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count()};
   std::atomic<bool> sync_stop{false};
   std::thread sync_thread;
 
@@ -1516,6 +1588,76 @@ int node_cmd(int argc, char** argv) {
   api_options.tree_export_csv = [&](std::string path) {
     return onion::api::tree_json::export_csv(writer->read_db(),
                                              std::move(path));
+  };
+  // D2 control providers (plan §4.1/§4.2/§4.4).
+  api_options.stream_enabled = true;
+  api_options.summary_json = [&]() {
+    onion::api::control_json::SummaryProbes probes;
+    probes.inflight = client.in_flight();
+    probes.limit = static_cast<std::size_t>(profile_limit);
+    probes.device_budget_usd = budget_usd;
+    probes.sync_rounds_completed =
+        static_cast<std::int64_t>(sync_rounds_completed.load());
+    const std::int64_t now_s =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    probes.seconds_since_last_round =
+        std::max<std::int64_t>(0, now_s - last_sync_round_at.load());
+    probes.viewcache_ready = view_cache->ready();
+    return onion::api::control_json::summary(*writer, metrics_store.get(),
+                                             probes)
+        .dump();
+  };
+  api_options.alerts_json = [&]() {
+    onion::api::alerts::Inputs inputs;
+    for (const auto& campaign : writer->campaigns())
+      inputs.campaigns.push_back(
+          {campaign.id, campaign.state, campaign.reason});
+    inputs.forked_batches = static_cast<std::int64_t>(writer->forks().size());
+    std::string count_error;
+    auto review_stmt = writer->read_db().prepare(
+        "SELECT COUNT(*) FROM reviews WHERE state IS NULL OR state != "
+        "'decided';",
+        &count_error);
+    std::int64_t review_open = 0;
+    if (review_stmt) {
+      std::string step_error;
+      if (review_stmt->step_row(&step_error))
+        review_open = review_stmt->integer(0);
+    }
+    inputs.review_open = review_open;
+    inputs.device_budget = onion::api::alerts::Inputs::SpendBudget{
+        writer->db().spend_usd(&count_error), budget_usd};
+    {
+      std::lock_guard fleet_lock(fleet_mutex);
+      for (const auto& member : lane_members)
+        inputs.member_states.emplace_back(member.device_id, "ACTIVE");
+    }
+    const std::int64_t alert_now_s =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    inputs.sync = onion::api::alerts::Inputs::Sync{
+        lane_members.size(),
+        std::max<std::int64_t>(0, alert_now_s - last_sync_round_at.load()),
+        15};
+    inputs.disk = onion::api::alerts::Inputs::Disk{
+        onion::platform::disk_free_gb(dir).value_or(0.0),
+        onion::platform::disk_total_gb(dir).value_or(1.0)};
+    return onion::api::alerts::list(inputs).dump();
+  };
+  api_options.events_json = [&](std::int64_t since) {
+    return onion::api::control_json::events_since(*metrics_store, since)
+        .dump();
+  };
+  api_options.speed_json = [&](std::string range) {
+    return onion::api::control_json::speed_series(*metrics_store, range, 1500)
+        .dump();
+  };
+  api_options.spend_json = [&](std::string range) {
+    return onion::api::control_json::spend_series(*metrics_store, range)
+        .dump();
   };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
@@ -1729,6 +1871,10 @@ int node_cmd(int argc, char** argv) {
     if (majority) {
       engine.note_sync_round();
       ++sync_rounds_completed;
+      last_sync_round_at.store(
+          std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count());
     }
     // M7: push this device's newest batch to every peer (DESIGN › New
     // children and claims are pushed at once). The repeated push also
@@ -2042,6 +2188,8 @@ if (!members_path.empty()) reload_members();
   if (sync_thread.joinable()) sync_thread.join();
   cache_stop.store(true);
   if (cache_thread.joinable()) cache_thread.join();
+  metrics_stop.store(true);
+  if (metrics_thread.joinable()) metrics_thread.join();
   if (sync_server) sync_server->stop();
   server.stop();
   writer->stop();

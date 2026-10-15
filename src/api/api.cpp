@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -39,6 +41,20 @@ struct Server::Impl {
   std::mutex auth_mutex;
   std::map<std::string, std::chrono::steady_clock::time_point> pending_codes{};
   std::map<std::string, Session> sessions{};
+
+  // SSE hub (plan §4.2): one broadcaster thread pushes summary frames every
+  // 2 s plus alert/event diffs to every subscriber's queue.
+  struct Subscriber {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::string> frames;
+    bool closed{false};
+  };
+  std::mutex stream_mutex;
+  std::vector<std::weak_ptr<Subscriber>> subscribers;
+  std::int64_t stream_event_seq{0};
+  std::thread stream_thread;
+  std::atomic<bool> stream_running{false};
 };
 
 namespace {
@@ -480,6 +496,138 @@ bool Server::start(std::string* error) {
     response.set_redirect("/");
   });
 
+  // D2 control reads (plan §4.1).
+  const auto control_guard = [this, tree_guard](const httplib::Request& request,
+                                                httplib::Response& response) {
+    return tree_guard(request, response);
+  };
+  const auto control_get =
+      [this, control_guard](const char* path,
+                            std::function<std::string()> provider) {
+        impl_->server->Get(path, [this, control_guard, provider](
+                                     const httplib::Request& request,
+                                     httplib::Response& response) {
+          if (!control_guard(request, response)) return;
+          if (!provider) {
+            response.status = 404;
+            response.set_content("{\"error\":\"no provider\"}",
+                                 "application/json");
+            return;
+          }
+          try {
+            response.set_content(provider(), "application/json");
+          } catch (const std::exception& exception) {
+            response.status = 500;
+            response.set_content(
+                std::string("{\"error\":\"") + exception.what() + "\"}",
+                "application/json");
+          }
+        });
+      };
+  control_get("/api/v1/summary", [this]() {
+    return impl_->options.summary_json
+               ? impl_->options.summary_json()
+               : std::string{};
+  });
+  control_get("/api/v1/alerts", [this]() {
+    return impl_->options.alerts_json ? impl_->options.alerts_json()
+                                      : std::string{};
+  });
+  impl_->server->Get("/api/v1/events",
+                     [this, control_guard](const httplib::Request& request,
+                                           httplib::Response& response) {
+    if (!control_guard(request, response)) return;
+    if (!impl_->options.events_json) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no provider\"}",
+                           "application/json");
+      return;
+    }
+    std::int64_t since = 0;
+    if (request.has_param("since")) {
+      try {
+        since = std::stoll(request.get_param_value("since"));
+      } catch (const std::exception&) {
+        since = 0;
+      }
+    }
+    response.set_content(impl_->options.events_json(since),
+                         "application/json");
+  });
+  impl_->server->Get("/api/v1/metrics/speed",
+                     [this, control_guard](const httplib::Request& request,
+                                           httplib::Response& response) {
+    if (!control_guard(request, response)) return;
+    if (!impl_->options.speed_json) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no provider\"}",
+                           "application/json");
+      return;
+    }
+    const std::string range = request.get_param_value("range");
+    response.set_content(
+        impl_->options.speed_json(range.empty() ? "24h" : range),
+        "application/json");
+  });
+  impl_->server->Get("/api/v1/metrics/spend",
+                     [this, control_guard](const httplib::Request& request,
+                                           httplib::Response& response) {
+    if (!control_guard(request, response)) return;
+    if (!impl_->options.spend_json) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no provider\"}",
+                           "application/json");
+      return;
+    }
+    const std::string range = request.get_param_value("range");
+    response.set_content(
+        impl_->options.spend_json(range.empty() ? "24h" : range),
+        "application/json");
+  });
+
+  // SSE stream (plan §4.2): summary every 2 s, alert add/clear diffs and
+  // event frames as they happen. The client resumes with Last-Event-ID.
+  impl_->server->Get("/api/v1/stream",
+                     [this, control_guard](const httplib::Request& request,
+                                           httplib::Response& response) {
+    if (!control_guard(request, response)) return;
+    if (!impl_->options.stream_enabled) {
+      response.status = 404;
+      response.set_content("{\"error\":\"stream disabled\"}",
+                           "application/json");
+      return;
+    }
+    auto sub = std::make_shared<Impl::Subscriber>();
+    {
+      std::lock_guard lock(impl_->stream_mutex);
+      impl_->subscribers.push_back(sub);
+    }
+    response.set_header("Content-Type", "text/event-stream");
+    response.set_header("Cache-Control", "no-cache");
+    response.set_chunked_content_provider(
+        "text/event-stream",
+        [sub](std::size_t, httplib::DataSink& sink) {
+          std::unique_lock lock(sub->mutex);
+          sub->cv.wait_for(lock, std::chrono::seconds(30), [&] {
+            return sub->closed || !sub->frames.empty();
+          });
+          if (sub->closed) {
+            sink.done();
+            return true;
+          }
+          if (sub->frames.empty()) {
+            // Keep-alive comment line so proxies never time the stream
+            // out while the hub is idle.
+            sink.write(": keep-alive\n\n", 14);
+            return true;
+          }
+          const std::string frame = std::move(sub->frames.front());
+          sub->frames.pop_front();
+          sink.write(frame.data(), frame.size());
+          return true;
+        });
+  });
+
   impl_->server->Get("/", serve_static);
   impl_->server->Get(R"(/(.+))", serve_static);
 
@@ -580,6 +728,77 @@ bool Server::start(std::string* error) {
     return true;
   });
 
+  // The SSE hub: broadcasts summary/alerts/events to every subscriber.
+  if (impl_->options.stream_enabled && impl_->options.summary_json) {
+    impl_->stream_running.store(true);
+    impl_->stream_thread = std::thread([this] {
+      while (impl_->stream_running.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::string summary;
+        try {
+          summary = impl_->options.summary_json();
+        } catch (const std::exception&) {
+          continue;
+        }
+        std::string alerts_body;
+        std::set<std::string> alert_ids;
+        if (impl_->options.alerts_json) {
+          try {
+            alerts_body = impl_->options.alerts_json();
+            const auto parsed = nlohmann::json::parse(alerts_body, nullptr,
+                                                      false);
+            if (parsed.is_object() && parsed.contains("items")) {
+              for (const auto& item : parsed["items"])
+                if (item.contains("id"))
+                  alert_ids.insert(item["id"].get<std::string>());
+            }
+          } catch (const std::exception&) {
+          }
+        }
+        std::string events_body;
+        if (impl_->options.events_json) {
+          try {
+            events_body = impl_->options.events_json(impl_->stream_event_seq);
+            const auto parsed = nlohmann::json::parse(events_body, nullptr,
+                                                      false);
+            if (parsed.is_object() && parsed.contains("items")) {
+              for (const auto& item : parsed["items"])
+                if (item.contains("seq"))
+                  impl_->stream_event_seq =
+                      std::max(impl_->stream_event_seq,
+                               item["seq"].get<std::int64_t>());
+            }
+          } catch (const std::exception&) {
+          }
+        }
+
+        const auto sse = [](std::string event, std::string data) {
+          return "event: " + std::move(event) + "\ndata: " +
+                 std::move(data) + "\n\n";
+        };
+        std::vector<std::shared_ptr<Impl::Subscriber>> live;
+        {
+          std::lock_guard lock(impl_->stream_mutex);
+          for (auto& weak : impl_->subscribers)
+            if (auto sub = weak.lock()) live.push_back(sub);
+        }
+        for (const auto& sub : live) {
+          std::lock_guard lock(sub->mutex);
+          if (sub->closed) continue;
+          if (sub->frames.size() < 64) {
+            sub->frames.push_back(sse("summary", std::move(summary)));
+            sub->frames.push_back(sse("alerts", std::move(alerts_body)));
+            if (!events_body.empty())
+              sub->frames.push_back(sse("events", std::move(events_body)));
+          } else {
+            sub->closed = true;  // a stalled client: drop it
+          }
+          sub->cv.notify_all();
+        }
+      }
+    });
+  }
+
   impl_->running.store(true);
   impl_->thread = std::thread([this] {
     if (impl_->options.port == 0) {
@@ -611,7 +830,20 @@ bool Server::start(std::string* error) {
 }
 
 void Server::stop() {
-  if (!impl_->running.load() && !impl_->thread.joinable()) return;
+  if (!impl_->running.load() && !impl_->thread.joinable() &&
+      !impl_->stream_running.load())
+    return;
+  impl_->stream_running.store(false);
+  {
+    std::lock_guard lock(impl_->stream_mutex);
+    for (auto& weak : impl_->subscribers)
+      if (auto sub = weak.lock()) {
+        std::lock_guard sub_lock(sub->mutex);
+        sub->closed = true;
+        sub->cv.notify_all();
+      }
+  }
+  if (impl_->stream_thread.joinable()) impl_->stream_thread.join();
   impl_->running.store(false);
   if (impl_->server) impl_->server->stop();
   if (impl_->thread.joinable()) impl_->thread.join();

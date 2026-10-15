@@ -63,6 +63,14 @@ class Server {
         tree_search_json;
     std::function<std::string()> tree_stats_json;
     std::function<std::string(std::string path)> tree_export_csv;
+    // D2 control providers (absent hooks answer 404).
+    std::function<std::string()> summary_json;
+    std::function<std::string()> alerts_json;
+    std::function<std::string(std::int64_t since)> events_json;
+    std::function<std::string(std::string range)> speed_json;
+    std::function<std::string(std::string range)> spend_json;
+    // SSE stream of summary/alert/event/op frames (plan §4.2).
+    bool stream_enabled{false};
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;

@@ -114,6 +114,13 @@ Statement& Statement::operator=(Statement&& other) noexcept {
   return *this;
 }
 
+bool Statement::bind_double(int index, double value, std::string* error) {
+  const int rc = sqlite3_bind_double(stmt_, index, value);
+  if (rc != SQLITE_OK && error)
+    *error = std::string("sqlite bind failed: ") + sqlite3_errstr(rc);
+  return rc == SQLITE_OK;
+}
+
 bool Statement::bind(int index, std::string_view value, std::string* error) {
   const int rc = sqlite3_bind_text(stmt_, index, value.data(),
                                    static_cast<int>(value.size()),
@@ -155,6 +162,10 @@ std::string Statement::blob(int column) const {
   const int bytes = sqlite3_column_bytes(stmt_, column);
   return std::string(reinterpret_cast<const char*>(value),
                      static_cast<std::size_t>(bytes));
+}
+
+double Statement::real(int column) const {
+  return sqlite3_column_double(stmt_, column);
 }
 
 std::string Statement::text(int column) const {

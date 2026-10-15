@@ -50,6 +50,7 @@ Sample sample();
 std::string os_name();                       // "linux" | "macos" | "windows"
 std::optional<double> total_ram_gb();
 std::optional<double> disk_free_gb(const std::filesystem::path& path);
+std::optional<double> disk_total_gb(const std::filesystem::path& path);
 std::optional<double> link_speed_mbps();     // the default-route interface
 
 // Cryptographically secure random bytes from the OS CSPRNG (/dev/urandom on

@@ -584,6 +584,22 @@ std::optional<double> disk_free_gb(const std::filesystem::path& path) {
 #endif
 }
 
+std::optional<double> disk_total_gb(const std::filesystem::path& path) {
+#ifdef _WIN32
+  ULARGE_INTEGER total_bytes;
+  if (GetDiskFreeSpaceExW(path.c_str(), nullptr, &total_bytes, nullptr))
+    return static_cast<double>(total_bytes.QuadPart) / (1024.0 * 1024.0 *
+                                                       1024.0);
+  return std::nullopt;
+#else
+  struct statvfs stats;
+  if (::statvfs(path.c_str(), &stats) == 0)
+    return static_cast<double>(stats.f_blocks) * stats.f_frsize /
+           (1024.0 * 1024.0 * 1024.0);
+  return std::nullopt;
+#endif
+}
+
 std::optional<double> link_speed_mbps() {
 #ifdef _WIN32
   return std::nullopt;  // Windows fleet profiles arrive with the M9 joins

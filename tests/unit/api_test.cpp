@@ -8,6 +8,13 @@
 
 #include <httplib.h>
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "api/api.hpp"
 #include "state/state.hpp"
 
@@ -597,4 +604,170 @@ TEST_F(ApiTest, ViewModeServesOpenReadsWithoutAuth) {
   const auto version = client.Get("/api/v1/version");
   ASSERT_TRUE(version);
   EXPECT_EQ(nlohmann::json::parse(version->body)["read_only"], true);
+}
+
+// ---------------------------------------------------------------- D2 (§4.4)
+
+#include "api/alerts.hpp"
+#include "api/control_json.hpp"
+
+namespace {
+
+using onion::api::alerts::Inputs;
+
+nlohmann::json alert_ids(const nlohmann::json& body) {
+  nlohmann::json ids = nlohmann::json::array();
+  for (const auto& item : body.at("items"))
+    ids.push_back(item.at("id").get<std::string>());
+  return ids;
+}
+
+bool has_alert(const nlohmann::json& body, std::string_view id) {
+  for (const auto& item : body.at("items"))
+    if (item.at("id").get<std::string>() == id) return true;
+  return false;
+}
+
+}  // namespace
+
+TEST(AlertsTest, ChurnGuardPauseRaisesAndClears) {
+  Inputs paused;
+  paused.campaigns.push_back({"c1", "paused", "no progress"});
+  const auto raised = onion::api::alerts::list(paused);
+  EXPECT_TRUE(has_alert(raised, "campaign-paused-c1"));
+  // The alert names a Resume action on the v1 campaigns route.
+  for (const auto& item : raised.at("items"))
+    if (item.at("id") == "campaign-paused-c1")
+      EXPECT_EQ(item.at("actions")[0].at("path"),
+                "/api/v1/campaigns/c1/resume");
+
+  Inputs running;
+  running.campaigns.push_back({"c1", "running", ""});
+  const auto cleared = onion::api::alerts::list(running);
+  EXPECT_FALSE(has_alert(cleared, "campaign-paused-c1"));
+}
+
+TEST(AlertsTest, ForkBudgetMemberSyncDiskReviewBreakerEachRaiseAndClear) {
+  Inputs raise;
+  raise.forked_batches = 2;
+  raise.device_budget = Inputs::SpendBudget{"100.0", "100.0"};
+  raise.member_states = {{"d1", "SUSPECT"}, {"d2", "DEAD"}};
+  raise.sync = Inputs::Sync{2, 60, 15};
+  raise.disk = Inputs::Disk{5.0, 100.0};
+  raise.review_open = 150;
+  raise.review_threshold = 100;
+  raise.breaker = Inputs::Breaker{true, "transport"};
+  const auto raised = onion::api::alerts::list(raise);
+  EXPECT_TRUE(has_alert(raised, "forked-batches"));
+  EXPECT_TRUE(has_alert(raised, "device-budget-exhausted"));
+  EXPECT_TRUE(has_alert(raised, "member-SUSPECT-d1"));
+  EXPECT_TRUE(has_alert(raised, "member-DEAD-d2"));
+  EXPECT_TRUE(has_alert(raised, "sync-lag"));
+  EXPECT_TRUE(has_alert(raised, "disk-low"));
+  EXPECT_TRUE(has_alert(raised, "review-backlog"));
+  EXPECT_TRUE(has_alert(raised, "circuit-breaker"));
+  EXPECT_EQ(raised.at("items").size(), 8u);
+
+  Inputs clear;
+  clear.campaigns.clear();
+  clear.forked_batches = 0;
+  clear.device_budget = Inputs::SpendBudget{"10.0", "100.0"};
+  clear.sync = Inputs::Sync{2, 10, 15};
+  clear.disk = Inputs::Disk{60.0, 100.0};
+  clear.review_open = 5;
+  clear.review_threshold = 100;
+  clear.breaker = Inputs::Breaker{false, ""};
+  const auto cleared = onion::api::alerts::list(clear);
+  EXPECT_EQ(cleared.at("items").size(), 0u);
+}
+
+// Summary shape over a real writer + metrics store (D2 §4.1).
+TEST_F(ApiTest, SummaryReturnsLiveShape) {
+  server_->stop();
+  Server::Options options;
+  options.port = 0;
+  options.token = "test-token";
+  options.writer = writer_.get();
+  options.dashboard_auth = true;
+  options.summary_json = [this]() {
+    onion::api::control_json::SummaryProbes probes;
+    probes.inflight = 2;
+    probes.limit = 500;
+    probes.device_budget_usd = "100";
+    return onion::api::control_json::summary(*writer_, nullptr, probes)
+        .dump();
+  };
+  server_ = std::make_unique<Server>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(server_->start(&error)) << error;
+  port_ = server_->bound_port();
+
+  httplib::Client client("127.0.0.1", port_);
+  const auto response = client.Get("/api/v1/summary");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 401);  // the guard still applies
+
+  httplib::Client authed("127.0.0.1", port_);
+  authed.set_default_headers({{"X-Onion-Token", "test-token"}});
+  const auto ok = authed.Get("/api/v1/summary");
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(ok->status, 200);
+  const auto body = nlohmann::json::parse(ok->body);
+  EXPECT_EQ(body["inflight"], 2);
+  EXPECT_EQ(body["limit"], 500);
+  EXPECT_EQ(body["budget_usd"], "100");
+  EXPECT_TRUE(body["counts"].contains("nodes"));
+  EXPECT_TRUE(body["sync"].contains("rounds_completed"));
+}
+
+TEST_F(ApiDashTest, StreamServesSummaryEvents) {
+  // Rebuild with a stream-enabled server (summary only; alerts optional).
+  server_->stop();
+  Server::Options options;
+  options.port = 0;
+  options.token = "test-token";
+  options.writer = writer_.get();
+  options.dashboard_auth = true;
+  options.stream_enabled = true;
+  options.summary_json = []() {
+    return std::string("{\"inflight\":1,\"limit\":10}");
+  };
+  server_ = std::make_unique<Server>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(server_->start(&error)) << error;
+  port_ = server_->bound_port();
+
+  const std::string cookie = sign_in();
+  // Raw socket read: the stream never ends, so a client Get() would block.
+#ifndef _WIN32
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  struct sockaddr_in address {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<std::uint16_t>(port_));
+  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&address),
+                      sizeof(address)),
+            0);
+  std::string request =
+      "GET /api/v1/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+      "Cookie: " +
+      cookie + "\r\nAccept: text/event-stream\r\n\r\n";
+  ASSERT_EQ(::send(fd, request.data(), request.size(), 0),
+            static_cast<ssize_t>(request.size()));
+  // The headers arrive immediately; the first summary frame follows the
+  // hub's 2 s tick. Accumulate until it lands (≤ 6 s).
+  timeval timeout{1, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  std::string payload;
+  char buffer[4096];
+  for (int attempt = 0; attempt < 6; ++attempt) {
+    const ssize_t read_count = ::recv(fd, buffer, sizeof(buffer), 0);
+    if (read_count > 0) payload.append(buffer, read_count);
+    if (payload.find("event: summary") != std::string::npos) break;
+  }
+  EXPECT_NE(payload.find("event: summary"), std::string::npos);
+  EXPECT_NE(payload.find("\"inflight\":1"), std::string::npos);
+  ::close(fd);
+#endif  // !_WIN32
 }

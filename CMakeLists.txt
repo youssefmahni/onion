@@ -143,6 +143,8 @@ target_link_libraries(store PUBLIC onion_sqlite onion::log)
 target_link_libraries(store PUBLIC onion::core onion::platform)
 onion_add_compiled_module(viewcache src/viewcache/viewcache.cpp)
 target_link_libraries(viewcache PUBLIC onion::store)
+onion_add_compiled_module(metrics src/metrics/metrics.cpp)
+target_link_libraries(metrics PUBLIC onion::store onion::llm)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
   # keeps certificate validation on the Windows trust store.
@@ -207,7 +209,7 @@ target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
 
 # Interface layer
-onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp)
+onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp src/api/alerts.cpp src/api/control_json.cpp)
 # The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
 # httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
 # httplib::httplib CMake target would pull a Homebrew OpenSSL that cannot
@@ -219,6 +221,7 @@ if(WIN32)
 endif()
 target_link_libraries(api PUBLIC onion::state)
 target_link_libraries(api PUBLIC onion::viewcache)
+target_link_libraries(api PUBLIC onion::metrics)
 onion_add_module(cli)
 target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
 
@@ -261,6 +264,11 @@ if(BUILD_TESTING)
   target_link_libraries(onion_viewcache_test PRIVATE onion::viewcache
     onion::state GTest::gtest_main)
   gtest_discover_tests(onion_viewcache_test)
+
+  add_executable(onion_metrics_test tests/unit/metrics_test.cpp)
+  target_link_libraries(onion_metrics_test PRIVATE onion::metrics
+    onion::llm GTest::gtest_main)
+  gtest_discover_tests(onion_metrics_test)
 
   add_executable(onion_state_test tests/unit/state_test.cpp)
   target_link_libraries(onion_state_test PRIVATE onion::state GTest::gtest_main)
@@ -390,7 +398,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::viewcache onion::profile onion::sync onion::swim)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::viewcache onion::metrics onion::profile onion::sync onion::swim)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 if(ONION_CHAOS_HOOKS)
@@ -400,7 +408,7 @@ endif()
 # Dashboard static files (plan §3.1): embedded into the binary at build time.
 # dashboard.html stays disk-loaded for now (removed in D6).
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-file(GLOB_RECURSE ONION_WEB_FILES
+file(GLOB_RECURSE ONION_WEB_FILES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html"
   "${CMAKE_CURRENT_SOURCE_DIR}/web/app.js"
   "${CMAKE_CURRENT_SOURCE_DIR}/web/styles.css"
