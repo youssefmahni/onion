@@ -41,8 +41,9 @@ Note column). Last audited 2026-10-14 against `origin/main` @ `cb0f3ab`
 
 | 0025 | Branch-share allowances apply to engine-created expansion only (imported tickets never leaf as "allowance spent"); the no-progress churn guard | *claimed 2026-10-14 (Mac Pro live-test finding)* | amends 0023 (the pool ledger) |
 | 0026 | Remove audit sampling from the engine | Accepted (owner directive) | supersedes 0024's audit-sampling clauses | on b3-gate-funnel |
+| 0027 | Import safety and domain profiles (RE&CT readiness) | Accepted (owner directive) | amends 0025 (source field) | on b3-gate-funnel |
 
-Next free number: **0027**.
+Next free number: **0028**.
 
 ## Rules
 
