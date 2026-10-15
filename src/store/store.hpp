@@ -93,6 +93,16 @@ struct Campaign {
   std::string reason;  // e.g. "no progress" (the churn guard, decision 0025)
 };
 
+// Decision 0027: a folded domain profile (PROFILE records). Content-
+// addressed: the hash is the profile_hash over the canonical JSON, and
+// campaigns carry it.
+struct DomainProfile {
+  std::string hash;
+  std::string name;
+  std::string tree;
+  std::string json;
+};
+
 // RAII prepared statement: fails hard on misuse in debug, reports errors out.
 class Statement {
  public:
@@ -184,6 +194,13 @@ class Db {
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,
                   std::string* error, std::string_view tree = "") const;
+
+  // Decision 0027: folded domain profiles, content-addressed by hash.
+  std::optional<DomainProfile> domain_profile(std::string_view hash,
+                                              std::string* error) const;
+  bool store_domain_profile(std::string_view hash, std::string_view name,
+                            std::string_view tree, std::string_view json,
+                            std::string* error);
 
   std::filesystem::path path() const { return path_; }
 

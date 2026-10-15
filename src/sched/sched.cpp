@@ -82,6 +82,7 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
   spec.tree = value.value("tree", std::string{});
+  spec.profile_hash = value.value("profile_hash", std::string{});
   // Decision 0024. critic: "on" | "off" (a boolean is accepted too).
   if (value.contains("critic")) {
     if (value["critic"].is_boolean())
@@ -226,6 +227,7 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   // travel in the record so every replica folds the same numbers.
   out["branch_share"] = std::to_string(spec.branch_share);
   if (!spec.tree.empty()) out["tree"] = spec.tree;
+  if (!spec.profile_hash.empty()) out["profile_hash"] = spec.profile_hash;
   if (spec.depth_checkpoint_every > 0) {
     out["depth_checkpoint_from"] = spec.depth_checkpoint_from;
     out["depth_checkpoint_every"] = spec.depth_checkpoint_every;
@@ -519,6 +521,40 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   }
 
   gate::FunnelOptions funnel_options;
+  // Decision 0027: resolve the campaign's domain profile. Empty hash =
+  // the embedded planning profile (byte-identical to the historical
+  // hard-coded rules). A device that does not hold the exact profile
+  // does not run the campaign: pause it with a clear reason.
+  onion::domain::Profile profile = onion::domain::planning_profile();
+  if (!spec.profile_hash.empty()) {
+    std::string profile_error;
+    const auto held =
+        writer.db().domain_profile(spec.profile_hash, &profile_error);
+    if (!held) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"state", "paused"},
+                       {"reason", "profile " + spec.profile_hash +
+                                      " not held"}})}});
+      writer.sync();
+      result.end_reason = "profile missing";
+      return result;
+    }
+    const auto parsed = onion::domain::parse_profile(
+        nlohmann::json::parse(held->json, nullptr, false), &profile_error);
+    if (!parsed) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"state", "paused"},
+                       {"reason", "profile parse failed: " +
+                                      profile_error}})}});
+      writer.sync();
+      result.end_reason = "profile invalid";
+      return result;
+    }
+    profile = *parsed;
+  }
+  funnel_options.profile = profile;
   funnel_options.params.max_attempts = spec.max_attempts;
   funnel_options.params.children_min = spec.children_min;
   funnel_options.critic = spec.critic;
@@ -1165,10 +1201,16 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       }
       case gate::Decision::Commit: {
         const auto& chosen = funnel_result.attempts[funnel_result.chosen];
-        // Structure (DESIGN › Campaigns › structure): L1..L3 expansion
-        // (layers 0..2) runs only when the campaign allows it; otherwise
-        // the result goes to review.
-        if (!spec.structure && ticket.layer < 3) {
+        // Structure (DESIGN › Campaigns › structure): expansion at the
+        // profile's structure_layers runs only when the campaign allows
+        // it; otherwise the result goes to review. The embedded planning
+        // profile lists layers 0..2 — the historical L1..L3 rule.
+        const bool needs_structure = [&] {
+          for (const int layer : profile.structure_layers)
+            if (layer == ticket.layer) return true;
+          return false;
+        }();
+        if (!spec.structure && needs_structure) {
           emit_needs_review(chosen, "structure disallowed");
           break;
         }

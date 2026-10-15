@@ -135,6 +135,18 @@ TEST(ParseCampaign, TreeRoundTrips) {
   const auto reparsed = parse_campaign(canonical, &error);
   ASSERT_TRUE(reparsed.has_value()) << error;
   EXPECT_EQ(reparsed->tree, "react");
+
+  // Decision 0027: the campaign carries its domain profile's hash
+  // (empty = the embedded planning profile, not serialized).
+  const auto hashed = parse_campaign(
+      json{{"id", "h"}, {"profile_hash", "abcd1234"}}, &error);
+  ASSERT_TRUE(hashed.has_value()) << error;
+  EXPECT_EQ(hashed->profile_hash, "abcd1234");
+  const auto canonical_hashed = onion::sched::campaign_spec_json(*hashed);
+  EXPECT_EQ(canonical_hashed["profile_hash"].get<std::string>(), "abcd1234");
+  const auto reparsed_hashed = parse_campaign(canonical_hashed, &error);
+  ASSERT_TRUE(reparsed_hashed.has_value()) << error;
+  EXPECT_EQ(reparsed_hashed->profile_hash, "abcd1234");
 }
 
 TEST(ParseCampaign, RejectsInvalidVariantFields) {

@@ -14,6 +14,7 @@
 
 #include "log/log.hpp"
 #include "store/checkpoint.hpp"
+#include "domain/domain.hpp"
 
 namespace onion::state {
 namespace {
@@ -27,9 +28,30 @@ std::int64_t wall_ms() {
 
 // The deterministic fold: one record type, one store mutation. Upserts use
 // the highest (hlc, origin) so a replay after a crash is idempotent.
-void upsert_node(store::Db& db, const log::Record& record,
-                 std::string_view writer_origin, std::string* error) {
+// Decision 0027: a PROFILE record folds into the content-addressed
+// domain_profiles table. The payload IS the profile JSON; the hash is
+// recomputed over its canonical form so a tampered record can never
+// impersonate a profile (the chain signature already covers it, but the
+// hash is what campaigns match against).
+void upsert_domain_profile(store::Db& db, const log::Record& record,
+                           std::string_view, std::string* error) {
   const auto& payload = record.payload;
+  std::string parse_error;
+  const auto profile = onion::domain::parse_profile(payload, &parse_error);
+  if (!profile) {
+    if (error) *error = "PROFILE fold: " + parse_error;
+    return;
+  }
+  const std::string hash = onion::domain::profile_hash(*profile);
+  const std::string json = onion::log::canonical_json(payload);
+  if (!db.store_domain_profile(hash, profile->name, profile->tree, json,
+                               error)) {
+    if (error && error->empty()) *error = "PROFILE fold failed";
+  }
+}
+
+void upsert_node(store::Db& db, const log::Record& record,
+                 std::string_view writer_origin, std::string* error) {  const auto& payload = record.payload;
   const std::string path = payload.at("path").get<std::string>();
   const std::int64_t layer = payload.at("layer").get<std::int64_t>();
   const std::string title = payload.at("title").get<std::string>();
@@ -598,6 +620,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   const std::string& type = record.type;
   const std::string origin(batch_origin);
   if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
+  else if (type == "PROFILE") upsert_domain_profile(db_, record, origin, error);
   else if (type == "SETTLE") {
     upsert_settle(db_, record, origin, error);
     // A settle ends any CLAIM and REEXPAND lock on the path.

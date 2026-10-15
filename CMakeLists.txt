@@ -208,7 +208,7 @@ target_link_libraries(sched PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(sched PUBLIC onion::core onion::gate onion::state)
 onion_add_compiled_module(state src/state/state.cpp)
 target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
-target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
+target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static onion::domain)
 
 # Interface layer
 onion_add_compiled_module(api src/api/api.cpp)

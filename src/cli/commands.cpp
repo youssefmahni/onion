@@ -2078,6 +2078,23 @@ int campaign_cmd(int argc, char** argv) {
       std::string pool_error;
       with_pools.pools = onion::sched::compute_starting_pools(
           *writer, *spec, &pool_error);
+      // Decision 0027: the campaign record carries its profile's hash.
+      // Empty = the embedded planning profile; a custom hash must be
+      // held by this device already (folded from a PROFILE record).
+      if (with_pools.profile_hash.empty()) {
+        with_pools.profile_hash =
+            onion::domain::profile_hash(onion::domain::planning_profile());
+      } else {
+        std::string profile_error;
+        const auto held =
+            writer->db().domain_profile(with_pools.profile_hash,
+                                        &profile_error);
+        if (!held) {
+          std::cerr << "this device does not hold profile "
+                    << with_pools.profile_hash << "\n";
+          return 1;
+        }
+      }
       writer->submit(onion::state::CommitTerminal{{make_record(
           "CAMPAIGN", {{"id", with_pools.id},
                        {"spec", onion::sched::campaign_spec_json(with_pools)},
@@ -2295,6 +2312,58 @@ int dev_import_cmd(int argc, char** argv) {
   // clone includes the new tree without waiting for the 6 h cadence.
   writer->submit(onion::state::WriteCheckpoint{});
   writer->sync();
+  return 0;
+}
+
+// Decision 0027: publish a domain profile. The record is signed like any
+// other (the batch signature) and distributed with the log; campaigns
+// carry its hash.
+int profile_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot profile add --file <profile.json> "
+                 "[--data-dir <dir>]\n"
+              << "\npublish a domain profile as a signed PROFILE record. "
+                 "The printed hash is what a campaign file references as "
+                 "profile_hash.\n";
+    return 0;
+  }
+  const std::string action = argc >= 3 ? argv[2] : "";
+  if (action != "add") {
+    std::cerr << "usage: data_depot profile add --file <profile.json>\n";
+    return 2;
+  }
+  const std::string file = flag(argc, argv, "--file", "");
+  if (file.empty()) {
+    std::cerr << "profile add needs --file <profile.json>\n";
+    return 2;
+  }
+  const nlohmann::json value =
+      nlohmann::json::parse(load_file(file), nullptr, false);
+  if (value.is_discarded()) {
+    std::cerr << "profile file is not valid JSON\n";
+    return 2;
+  }
+  std::string parse_error;
+  const auto profile = onion::domain::parse_profile(value, &parse_error);
+  if (!profile) {
+    std::cerr << parse_error << "\n";
+    return 2;
+  }
+  const std::string hash = onion::domain::profile_hash(*profile);
+  const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
+  std::string error;
+  auto writer = open_writer(dir, &error);
+  if (!writer) {
+    std::cerr << error << "\n";
+    return 1;
+  }
+  writer->submit(onion::state::CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(*profile))}});
+  writer->sync();
+  std::cout << "profile " << profile->name << " tree \"" << profile->tree
+            << "\" hash " << hash << "\n";
   return 0;
 }
 

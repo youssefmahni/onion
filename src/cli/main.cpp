@@ -430,6 +430,9 @@ const HelpEntry kTopLevel[] = {
      "import a development corpus (per-layer CSVs) into the data dir"},
     {"export-csv", "export-csv --out <dir>",
      "export the knowledge tree to per-layer CSVs"},
+    {"profile", "profile add --file <profile.json>",
+     "publish a domain profile (signed PROFILE record; campaigns carry "
+     "its hash)"},
     {"admin", "admin keygen --out <path>",
      "administrator key management (the admin key never lives in the data "
      "dir)"},
@@ -579,6 +582,7 @@ int main(int argc, char** argv) {
   if (command == "review") return review_cmd(argc, argv);
   if (command == "dev-import") return dev_import_cmd(argc, argv);
   if (command == "export-csv") return export_csv_cmd(argc, argv);
+  if (command == "profile") return profile_cmd(argc, argv);
   if (command == "admin") return admin_cmd(argc, argv);
   if (command == "genesis-import") return genesis_import_cmd(argc, argv);
   std::cerr << "unknown command: " << command << " (run 'data_depot --help')\n";

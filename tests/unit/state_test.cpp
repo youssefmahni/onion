@@ -13,6 +13,8 @@
 #endif
 
 #include "state/state.hpp"
+
+#include "domain/domain.hpp"
 #include "store/checkpoint.hpp"
 
 namespace {
@@ -1434,6 +1436,43 @@ TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
   writer_->sync();
   EXPECT_EQ(writer_->audits_open("mp1"), 0);
   EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
+}
+
+TEST_F(StateWriterTest, ProfileRecordFoldsIntoDomainProfiles) {
+  // Decision 0027: PROFILE records fold into the content-addressed
+  // domain_profiles table; campaigns match on the hash.
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer_->start(&start_error)) << start_error;
+  }
+  const auto profile = onion::domain::planning_profile();
+  writer_->submit(CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(profile))}});
+  writer_->sync();
+  const std::string hash = onion::domain::profile_hash(profile);
+  std::string error;
+  const auto held = writer_->db().domain_profile(hash, &error);
+  ASSERT_TRUE(held) << error;
+  EXPECT_EQ(held->name, "planning");
+  EXPECT_EQ(held->tree, "");
+  EXPECT_EQ(held->hash, hash);
+  // An unknown hash is simply not held.
+  EXPECT_FALSE(
+      writer_->db()
+          .domain_profile(std::string(64, 'f'), &error)
+          .has_value());
+  // A custom profile with a tree folds under its own hash.
+  onion::domain::Profile react = onion::domain::planning_profile();
+  react.name = "react";
+  react.tree = "react";
+  react.structure_layers.clear();
+  writer_->submit(CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(react))}});
+  writer_->sync();
+  const auto react_held =
+      writer_->db().domain_profile(onion::domain::profile_hash(react), &error);
+  ASSERT_TRUE(react_held) << error;
+  EXPECT_EQ(react_held->tree, "react");
 }
 
 TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollisionRefuses) {

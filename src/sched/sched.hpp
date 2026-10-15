@@ -67,6 +67,10 @@ struct CampaignSpec {
   // Decision 0027: the domain tree this campaign works in (empty = the
   // planning tree). Every ADD_NODE the campaign emits carries it.
   std::string tree;
+  // Decision 0027: the domain profile's hash. Empty = the embedded
+  // planning profile. A device that does not hold the exact profile
+  // refuses to run the campaign.
+  std::string profile_hash;
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,

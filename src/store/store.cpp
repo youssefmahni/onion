@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS applied   (origin TEXT PRIMARY KEY, seq INTEGER NOT N
 CREATE TABLE IF NOT EXISTS batches  (origin TEXT NOT NULL, number INTEGER NOT NULL, hash TEXT NOT NULL,
                         PRIMARY KEY (origin, number));
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS domain_profiles (hash TEXT PRIMARY KEY, name TEXT NOT NULL,
+                       tree TEXT NOT NULL, json TEXT NOT NULL);
 )sql";
 
 void set_error(std::string* error, sqlite3* handle, std::string_view prefix) {
@@ -527,6 +529,51 @@ std::vector<Campaign> Db::campaigns(std::string* error) const {
   }
   if (!step_error.empty()) set_error(error, handle_, "campaign query failed");
   return campaigns;
+}
+
+std::optional<DomainProfile> Db::domain_profile(std::string_view hash,
+                                                std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT hash, name, tree, json FROM domain_profiles WHERE hash = ?1;",
+      error);
+  if (!stmt) return std::nullopt;
+  std::string bind_error;
+  if (!stmt->bind(1, std::string(hash), &bind_error)) {
+    set_error(error, handle_, "domain profile bind failed");
+    return std::nullopt;
+  }
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return std::nullopt;
+  DomainProfile profile;
+  profile.hash = stmt->text(0);
+  profile.name = stmt->text(1);
+  profile.tree = stmt->text(2);
+  profile.json = stmt->text(3);
+  return profile;
+}
+
+bool Db::store_domain_profile(std::string_view hash, std::string_view name,
+                              std::string_view tree, std::string_view json,
+                              std::string* error) {
+  // Content-addressed: the same hash always folds to the same profile.
+  std::optional<Statement> stmt = prepare(
+      "INSERT OR IGNORE INTO domain_profiles(hash, name, tree, json) "
+      "VALUES (?1, ?2, ?3, ?4);",
+      error);
+  if (!stmt) return false;
+  std::string bind_error;
+  if (!stmt->bind(1, std::string(hash), &bind_error) ||
+      !stmt->bind(2, std::string(name), &bind_error) ||
+      !stmt->bind(3, std::string(tree), &bind_error) ||
+      !stmt->bind(4, std::string(json), &bind_error)) {
+    set_error(error, handle_, "domain profile bind failed: " + bind_error);
+    return false;
+  }
+  if (stmt->step(&bind_error) || !bind_error.empty()) {
+    set_error(error, handle_, "domain profile insert failed: " + bind_error);
+    return false;
+  }
+  return true;
 }
 
 std::vector<Settle> Db::settles(std::string* error) const {
