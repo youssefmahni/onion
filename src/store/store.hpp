@@ -37,6 +37,7 @@ struct Settle {
   int attempts{};
   std::string score;
   std::string campaign;
+  std::string end;  // how the node ended ("" for pre-migration rows)
   std::uint64_t hlc{};
   std::string origin;
 };
@@ -139,6 +140,9 @@ class Db {
   // The raw handle, for callers that need sqlite3 functions directly
   // (e.g. sqlite3_changes).
   sqlite3* handle() const { return handle_; }
+  // Rows changed by the most recent statement on this connection
+  // (sqlite3_changes; the fold's counter deltas read this).
+  int changes() const;
 
   // Plain SQL with no results.
   bool exec(std::string_view sql, std::string* error);
@@ -152,6 +156,33 @@ class Db {
   std::vector<Node> all_nodes(std::string* error) const;
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
                                            std::string* error) const;
+  // Dashboard tree reads (plan §4.1): keyset cursors, never OFFSET.
+  std::vector<Node> children_page(std::string_view parent_path,
+                                  std::string_view cursor, int limit,
+                                  std::string* error) const;
+  std::int64_t children_count(std::string_view parent_path,
+                              std::string* error) const;
+  std::int64_t children_count_after(std::string_view parent_path,
+                                    std::string_view after_path,
+                                    std::string* error) const;
+  std::int64_t subtree_count(std::string_view path, std::string* error) const;
+  std::optional<Settle> settle_by_path(std::string_view path,
+                                       std::string* error) const;
+  std::vector<Attempt> attempts_for(std::string_view path,
+                                    std::string* error) const;
+  std::vector<Critique> critiques_for(std::string_view path,
+                                      std::string* error) const;
+  std::vector<std::pair<int, std::int64_t>> level_counts(
+      std::string* error) const;
+  std::vector<std::pair<std::string, std::int64_t>> status_counts(
+      std::string* error) const;
+  // LIKE-based title search (the viewcache FTS path supersedes this when
+  // present). At most `limit` rows, best matches by prefix first.
+  std::vector<Node> search_titles(std::string_view query, int limit,
+                                  std::string* error) const;
+  // The membership state ("ACTIVE" | ...) for a device id, if known.
+  std::optional<std::string> member_state(std::string_view device_id,
+                                          std::string* error) const;
   std::vector<Review> open_reviews(std::string* error) const;
   // The review row's state for one path ("open" | "decided"), empty when
   // the path never had a review (M8 depth checkpoints: a decided review

@@ -12,6 +12,16 @@
 namespace onion::store {
 namespace {
 
+std::string escape_like(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const char c : value) {
+    if (c == '%' || c == '_' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
 std::string csv_field(std::string_view value) {
   const bool needs_quoting =
       value.find(',') != std::string_view::npos ||
@@ -60,6 +70,11 @@ CREATE TABLE IF NOT EXISTS applied   (origin TEXT PRIMARY KEY, seq INTEGER NOT N
 CREATE TABLE IF NOT EXISTS batches  (origin TEXT NOT NULL, number INTEGER NOT NULL, hash TEXT NOT NULL,
                         PRIMARY KEY (origin, number));
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+-- Dashboard counters (plan §6.1): derived, rebuildable, updated in the
+-- same transaction as each fold. stats_levels counts live (non-tombstone)
+-- nodes per layer; stats_status counts settle endings per `end` kind.
+CREATE TABLE IF NOT EXISTS stats_levels(layer INTEGER PRIMARY KEY, nodes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS stats_status(status TEXT PRIMARY KEY, n INTEGER NOT NULL);
 )sql";
 
 void set_error(std::string* error, sqlite3* handle, std::string_view prefix) {
@@ -158,6 +173,8 @@ int Statement::integer_int(int column) const {
 
 Db::Db(std::filesystem::path path) : path_(std::move(path)) {}
 Db::~Db() { close(); }
+
+int Db::changes() const { return sqlite3_changes(handle_); }
 
 void Db::close() {
   if (handle_) {
@@ -294,6 +311,12 @@ bool Db::open(std::string* error) {
   // B5 (decision 0025): campaigns carry the pause reason ("no progress").
   sqlite3_exec(handle_,
                "ALTER TABLE campaigns ADD COLUMN reason TEXT;",
+               nullptr, nullptr, nullptr);
+  // Dashboard: settles carry their ending kind ("children" | "cannot
+  // split" | "allowance spent" | ...) so tree/stats can count how nodes
+  // ended without re-reading the log.
+  sqlite3_exec(handle_,
+               "ALTER TABLE settles ADD COLUMN end TEXT;",
                nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
@@ -471,6 +494,222 @@ std::optional<std::string> Db::review_state(std::string_view path,
   return stmt->text(0);
 }
 
+std::vector<Node> Db::children_page(std::string_view parent_path,
+                                    std::string_view cursor, int limit,
+                                    std::string* error) const {
+  // Keyset cursor over the parent's children, ordered by path (stable,
+  // matches the tree's visual order). The parent resolves by path so the
+  // root (empty parent) is one uniform case.
+  std::optional<Statement> stmt = prepare(
+      std::string("SELECT ") + kNodeColumns +
+          " FROM nodes WHERE parent_id IS (SELECT id FROM nodes WHERE path "
+          "= ?1) AND tombstone = 0 AND path > ?2 ORDER BY path LIMIT ?3;",
+      error);
+  if (!stmt) return {};
+  std::string bind_error;
+  if (!stmt->bind(1, std::string(parent_path), &bind_error) ||
+      !stmt->bind(2, std::string(cursor), &bind_error) ||
+      !stmt->bind(3, std::max(1, std::min(limit, 200)), &bind_error)) {
+    set_error(error, handle_, "children bind failed");
+    return {};
+  }
+  std::string step_error;
+  std::vector<Node> children;
+  while (stmt->step_row(&step_error))
+    children.push_back(read_node(*stmt));
+  if (!step_error.empty())
+    set_error(error, handle_, "children query failed");
+  return children;
+}
+
+std::int64_t Db::children_count(std::string_view parent_path,
+                                std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT COUNT(*) FROM nodes WHERE parent_id IS (SELECT id FROM nodes "
+      "WHERE path = ?1) AND tombstone = 0;",
+      error);
+  if (!stmt) return 0;
+  std::string bind_error;
+  stmt->bind(1, std::string(parent_path), &bind_error);
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return 0;
+  return stmt->integer(0);
+}
+
+std::int64_t Db::children_count_after(std::string_view parent_path,
+                                    std::string_view after_path,
+                                    std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT COUNT(*) FROM nodes WHERE parent_id IS (SELECT id FROM nodes "
+      "WHERE path = ?1) AND tombstone = 0 AND path > ?2;",
+      error);
+  if (!stmt) return 0;
+  std::string bind_error;
+  stmt->bind(1, std::string(parent_path), &bind_error);
+  stmt->bind(2, std::string(after_path), &bind_error);
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return 0;
+  return stmt->integer(0);
+}
+
+std::int64_t Db::subtree_count(std::string_view path, std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT COUNT(*) FROM nodes WHERE path = ?1 OR (path > ?2 AND path < "
+      "?3);",
+      error);
+  if (!stmt) return 0;
+  const std::string bound(path);
+  const std::string ceiling = bound + ".";
+  std::string bind_error;
+  if (!stmt->bind(1, bound, &bind_error) ||
+      !stmt->bind(2, bound, &bind_error) ||
+      !stmt->bind(3, ceiling, &bind_error)) {
+    set_error(error, handle_, "subtree count bind failed");
+    return 0;
+  }
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return 0;
+  return stmt->integer(0);
+}
+
+std::optional<Settle> Db::settle_by_path(std::string_view path,
+                                         std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT path, kept, atomic, attempts, score, campaign, end, hlc, "
+      "origin FROM settles WHERE path = ?1;",
+      error);
+  if (!stmt) return std::nullopt;
+  std::string bind_error;
+  stmt->bind(1, std::string(path), &bind_error);
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return std::nullopt;
+  Settle settle;
+  settle.path = stmt->text(0);
+  settle.kept = stmt->integer_int(1);
+  settle.atomic = stmt->integer_int(2);
+  settle.attempts = stmt->integer_int(3);
+  settle.score = stmt->text(4);
+  settle.campaign = stmt->text(5);
+  settle.end = stmt->text(6);
+  settle.hlc = static_cast<std::uint64_t>(stmt->integer(7));
+  settle.origin = stmt->text(8);
+  return settle;
+}
+
+std::vector<Attempt> Db::attempts_for(std::string_view path,
+                                      std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT path, n, score, passed, tokens_in, tokens_cached, tokens_out, "
+      "cost, campaign, hlc, origin FROM attempts WHERE path = ?1 "
+      "ORDER BY n;",
+      error);
+  if (!stmt) return {};
+  std::string bind_error;
+  stmt->bind(1, std::string(path), &bind_error);
+  std::string step_error;
+  std::vector<Attempt> attempts;
+  while (stmt->step_row(&step_error)) {
+    Attempt attempt;
+    attempt.path = stmt->text(0);
+    attempt.n = stmt->integer_int(1);
+    attempt.score = stmt->text(2);
+    attempt.passed = stmt->integer_int(3);
+    attempt.tokens_in = stmt->integer(4);
+    attempt.tokens_cached = stmt->integer(5);
+    attempt.tokens_out = stmt->integer(6);
+    attempt.cost = stmt->text(7);
+    attempt.campaign = stmt->text(8);
+    attempt.hlc = static_cast<std::uint64_t>(stmt->integer(9));
+    attempt.origin = stmt->text(10);
+    attempts.push_back(std::move(attempt));
+  }
+  if (!step_error.empty())
+    set_error(error, handle_, "attempts query failed");
+  return attempts;
+}
+
+std::vector<Critique> Db::critiques_for(std::string_view path,
+                                        std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT path, score, issues, remove, add_, hlc, origin FROM critiques "
+      "WHERE path = ?1 ORDER BY hlc;",
+      error);
+  if (!stmt) return {};
+  std::string bind_error;
+  stmt->bind(1, std::string(path), &bind_error);
+  std::string step_error;
+  std::vector<Critique> critiques;
+  while (stmt->step_row(&step_error)) {
+    Critique critique;
+    critique.path = stmt->text(0);
+    critique.score = stmt->text(1);
+    critique.issues = stmt->text(2);
+    critique.remove = stmt->text(3);
+    critique.add = stmt->text(4);
+    critique.hlc = static_cast<std::uint64_t>(stmt->integer(5));
+    critique.origin = stmt->text(6);
+    critiques.push_back(std::move(critique));
+  }
+  if (!step_error.empty())
+    set_error(error, handle_, "critiques query failed");
+  return critiques;
+}
+
+std::vector<std::pair<int, std::int64_t>> Db::level_counts(
+    std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT layer, nodes FROM stats_levels ORDER BY layer;", error);
+  if (!stmt) return {};
+  std::string step_error;
+  std::vector<std::pair<int, std::int64_t>> counts;
+  while (stmt->step_row(&step_error))
+    counts.emplace_back(stmt->integer_int(0), stmt->integer(1));
+  if (!step_error.empty())
+    set_error(error, handle_, "level counts failed");
+  return counts;
+}
+
+std::vector<std::pair<std::string, std::int64_t>> Db::status_counts(
+    std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT status, n FROM stats_status ORDER BY n DESC, status;", error);
+  if (!stmt) return {};
+  std::string step_error;
+  std::vector<std::pair<std::string, std::int64_t>> counts;
+  while (stmt->step_row(&step_error))
+    counts.emplace_back(stmt->text(0), stmt->integer(1));
+  if (!step_error.empty())
+    set_error(error, handle_, "status counts failed");
+  return counts;
+}
+
+std::vector<Node> Db::search_titles(std::string_view query, int limit,
+                                    std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      std::string("SELECT ") + kNodeColumns +
+          " FROM nodes WHERE tombstone = 0 AND (title LIKE ?1 ESCAPE '\\' "
+          "OR path LIKE ?1 ESCAPE '\\') ORDER BY "
+          "CASE WHEN title LIKE ?2 ESCAPE '\\' THEN 0 ELSE 1 END, path "
+          "LIMIT ?3;",
+      error);
+  if (!stmt) return {};
+  const std::string pattern = "%" + escape_like(std::string(query)) + "%";
+  const std::string prefix = escape_like(std::string(query)) + "%";
+  std::string bind_error;
+  if (!stmt->bind(1, pattern, &bind_error) ||
+      !stmt->bind(2, prefix, &bind_error) ||
+      !stmt->bind(3, std::max(1, std::min(limit, 200)), &bind_error)) {
+    set_error(error, handle_, "search bind failed");
+    return {};
+  }
+  std::string step_error;
+  std::vector<Node> nodes;
+  while (stmt->step_row(&step_error)) nodes.push_back(read_node(*stmt));
+  if (!step_error.empty())
+    set_error(error, handle_, "search query failed");
+  return nodes;
+}
+
 std::vector<Review> Db::open_reviews(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT path, reason, state, note, atomic, hlc, origin FROM reviews "
@@ -516,7 +755,8 @@ std::vector<Campaign> Db::campaigns(std::string* error) const {
 
 std::vector<Settle> Db::settles(std::string* error) const {
   std::optional<Statement> stmt = prepare(
-      "SELECT path, kept, atomic, attempts, score, campaign, hlc, origin "
+      "SELECT path, kept, atomic, attempts, score, campaign, end, hlc, "
+      "origin "
       "FROM settles ORDER BY path;",
       error);
   if (!stmt) return {};
@@ -530,8 +770,9 @@ std::vector<Settle> Db::settles(std::string* error) const {
     settle.attempts = stmt->integer_int(3);
     settle.score = stmt->text(4);
     settle.campaign = stmt->text(5);
-    settle.hlc = static_cast<std::uint64_t>(stmt->integer(6));
-    settle.origin = stmt->text(7);
+    settle.end = stmt->text(6);
+    settle.hlc = static_cast<std::uint64_t>(stmt->integer(7));
+    settle.origin = stmt->text(8);
     settles.push_back(std::move(settle));
   }
   if (!step_error.empty()) set_error(error, handle_, "settle query failed");
@@ -675,6 +916,18 @@ std::vector<Attempt> Db::attempts(std::string* error) const {
   }
   if (!step_error.empty()) set_error(error, handle_, "attempts query failed");
   return attempts;
+}
+
+std::optional<std::string> Db::member_state(std::string_view device_id,
+                                            std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT state FROM members WHERE device_id = ?1;", error);
+  if (!stmt) return std::nullopt;
+  std::string bind_error;
+  stmt->bind(1, std::string(device_id), &bind_error);
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return std::nullopt;
+  return stmt->text(0);
 }
 
 }  // namespace onion::store

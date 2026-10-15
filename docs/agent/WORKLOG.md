@@ -1,4 +1,37 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D1 · tree endpoints + viewcache + screens 5–7 (WIP, handoff)
+
+Result: in progress — branch `dash/d1-tree` (local, pushed as WIP). NOT yet
+PR'd: the §8 perf proof was mid-run when the session handed off.
+Evidence:
+- Store (§6.1): settles.end column (migration), stats_levels/stats_status
+  counter tables; fold deltas via sqlite3_changes in upsert_node/upsert_settle/
+  TOMBSTONE (replay-idempotent); recompute_stats at every startup; the
+  fold-idempotency property test now dumps the counters (34/34 state tests).
+- viewcache (§6.2): new src/viewcache module — counts(path,children,subtree)
+  with bottom-up subtree fold, FTS5 (external content fts_titles + fts,
+  SQLITE_ENABLE_FTS5 now on for the vendored amalgamation), meta
+  (version+applied vector); rebuild/stale/node_added/node_removed with
+  incremental ancestor walks; mutex-serialized. 4/4 viewcache tests.
+- API (§4.1): /api/v1/tree/children|node|search|stats|export.csv behind the
+  session/token guard; view-mode open reads when dashboard_auth=false and
+  token empty; version carries read_only. Providers are pure functions in
+  src/api/tree_json.cpp (api module) — 27/27 api tests incl. paging/cursor,
+  stats counters, search jump, CSV, 401s, view mode.
+- CLI: node run wires the cache + a maintenance thread (fold-hook queue ->
+  incremental updates -> throttled rebuilds); new `view --db <path>` (read-
+  only server, per-thread ReadPool) and `bench api --db <copy>` (p50/p95/p99).
+- Frontend: vlist.js virtual list; screens/tree.js (lazy 50-at-a-time, detail
+  pane, attempts/critiques tabs), search.js (debounced FTS + filters),
+  stats.js (KPIs + level/ending/campaign tables); app.js router + read_only
+  nav hiding + '/' search focus. Live smoke over view --db passed (root
+  children, node detail, search, export.csv all verified with curl).
+- Fixed en route: children_page root case (parent_id IS NULL), FTS5 shadow-
+  table name collision (fts_data -> fts_titles), external-content 'rebuild'
+  after bulk inserts, keyset has_more via children_count_after.
+Next step: see docs/dashboard/D1_HANDOFF.md (finish the corpus import +
+bench api §8 budgets, browser smoke, commit+PR+3 green CI, merge).
+
 
 ## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
 

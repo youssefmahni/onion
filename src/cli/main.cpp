@@ -424,6 +424,10 @@ const HelpEntry kTopLevel[] = {
      "keys, install the OS service"},
     {"dashboard", "dashboard [--api-port 8080] [--data-dir <dir>]",
      "print a fresh one-time sign-in URL for the control dashboard"},
+    {"view", "view --db <onion.db path> [--port 8081]",
+     "serve the read-only tree viewer (screens 5-7) from any database copy"},
+    {"bench", "bench api --db <onion.db path> [--requests 50]",
+     "measure the tree endpoints' p50/p95/p99 against a corpus copy"},
     {"campaign", "campaign start|plan|pause|resume|stop ...",
      "start and steer campaigns from JSON spec files"},
     {"review", "review list|accept|retry|reject ...",
@@ -575,6 +579,8 @@ int main(int argc, char** argv) {
   if (command == "llm") return llm_main(argc, argv);
   if (command == "node") return node_cmd(argc, argv);
   if (command == "dashboard") return dashboard_cmd(argc, argv);
+  if (command == "view") return view_cmd(argc, argv);
+  if (command == "bench") return bench_cmd(argc, argv);
   if (command == "campaign") return campaign_cmd(argc, argv);
   if (command == "review") return review_cmd(argc, argv);
   if (command == "dev-import") return dev_import_cmd(argc, argv);

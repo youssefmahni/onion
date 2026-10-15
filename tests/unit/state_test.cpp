@@ -744,6 +744,8 @@ std::string normalized_dump(const StateWriter& writer, const onion::store::Db& d
        "ORDER BY path;", "reviews");
   dump("SELECT device_id, version, prev, reason, changed, spec, rules_version, "
        "schema, hlc FROM profiles ORDER BY device_id, version;", "profiles");
+  dump("SELECT layer, nodes FROM stats_levels ORDER BY layer;", "stats_levels");
+  dump("SELECT status, n FROM stats_status ORDER BY status;", "stats_status");
   const auto nodes = db.all_nodes(error);
   out << "merkle: " << onion::store::merkle_root(nodes) << "\n";
   out << "spend: " << db.spend_usd(error) << "\n";

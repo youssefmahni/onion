@@ -96,6 +96,11 @@ class StateWriter {
     // 1 = terminal batch durable, before the fold; 2 = after the fold.
     // Throwing (or terminating) from it simulates a power cut.
     std::function<void(int)> crash_hook;
+    // Dashboard (plan §6.2): invoked on the writer thread after every
+    // folded record, with the record itself. The viewcache maintenance
+    // loop consumes it for incremental updates; keep it cheap (no locks
+    // held, no blocking).
+    std::function<void(const log::Record&)> on_folded_record;
   };
 
   explicit StateWriter(Options options);
@@ -254,6 +259,9 @@ class StateWriter {
   std::size_t last_import_skipped() const { return import_skipped_.load(); }
 
  private:
+  // §6.1: recomputes stats_levels/stats_status from the folded tables
+  // (derived and rebuildable — runs once at startup after the replay).
+  void recompute_stats(std::string* error);
   struct Command {
     enum class Kind {
       Attempt,
