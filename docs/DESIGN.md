@@ -826,3 +826,32 @@ The design picks defaults for each of these; confirm or change them.
 - [ ] Branch share of 50% per level, or smaller for cheaper, shallower trees?
 - [ ] Depth checkpoint every 5 levels past L9 by default, or off unless a campaign turns it on?
 - [ ] Claim lease of 10 minutes renewed every 3, and budget chunks of 50 attempts: keep or tune?
+
+## Control dashboard
+
+One dashboard, served by the node's own HTTP API, controls the device and
+the fleet and reads the tree (docs/DASHBOARD_PLAN.md; decision 0026).
+
+- **Stack:** static Preact+htm+uPlot shell under `web/`, vendored and
+  embedded into the binary at build time (tools/embed_web.py); no build
+  step, no Node in CI.
+- **Access:** loopback only; remote operators use an SSH tunnel. A
+  non-loopback `--host` requires `--allow-remote-dashboard` (warning at
+  startup). Sign-in swaps a one-time 128-bit code for an in-memory
+  session cookie (12 h); scripts and the CLI keep the device token.
+- **Writes:** every dashboard action submits the same signed records the
+  CLI writes — there are no new write paths — and answers 202 {op_id};
+  the outcome arrives as an `op` frame on the SSE stream. Mutating calls
+  need session/token + Origin + `X-Onion-Request: 1` + JSON + an
+  Idempotency-Key. Irreversible actions need a typed confirmation checked
+  on the server.
+- **Reads:** `/api/v1/*` with keyset cursors (never OFFSET) over the
+  per-thread read-only connections. The §6.1 fold counters (stats_levels,
+  stats_status) serve the counts; `viewcache.db` (counts + FTS5) and
+  `metrics.db` (speed/spend series, activity ring, device settings) are
+  local sidecars, never synced.
+- **Stream:** SSE with summary (2 s), alerts, events and op frames;
+  clients reconnect and resume by sequence.
+- **Read-only mode:** `data_depot view --db <copy>` serves only the tree
+  screens from any database copy. `GET /api/state` is deprecated
+  (`X-Onion-Deprecated: use /api/v1`).

@@ -1,0 +1,97 @@
+name: dash-nightly
+
+# Nightly dashboard gates (plan §8/§9). Browser smoke + accessibility and
+# the performance budgets on a synthetic 1M-node database. Runs every
+# night and on demand; failures block the next dashboard phase's merge.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  perf:
+    name: Dashboard perf budgets (§8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install --yes libcurl4-openssl-dev
+      - name: Configure + build
+        run: |
+          cmake -S . -B build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DONION_ENABLE_OPENCL=OFF
+          cmake --build build/linux-release
+      - name: Synthetic corpus (1M nodes)
+        run: |
+          python3 tools/gen_corpus.py --nodes 1000000 --data-dir build/corpus
+      - name: bench api
+        run: |
+          build/linux-release/data_depot bench api --db build/corpus/onion.db --requests 100 | tee bench.txt
+          # §8 budgets: children/node/stats ≤ 30 ms p95, search ≤ 100 ms p95.
+          python3 - <<'EOF'
+          import re, sys
+          budgets = {
+              "tree/children(root)": 30.0,
+              "tree/children(deep)": 30.0,
+              "tree/node": 30.0,
+              "tree/stats": 30.0,
+              "tree/search": 100.0,
+          }
+          failed = False
+          for line in open("bench.txt"):
+              match = re.match(r"(\S+)\s+p50\s+[\d.]+\s+ms\s+p95\s+([\d.]+)\s+ms", line)
+              if match and match.group(1) in budgets:
+                  p95 = float(match.group(2))
+                  budget = budgets[match.group(1)]
+                  print(f"{match.group(1)}: p95 {p95} ms (budget {budget} ms)")
+                  if p95 > budget:
+                      print(f"BUDGET MISS: {match.group(1)}", file=sys.stderr)
+                      failed = True
+          sys.exit(1 if failed else 0)
+          EOF
+
+  browser:
+    name: Browser smoke + accessibility (§9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install --yes libcurl4-openssl-dev
+      - name: Configure + build
+        run: |
+          cmake -S . -B build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DONION_ENABLE_OPENCL=OFF
+          cmake --build build/linux-debug
+      - name: Corpus copy
+        run: |
+          python3 tools/gen_corpus.py --nodes 50000 --data-dir build/corpus
+      - name: Start view server
+        run: |
+          setsid build/linux-debug/data_depot view --db build/corpus/onion.db --port 18099 >/dev/null 2>&1 &
+          sleep 5
+      - name: Playwright smoke
+        run: |
+          npm install --no-save playwright@latest @axe-core/playwright
+          python3 - <<'EOF'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch()
+                  page = await browser.new_page()
+                  errors = []
+                  page.on("console", lambda m: errors.append(m.text)
+                          if m.type == "error" else None)
+                  for route in ["#/tree/", "#/search", "#/stats"]:
+                      await page.goto(f"http://127.0.0.1:18099/{route}")
+                      await page.wait_for_timeout(1200)
+                  assert not errors, f"console errors: {errors}"
+                  from axe_core.axe import Axe
+                  await page.goto("http://127.0.0.1:18099/#/stats")
+                  await page.wait_for_timeout(1500)
+                  results = await Axe(page).analyze()
+                  assert not results.violations, results.violations
+                  await browser.close()
+
+          asyncio.run(main())
+          EOF

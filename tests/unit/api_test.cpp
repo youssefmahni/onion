@@ -110,12 +110,13 @@ TEST_F(ApiTest, TreeEndpointPassesPathAndDepthToTheProvider) {
   EXPECT_NE(response->body.find("\"node\""), std::string::npos);
 }
 
-TEST_F(ApiTest, DashboardServesAtRoot) {
+TEST_F(ApiTest, RootWithoutEmbeddedAssetsIs404) {
+  // D6: the legacy disk-loaded dashboard.html is gone; without embedded
+  // assets the root answers 404.
   httplib::Client client("127.0.0.1", port_);
   const auto response = client.Get("/");
   ASSERT_TRUE(response);
-  EXPECT_EQ(response->status, 200);
-  EXPECT_EQ(response->body, "<html>dashboard</html>");
+  EXPECT_EQ(response->status, 404);
 }
 
 TEST_F(ApiTest, PostWithoutTokenIsRefused) {
@@ -373,13 +374,12 @@ TEST_F(ApiDashTest, StaticAssetsServeWithEtagAndNoCache) {
   EXPECT_EQ(missing->status, 404);
 }
 
-TEST_F(ApiTest, LegacyDashboardHtmlFallsBackWhenNoAssets) {
-  // The plain fixture (no static_files) still serves dashboard_html at /.
+TEST_F(ApiTest, ApiStateCarriesTheDeprecationNote) {
   httplib::Client client("127.0.0.1", port_);
-  const auto response = client.Get("/");
+  const auto response = client.Get("/api/state");
   ASSERT_TRUE(response);
   EXPECT_EQ(response->status, 200);
-  EXPECT_EQ(response->body, "<html>dashboard</html>");
+  EXPECT_EQ(response->get_header_value("X-Onion-Deprecated"), "use /api/v1");
 }
 
 TEST_F(ApiDashTest, CspHeaderPresentOnDashboardAndApi) {

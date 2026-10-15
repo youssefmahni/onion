@@ -199,6 +199,9 @@ bool Server::start(std::string* error) {
   impl_->server->Get("/api/state", [this](const httplib::Request&,
                                           httplib::Response& response) {
     set_csp(response);
+    // D6: deprecated in favour of /api/v1/summary etc.; kept for the
+    // scripts and the multi-process tests.
+    response.set_header("X-Onion-Deprecated", "use /api/v1");
     response.set_content(impl_->options.state_json
                              ? impl_->options.state_json()
                              : "{\"error\":\"no state provider\"}",
@@ -258,10 +261,6 @@ bool Server::start(std::string* error) {
     const auto& files = impl_->options.static_files;
     const auto found = files.find(name);
     if (found == files.end()) {
-      if (name == "index.html" && !impl_->options.dashboard_html.empty()) {
-        response.set_content(impl_->options.dashboard_html, "text/html");
-        return;
-      }
       response.status = 404;
       response.set_content("not found", "text/plain");
       return;

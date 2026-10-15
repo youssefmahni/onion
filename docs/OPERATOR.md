@@ -175,3 +175,59 @@ same as `node run`, including `--members` and `--host`) into the printed
 template. On macOS a LaunchDaemon needs the plist in
 `/Library/LaunchDaemons` and the owner's sudo.
 
+
+# Control dashboard
+
+The node serves a control dashboard (D0–D6, docs/DASHBOARD_PLAN.md). It
+binds 127.0.0.1 by default; remote use goes through an SSH tunnel
+(decision 0026). `--host <non-loopback>` is refused unless
+`--allow-remote-dashboard` is also passed (with a warning).
+
+## Starting and signing in
+
+1. `data_depot node run ...` prints a one-time sign-in URL
+   (`http://127.0.0.1:<port>/auth?code=...`, valid 2 minutes).
+2. For a fresh code on a running node:
+   `data_depot dashboard [--api-port 8080] [--data-dir <dir>]`
+3. Open the URL: it swaps the code for a session cookie and redirects to
+   the dashboard. Sessions last 12 hours of inactivity.
+
+## Remote use (SSH tunnel)
+
+```sh
+ssh -L 8080:127.0.0.1:8080 <host>
+# then open the printed http://127.0.0.1:8080/... URL locally
+```
+
+## Screens
+
+- **Control**: alerts with actions, live numbers, speed/spend charts,
+  campaign and fleet summaries, recent activity (updates every 2 s).
+- **Campaigns**: plan-before-start (you must see the projection first),
+  start, pause, resume, raise budget, stop (typed confirmation).
+- **Fleet**: members, invitations (the token is shown once — hand it to
+  the joiner immediately), eviction proposals (sign/reject; a majority
+  still applies them through the sync path), device DeepSeek key
+  (stored, never shown), restart the service (typed "restart").
+- **Review queue**: attempts, proposed children, accept a selection /
+  retry / leaf; auto-accept settings (days + reasons).
+- **Tree**: lazy explorer with node details and history; **Search**:
+  full-text with level/status filters and path jump; **Stats**: per-level
+  counts, endings, campaign settles.
+
+## Read-only viewer
+
+`data_depot view --db <path-to-onion.db> [--port 8081]` serves only the
+three tree screens from any database copy — no engine, no sync, no
+authentication, no actions. It builds `viewcache.db` beside the copy on
+first run.
+
+## Notes
+
+- Every mutating dashboard call needs the session (or device token),
+  the dashboard's own Origin, `X-Onion-Request: 1`, JSON content type and
+  an Idempotency-Key; repeats return the first result.
+- Actions write the same signed records the CLI writes and answer
+  202 {op_id}; the outcome arrives as an `op` frame on the stream.
+- `GET /api/state` is deprecated (header `X-Onion-Deprecated: use
+  /api/v1`); scripts keep working but should move to `/api/v1/*`.

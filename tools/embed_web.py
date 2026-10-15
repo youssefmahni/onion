@@ -23,7 +23,7 @@ MIME = {
     ".woff2": "font/woff2",
 }
 
-SKIP = {"dashboard.html"}  # legacy page, still loaded from disk (removed in D6)
+SKIP = set()  # D6: the legacy disk-loaded page is gone
 
 
 def raw_string(data: bytes) -> str:

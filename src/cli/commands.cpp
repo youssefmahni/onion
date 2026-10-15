@@ -1537,8 +1537,6 @@ int node_cmd(int argc, char** argv) {
   api_options.port = api_port;
   api_options.host = self_host;
   api_options.token = token;
-  api_options.dashboard_html =
-      load_file(std::filesystem::path(ONION_WEB_DIR) / "dashboard.html");
   api_options.writer = writer.get();
   api_options.dashboard_auth = true;
   api_options.static_files = onion::cli::web_assets();
