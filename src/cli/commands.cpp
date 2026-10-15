@@ -226,9 +226,10 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string error;
   json result = json::object();
   auto children_stmt = read.prepare(
-      "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
-      "WHERE parent_id = ?1 AND tombstone = 0 ORDER BY layer, id "
-      "LIMIT ?2 OFFSET ?3;",
+      "SELECT id, code, path, layer, title, hlc, tree, sibling_order FROM nodes "
+      "WHERE parent_id = ?1 AND tombstone = 0 "
+      "ORDER BY layer, CASE WHEN sibling_order < 0 THEN 1 ELSE 0 END, "
+      "sibling_order, id LIMIT ?2 OFFSET ?3;",
       &error);
   auto child_count = read.prepare(
       "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1 AND tombstone = 0;",
@@ -260,12 +261,15 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::vector<Frame> frames;
   const auto make_node = [&](std::string_view code, std::string_view path,
                              int layer, std::string_view title,
-                             std::string_view tree) {
+                             std::string_view tree, int sibling_order) {
     json node;
     node["code"] = code;
     node["path"] = path;
     node["layer"] = layer;
     node["title"] = title;
+    // Only ordered children carry the field (decision 0029); a planning
+    // node's JSON keeps its historical shape.
+    if (sibling_order >= 0) node["sibling_order"] = sibling_order;
     if (!tree.empty()) node["tree"] = tree;
     node["children"] = json::array();
     settle_for(path, node);
@@ -274,9 +278,10 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string bind_error;
   if (root.empty()) {
     auto roots = read.prepare(
-        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
-        "WHERE parent_id IS NULL AND tombstone = 0 ORDER BY layer, id "
-        "LIMIT ?1;",
+        "SELECT id, code, path, layer, title, hlc, tree, sibling_order FROM nodes "
+        "WHERE parent_id IS NULL AND tombstone = 0 "
+        "ORDER BY layer, tree, CASE WHEN sibling_order < 0 THEN 1 ELSE 0 END, "
+        "sibling_order, id LIMIT ?1;",
         &error);
     if (!roots) {
       result["error"] = error;
@@ -291,7 +296,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       root_ids.push_back(id);
       nodes.push_back(make_node(roots->text(1), roots->text(2),
                                 roots->integer_int(3), roots->text(4),
-                                roots->text(6)));
+                                roots->text(6), roots->integer_int(7)));
     }
     result["nodes"] = std::move(nodes);
     if (depth > 0)
@@ -299,7 +304,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
         frames.push_back(Frame{&result["nodes"][i], root_ids[i], depth});
   } else {
     auto node_stmt = read.prepare(
-        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
+        "SELECT id, code, path, layer, title, hlc, tree, sibling_order FROM nodes "
         "WHERE path = ?1 AND tombstone = 0;",
         &error);
     if (!node_stmt) {
@@ -315,7 +320,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
     const std::int64_t id = node_stmt->integer(0);
     result["node"] = make_node(node_stmt->text(1), node_stmt->text(2),
                                node_stmt->integer_int(3), node_stmt->text(4),
-                               node_stmt->text(6));
+                               node_stmt->text(6), node_stmt->integer_int(7));
     if (depth > 0) frames.push_back(Frame{&result["node"], id, depth});
   }
   std::size_t cursor = 0;
@@ -339,7 +344,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       batch.emplace_back(
           make_node(children_stmt->text(1), children_stmt->text(2),
                     children_stmt->integer_int(3), children_stmt->text(4),
-                    children_stmt->text(6)),
+                    children_stmt->text(6), children_stmt->integer_int(7)),
           child_id);
     }
     // sqlite3_step AUTO-RESETS the statement when it returns DONE, so
@@ -2281,6 +2286,11 @@ int dev_import_cmd(int argc, char** argv) {
     return 2;
   }
   const std::string tree = flag(argc, argv, "--tree", "");
+  if (tree == onion::store::kPlanningTreeFilter) {
+    std::cerr << "--tree planning is reserved; import the planning tree "
+                 "without --tree\n";
+    return 2;
+  }
   const std::filesystem::path dir = data_dir_arg(argc, argv);
   auto data_lock = lock_data_dir(dir);
   if (!data_lock) return 1;
@@ -2291,6 +2301,23 @@ int dev_import_cmd(int argc, char** argv) {
     return 1;
   }
   onion::state::DevImport import;
+  // Decision 0029: the column NAMED "sibling_order" in a file's header is
+  // honoured. A file without it (every planning CSV, whatever extra columns it
+  // carries), an empty cell or -1 (what an export writes for an unordered
+  // row) means "no explicit order", so a planning CSV imports exactly as
+  // before and an export re-imports unchanged. The importer never invents an
+  // order from row sequence.
+  const auto imported_order = [&](const std::vector<std::string>& columns,
+                                  std::size_t index) -> std::optional<int> {
+    if (index == std::string::npos || columns.size() <= index) return -1;
+    const std::string text = depot::trim(columns[index]);
+    if (text.empty()) return -1;
+    char* end = nullptr;
+    const long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || parsed < -1 || parsed > 1000000)
+      return std::nullopt;
+    return static_cast<int>(parsed);
+  };
   for (int level = 0; level <= 9; ++level) {
     char name[64];
     std::snprintf(name, sizeof(name), "Onion - level_%02d.csv", level);
@@ -2298,27 +2325,44 @@ int dev_import_cmd(int argc, char** argv) {
     if (!in) continue;
     std::string line;
     std::getline(in, line);  // header
+    std::size_t order_column = std::string::npos;
+    {
+      const auto header = depot::split_csv(line);
+      for (std::size_t i = 0; i < header.size(); ++i)
+        if (depot::trim(header[i]) == "sibling_order") order_column = i;
+    }
     while (std::getline(in, line)) {
       if (depot::trim(line).empty()) continue;
       const auto columns = depot::split_csv(line);
       if (level == 0) {
         if (columns.size() < 2) continue;
+        const std::string path = depot::trim(columns[0]);
+        const auto sibling_order = imported_order(columns, order_column);
+        if (!sibling_order) {
+          std::cerr << name << " has invalid sibling_order for " << path << "\n";
+          return 1;
+        }
         import.nodes.push_back(
-            {depot::trim(columns[0]), depot::trim(columns[0]), 0,
-             depot::trim(columns[1])});
+            {path, path, 0, depot::trim(columns[1]), "", *sibling_order});
       } else {
         if (columns.size() < 3) continue;
+        const std::string path = depot::trim(columns[1]);
+        const auto sibling_order = imported_order(columns, order_column);
+        if (!sibling_order) {
+          std::cerr << name << " has invalid sibling_order for " << path << "\n";
+          return 1;
+        }
         import.nodes.push_back(
-            {depot::trim(columns[0]), depot::trim(columns[1]),
-             level, depot::trim(columns[2])});
+            {depot::trim(columns[0]), path, level, depot::trim(columns[2]),
+             "", *sibling_order});
       }
     }
   }
   for (auto& node : import.nodes) node.tree = tree;
   // Decision 0027: collisions are a hard stop unless --allow-skip is
   // given. A collision is (a) a path that already exists with DIFFERENT
-  // content, or (b) a code already used by another path. Every collision
-  // is reported per row to a file.
+  // content, or (b) a code already used by another path under the same
+  // parent. Every collision is reported per row to a file.
   const bool allow_skip = has_flag(argc, argv, "--allow-skip");
   const std::string report_path = flag(
       argc, argv, "--collisions", (dir / "import-collisions.tsv").string());
@@ -2373,10 +2417,13 @@ int dev_import_cmd(int argc, char** argv) {
 int react_convert_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot react-convert --yaml-dir <dir> "
-                 "--out <dir>\n"
+                 "--out <dir> [--names <react.json>] "
+                 "[--profile <react.domain-profile.json>]\n"
               << "\nconvert RE&CT response-action YAML files (RA codes as "
-                 "node codes, tree react) into dev-import CSVs plus "
-                 "react-profile.json.\n";
+                 "node codes, tree react) into stage/category/action "
+                 "dev-import CSVs plus react.domain-profile.json. Action "
+                 "titles come from the RE&CT bundle (--names, default "
+                 "<yaml-dir>/../docs/react.json).\n";
     return 0;
   }
   const std::string yaml_dir = flag(argc, argv, "--yaml-dir", "");
@@ -2399,15 +2446,31 @@ int react_convert_cmd(int argc, char** argv) {
         load_file(entry.path()));
     if (parsed) actions.push_back(*parsed);
     else
-      std::cerr << "skipping (no id/title/stage): " << name << "\n";
+      std::cerr << "skipping (invalid id/title/stage): " << name << "\n";
   }
   if (actions.empty()) {
     std::cerr << "no RE&CT actions found in " << yaml_dir << "\n";
     return 1;
   }
+  // Human action titles come from the RE&CT bundle (--names, else
+  // <yaml-dir>/../docs/react.json); without it the YAML slugs are turned
+  // into readable words, which loses acronym case ("ip", not "IP").
+  std::map<std::string, std::string> names;
+  {
+    std::filesystem::path names_path(flag(argc, argv, "--names", ""));
+    std::error_code names_ec;
+    if (names_path.empty())
+      names_path = std::filesystem::weakly_canonical(yaml_dir, names_ec)
+                       .parent_path() / "docs" / "react.json";
+    if (std::filesystem::is_regular_file(names_path, names_ec))
+      names = onion::reactconv::parse_action_names(load_file(names_path));
+    if (names.empty())
+      std::cerr << "note: no RE&CT action names found at " << names_path.string()
+                << "; titles are derived from the YAML slugs\n";
+  }
   std::filesystem::create_directories(out, ec);
   const onion::reactconv::Converted converted =
-      onion::reactconv::convert(actions);
+      onion::reactconv::convert(actions, names);
   const auto quote = [](std::string_view value) {
     const bool needs_quoting =
         value.find(',') != std::string_view::npos ||
@@ -2429,26 +2492,70 @@ int react_convert_cmd(int argc, char** argv) {
   {
     std::ofstream level0(std::filesystem::path(out) /
                          "Onion - level_00.csv");
-    level0 << "code,title\n";
-    for (const auto& [code, title] : converted.stages)
-      level0 << code << "," << quote(title) << "\n";
+    level0 << "code,title,sibling_order\n";
+    for (std::size_t index = 0; index < converted.stages.size(); ++index) {
+      const auto& [code, title] = converted.stages[index];
+      level0 << code << "," << quote(title) << "," << index << "\n";
+    }
   }
   {
     std::ofstream level1(std::filesystem::path(out) /
                          "Onion - level_01.csv");
-    level1 << "code,path,title\n";
-    for (const auto& [code, path, title] : converted.actions)
-      level1 << code << "," << quote(path) << "," << quote(title) << "\n";
+    level1 << "code,path,title,sibling_order\n";
+    std::map<std::string, int> next_order;
+    for (const auto& [code, path, title] : converted.categories) {
+      const std::string parent = path.substr(0, path.rfind('-'));
+      level1 << code << "," << quote(path) << "," << quote(title) << ","
+             << next_order[parent]++ << "\n";
+    }
   }
-  // The react domain profile: no structure permission anywhere (every
-  // campaign result goes to review) and no deterministic style checks.
-  onion::domain::Profile react;
-  react.name = "react";
-  react.tree = "react";
   {
-    std::ofstream profile(std::filesystem::path(out) /
-                          "react-profile.json");
-    profile << onion::domain::profile_json(react).dump(2) << "\n";
+    std::ofstream level2(std::filesystem::path(out) /
+                         "Onion - level_02.csv");
+    level2 << "code,path,title,sibling_order\n";
+    std::map<std::string, int> next_order;
+    for (const auto& [code, path, title] : converted.actions) {
+      const std::string parent = path.substr(0, path.rfind('-'));
+      level2 << code << "," << quote(path) << "," << quote(title) << ","
+             << next_order[parent]++ << "\n";
+    }
+  }
+  // The exact checked-in RE&CT profile is copied only after the normal
+  // strict loader accepts it.  This keeps conversion output bound to the
+  // same hash that campaigns publish and avoids reintroducing a reduced
+  // profile beside the source of truth.
+  // --profile overrides the default, which is the source checkout this binary
+  // was built from (a deployed binary has no such tree, so pass --profile).
+  const std::string profile_flag = flag(argc, argv, "--profile", "");
+  const std::filesystem::path profile_source =
+      profile_flag.empty()
+          ? std::filesystem::path(ONION_SOURCE_DIR) /
+                "docs/react.domain-profile.json"
+          : std::filesystem::path(profile_flag);
+  std::error_code profile_ec;
+  if (!std::filesystem::is_regular_file(profile_source, profile_ec)) {
+    std::cerr << "RE&CT profile not found at " << profile_source.string()
+              << " (pass --profile <react.domain-profile.json>)\n";
+    return 1;
+  }
+  std::string profile_error;
+  const auto profile_document =
+      nlohmann::json::parse(load_file(profile_source), nullptr, false);
+  const auto profile = profile_document.is_discarded()
+                           ? std::optional<onion::domain::Profile>{}
+                           : onion::domain::parse_profile(profile_document,
+                                                          &profile_error);
+  if (!profile) {
+    std::cerr << "RE&CT profile " << profile_source.string()
+              << " is invalid: "
+              << (profile_error.empty() ? "not valid JSON" : profile_error)
+              << "\n";
+    return 1;
+  }
+  {
+    std::ofstream profile_file(std::filesystem::path(out) /
+                               "react.domain-profile.json");
+    profile_file << onion::domain::profile_json(*profile).dump(2) << "\n";
   }
   std::cout << "converted " << actions.size() << " actions in "
             << converted.stages.size() << " stages to " << out << "\n";
@@ -2487,6 +2594,20 @@ int profile_cmd(int argc, char** argv) {
     return 2;
   }
   const std::string hash = onion::domain::profile_hash(*profile);
+  // Publish only what every device will accept at fold time: the signed
+  // record is profile_json(), so it must re-parse to the same hash.
+  {
+    std::string reparse_error;
+    const auto published = onion::domain::parse_profile(
+        onion::domain::profile_json(*profile), &reparse_error);
+    if (!published || onion::domain::profile_hash(*published) != hash) {
+      std::cerr << "refusing to publish: the signed form of this profile does "
+                   "not re-validate to the same hash"
+                << (reparse_error.empty() ? "" : " (" + reparse_error + ")")
+                << "\n";
+      return 2;
+    }
+  }
   const std::filesystem::path dir = data_dir_arg(argc, argv);
   auto data_lock = lock_data_dir(dir);
   if (!data_lock) return 1;
@@ -2499,6 +2620,13 @@ int profile_cmd(int argc, char** argv) {
   writer->submit(onion::state::CommitTerminal{
       {make_record("PROFILE", onion::domain::profile_json(*profile))}});
   writer->sync();
+  std::string held_error;
+  if (!writer->db().domain_profile(hash, &held_error)) {
+    std::cerr << "the profile record was signed but did not fold into the "
+                 "store"
+              << (held_error.empty() ? "" : ": " + held_error) << "\n";
+    return 1;
+  }
   std::cout << "profile " << profile->name << " tree \"" << profile->tree
             << "\" hash " << hash << "\n";
   return 0;

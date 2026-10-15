@@ -414,12 +414,16 @@ Outcome decide(const std::vector<Attempt>& attempts, const GateParams& params) {
     return outcome;
   }
   // Attempts exhausted: the attempt with the most valid children (ties: the
-  // later one) commits its valid children when it has at least three;
-  // otherwise the node is a leaf.
+  // later one) commits when it has at least `fallback_min` valid children
+  // (3 for the planning default, the profile range minimum for a domain
+  // profile); otherwise the node is a leaf.
   int best = -1;
   std::size_t best_valid = 0;
+  const std::size_t minimum =
+      static_cast<std::size_t>(std::max(1, params.fallback_min));
   for (std::size_t i = 0; i < attempts.size(); ++i)
-    if (attempts[i].valid_count >= 3 && attempts[i].valid_count >= best_valid) {
+    if (attempts[i].valid_count >= minimum &&
+        attempts[i].valid_count >= best_valid) {
       best = static_cast<int>(i);
       best_valid = attempts[i].valid_count;
     }
@@ -480,7 +484,13 @@ llm::Request make_request(const FunnelOptions& options, const NodeContext&,
                           int max_tokens_override = 0) {
   llm::Request request;
   request.model = options.model;
-  request.system = system_prompt();
+  // A non-planning profile supplies the signed system instruction. The
+  // embedded planning profile keeps the historical prompt byte-for-byte.
+  request.system = options.profile.system_prompt.empty()
+                       ? system_prompt()
+                       : options.profile.system_prompt;
+  if (!options.profile.persona.empty())
+    request.system += "\n\n" + options.profile.persona;
   if (!options.cache_prefix.empty())
     request.user = options.cache_prefix + "\n" + user;
   else
@@ -489,6 +499,96 @@ llm::Request make_request(const FunnelOptions& options, const NodeContext&,
                                            : options.max_tokens;
   request.temperature = temperature;
   return request;
+}
+
+// One left-to-right pass over the template: a `{name}` marker is replaced by
+// its value and the inserted text is never rescanned, so a node title or
+// candidate that itself contains `{siblings}` stays literal. Unknown markers
+// are left as written (profile loading rejects them up front).
+std::string render_template(
+    const std::string& text,
+    const std::vector<std::pair<std::string, std::string>>& values) {
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size();) {
+    if (text[i] == '{') {
+      const std::size_t close = text.find('}', i + 1);
+      if (close != std::string::npos) {
+        const std::string name = text.substr(i + 1, close - i - 1);
+        bool found = false;
+        for (auto it = values.rbegin(); it != values.rend(); ++it)
+          if (it->first == name) {
+            out += it->second;
+            found = true;
+            break;
+          }
+        if (found) {
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    out += text[i++];
+  }
+  return out;
+}
+
+std::string prompt_value(const onion::domain::Profile& profile,
+                         std::string_view prompt_name,
+                         const NodeContext& ctx, int children_min,
+                         int children_max,
+                         const std::vector<std::pair<std::string, std::string>>&
+                             extra = {}) {
+  if (!profile.document.is_object() || !profile.document.contains("prompts") ||
+      !profile.document["prompts"].contains(std::string(prompt_name)))
+    return {};
+  std::string output =
+      profile.document["prompts"][std::string(prompt_name)].get<std::string>();
+  std::string ancestors = join(ctx.ancestors);
+  std::string siblings = join(ctx.siblings);
+  std::string existing = join(ctx.existing);
+  std::string anchors = "[]";
+  if (profile.document.contains("critique_anchors"))
+    anchors = profile.document["critique_anchors"].dump();
+  const auto& style = onion::domain::style_for_child_level(profile, ctx.layer + 1);
+  const std::vector<std::pair<std::string, std::string>> values = {
+      {"title", ctx.title},
+      {"path", ctx.path},
+      {"level", std::to_string(ctx.layer)},
+      {"level_name", onion::domain::level_name(profile, ctx.layer)},
+      {"child_level_name", onion::domain::level_name(profile, ctx.layer + 1)},
+      {"child_level_guidance",
+       onion::domain::child_level_guidance(profile, ctx.layer)},
+      {"ancestors", ancestors.empty() ? "none" : ancestors},
+      {"siblings", siblings.empty() ? "none" : siblings},
+      {"existing_children", existing.empty() ? "none" : existing},
+      {"children_min", std::to_string(children_min)},
+      {"children_max", std::to_string(children_max)},
+      {"title_rules", onion::domain::title_rules(style)},
+      {"atomic_definition", profile.atomic_definition.empty()
+                                ? "a single indivisible operation"
+                                : profile.atomic_definition},
+      {"critique_anchors", anchors},
+  };
+  std::vector<std::pair<std::string, std::string>> all = values;
+  all.insert(all.end(), extra.begin(), extra.end());
+  output = render_template(output, all);
+  // Profiles own prose, never parser keys. Keep every output contract in
+  // code so a signed profile cannot widen what the strict parsers accept.
+  if (prompt_name == "precheck")
+    output += "\nReturn JSON {\"splits\": true} or {\"splits\": false}.";
+  else if (prompt_name == "planner" || prompt_name == "worker" ||
+           prompt_name == "trimmer")
+    output += "\nReturn JSON {\"items\": [ strings ]}.";
+  else if (prompt_name == "critique")
+    output += "\nReturn JSON {\"score\": 0.0-1.0, \"remove\": [ strings ], "
+              "\"add\": [ strings ], \"issues\": \"...\"}.";
+  else if (prompt_name == "synthesizer")
+    output += "\nReturn JSON {\"items\": [{\"title\": \"...\", "
+              "\"atomic\": false}]}.";
+  else if (prompt_name == "atomic_verification")
+    output += "\nReturn JSON {\"admits_none\": [ titles verbatim ]}.";
+  return output;
 }
 
 struct Meter {
@@ -545,6 +645,15 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
   const auto doom = [&]() {
     if (doomed_by.empty()) doomed_by = last_failure;
   };
+  const auto profiled_prompt =
+      [&](std::string_view name,
+          const std::vector<std::pair<std::string, std::string>>& values,
+          const std::string& fallback) {
+        const std::string rendered = prompt_value(
+            impl_->options.profile, name, ctx, impl_->options.params.children_min,
+            impl_->options.synth_max_children, values);
+        return rendered.empty() ? fallback : rendered;
+      };
 
   // Pre-check: at most 400 tokens, temperature 0.
   {
@@ -552,7 +661,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     std::string precheck_failure;
     for (int attempt = 0; attempt < 2; ++attempt) {
       const llm::Result precheck = counted(make_request(
-          impl_->options, ctx, precheck_prompt(ctx), 0.0, 400));
+          impl_->options, ctx,
+          profiled_prompt("precheck", {}, precheck_prompt(ctx)), 0.0, 400));
       precheck_failure = last_failure;
       if (result_ok(precheck)) {
         tried = true;
@@ -601,9 +711,16 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     {
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          planner_prompt(ctx, injected_issues, impl_->options.light,
-                         impl_->options.aspects_min,
-                         impl_->options.aspects_max),
+          profiled_prompt(
+              "planner",
+              {{"n_aspects_min", std::to_string(impl_->options.light ? 2
+                                                                       : impl_->options.aspects_min)},
+               {"n_aspects_max", std::to_string(impl_->options.light ? 3
+                                                                       : impl_->options.aspects_max)},
+               {"retry_reasons", injected_issues.empty() ? "none" : injected_issues}},
+              planner_prompt(ctx, injected_issues, impl_->options.light,
+                             impl_->options.aspects_min,
+                             impl_->options.aspects_max)),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -632,9 +749,13 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       for (const std::string& aspect : aspects) {
         const llm::Result reply = counted(make_request(
             impl_->options, ctx,
-            worker_prompt(ctx, aspect, existing_joined,
-                          impl_->options.worker_candidates,
-                          impl_->options.compact_output),
+            profiled_prompt(
+                "worker",
+                {{"aspect", aspect},
+                 {"n_items", std::to_string(impl_->options.worker_candidates)}},
+                worker_prompt(ctx, aspect, existing_joined,
+                              impl_->options.worker_candidates,
+                              impl_->options.compact_output)),
             temperature));
         meter.add(reply);
         if (!result_ok(reply)) {
@@ -682,7 +803,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       if (failed || candidates.size() <= static_cast<std::size_t>(keep)) return;
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          trimmer_prompt(ctx, candidates, keep),
+          profiled_prompt("trimmer",
+                          {{"candidates", join(candidates)},
+                           {"keep", std::to_string(keep)}},
+                          trimmer_prompt(ctx, candidates, keep)),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -718,7 +842,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     Critique critique;
     if (!failed && impl_->options.critic) {
       llm::Request critique_request = make_request(
-          impl_->options, ctx, critique_prompt(ctx, candidates), temperature);
+          impl_->options, ctx,
+          profiled_prompt("critique", {{"candidates", join(candidates)}},
+                          critique_prompt(ctx, candidates)),
+          temperature);
       if (!impl_->options.critic_model.empty())
         critique_request.model = impl_->options.critic_model;
       const llm::Result reply = counted(critique_request);
@@ -750,11 +877,16 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       }
       const llm::Result reply = counted(make_request(
           impl_->options, ctx,
-          synthesizer_prompt(ctx, candidates, critique_text,
-                             impl_->options.synth_target_min,
-                             impl_->options.synth_target_max,
-                             impl_->options.synth_max_children,
-                             impl_->options.compact_output, injected_issues),
+          profiled_prompt(
+              "synthesizer",
+              {{"candidates", join(candidates)},
+               {"critique_issues", critique.issues.empty() ? "none" : critique.issues},
+               {"retry_reasons", injected_issues.empty() ? "none" : injected_issues}},
+              synthesizer_prompt(ctx, candidates, critique_text,
+                                 impl_->options.synth_target_min,
+                                 impl_->options.synth_target_max,
+                                 impl_->options.synth_max_children,
+                                 impl_->options.compact_output, injected_issues)),
           temperature));
       meter.add(reply);
       if (!result_ok(reply)) {
@@ -777,7 +909,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
       const Checks checks =
           run_checks(children, ctx, impl_->options.synth_max_children,
                      impl_->options.params.children_min,
-                     &impl_->options.profile.style);
+                     &onion::domain::style_for_child_level(
+                         impl_->options.profile, ctx.layer + 1));
       attempt.checks_passed = checks.passed();
       attempt.valid_count = checks.valid_count;
       attempt.child_valid = checks.child_valid;
@@ -857,7 +990,10 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
           // replies in the DR 0021 measurement).
           const llm::Result verify = counted(make_request(
               impl_->options, ctx,
-              atomic_verification_prompt(ctx.title, labelled), 0.0,
+              profiled_prompt("atomic_verification",
+                              {{"labelled", join(labelled)}},
+                              atomic_verification_prompt(ctx.title, labelled)),
+              0.0,
               std::max(128, 10 * static_cast<int>(labelled.size()))));
           Meter& chosen_meter = meters[outcome.chosen];
           chosen_meter.add(verify);

@@ -270,6 +270,191 @@ TEST_F(EngineTest, EmbeddedPlanningProfileHashNeedsNoPublishedProfile) {
   EXPECT_EQ(stored->state, "running");
 }
 
+TEST_F(EngineTest, ProfileRangeMinimumIsTheFallbackFloor) {
+  // Range 2..2 and a style that allows two words. The model returns three
+  // children, one of them too long: the count check fails (3 > 2), so only
+  // the exhausted-attempts fallback can commit, and it commits the two valid
+  // children only because the profile's range minimum (2) is the floor. With
+  // the planning floor of 3 this node would become a leaf.
+  const json document = {
+      {"name", "floor-test"},
+      {"tree", "react"},
+      {"style", {{"max_words", 2}}},
+      {"structure", {{"structure_layers", json::array()}}},
+      {"levels", {{"max", 9},
+                  {"definitions", json::array({
+                      {{"level", 2}, {"name", "Response Action"},
+                       {"children_are", "Environments"},
+                       {"children", {{"min", 2}, {"max", 2}}}},
+                  })}}},
+  };
+  std::string profile_error;
+  const auto profile = onion::domain::parse_profile(document, &profile_error);
+  ASSERT_TRUE(profile) << profile_error;
+  writer_->submit(CommitTerminal{{
+      onion::log::Record{0, 0, "PROFILE", onion::domain::profile_json(*profile)},
+  }});
+  DevImport import;
+  import.nodes.push_back(
+      {"RA3101", "S3-C1-RA3101", 2, "Block External IP Address", "react"});
+  writer_->submit(std::move(import));
+  writer_->sync();
+
+  const SyncAsk base = funnel_fake(3);
+  const SyncAsk ask = [base](const Request& request) -> Result {
+    Result result = base(request);
+    if (request.user.find("select the final children set") !=
+        std::string::npos)
+      result.content =
+          R"({"items":[{"title":"Alpha Item","atomic":false},)"
+          R"({"title":"Beta Item","atomic":false},)"
+          R"({"title":"this one is far too long to pass","atomic":false}]})";
+    return result;
+  };
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, ask, budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign;
+  campaign.id = "floor";
+  campaign.scope = {"S3-C1-RA3101"};
+  campaign.tree = "react";
+  campaign.profile_hash = onion::domain::profile_hash(*profile);
+  campaign.children_min = 3;
+  campaign.max_attempts = 1;
+  campaign.loop_budget = 20;
+  campaign.review_all = true;
+  engine.run(campaign, nullptr);
+
+  std::string error;
+  std::vector<std::string> titles;
+  for (const auto& node :
+       writer_->db().nodes_with_path_prefix("S3-C1-RA3101", &error))
+    if (node.layer == 3) titles.push_back(node.title);
+  std::sort(titles.begin(), titles.end());
+  EXPECT_EQ(titles, (std::vector<std::string>{"Alpha Item", "Beta Item"}));
+}
+
+TEST_F(EngineTest, ProfileMaxLevelClosesTheDeepestNodesWithoutACall) {
+  // levels.max is a real depth limit (decision 0029): a node already at the
+  // deepest level is closed as a leaf and never reaches the model.
+  const json document = {
+      {"name", "depth-test"},
+      {"tree", "react"},
+      {"structure", {{"structure_layers", json::array()}}},
+      {"levels", {{"max", 2},
+                  {"definitions", json::array({
+                      {{"level", 2}, {"name", "Response Action"},
+                       {"children_are", "Environments"},
+                       {"children", {{"min", 2}, {"max", 2}}}},
+                  })}}},
+  };
+  std::string profile_error;
+  const auto profile = onion::domain::parse_profile(document, &profile_error);
+  ASSERT_TRUE(profile) << profile_error;
+  writer_->submit(CommitTerminal{{
+      onion::log::Record{0, 0, "PROFILE", onion::domain::profile_json(*profile)},
+  }});
+  DevImport import;
+  import.nodes.push_back(
+      {"RA3101", "S3-C1-RA3101", 2, "Block External IP Address", "react"});
+  writer_->submit(std::move(import));
+  writer_->sync();
+
+  Budget budget("10");
+  std::vector<json> calls;
+  Engine engine(Engine::Options{*writer_, funnel_fake(3, &calls), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign;
+  campaign.id = "depth";
+  campaign.scope = {"S3-C1-RA3101"};
+  campaign.tree = "react";
+  campaign.profile_hash = onion::domain::profile_hash(*profile);
+  campaign.max_attempts = 1;
+  campaign.loop_budget = 20;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_EQ(result.calls, 0);
+  EXPECT_TRUE(calls.empty());
+  EXPECT_EQ(result.leaves, 1);
+  std::string error;
+  int children = 0;
+  for (const auto& node :
+       writer_->db().nodes_with_path_prefix("S3-C1-RA3101", &error))
+    if (node.layer == 3) ++children;
+  EXPECT_EQ(children, 0);
+  bool settled = false;
+  for (const auto& settle : writer_->db().settles(&error))
+    if (settle.path == "S3-C1-RA3101") {
+      settled = true;
+      EXPECT_EQ(settle.kept, 0);
+      EXPECT_EQ(settle.attempts, 0);
+    }
+  EXPECT_TRUE(settled);
+}
+
+TEST_F(EngineTest, ProfileChildRangeOverridesCampaignTarget) {
+  const json document = {
+      {"name", "range-test"},
+      {"tree", "react"},
+      {"structure", {{"structure_layers", json::array()}}},
+      {"levels", {{"max", 9},
+                  {"definitions", json::array({
+                      {{"level", 2}, {"name", "Response Action"},
+                       {"children_are", "Environments"},
+                       {"children", {{"min", 2}, {"max", 2}}},
+                       {"ordered_children", true}},
+                  })}}},
+  };
+  std::string profile_error;
+  const auto profile = onion::domain::parse_profile(document, &profile_error);
+  ASSERT_TRUE(profile) << profile_error;
+  writer_->submit(CommitTerminal{{
+      onion::log::Record{0, 0, "PROFILE", onion::domain::profile_json(*profile)},
+  }});
+  DevImport import;
+  import.nodes.push_back(
+      {"RA3101", "S3-C1-RA3101", 2, "Block External IP Address", "react"});
+  writer_->submit(std::move(import));
+  writer_->sync();
+
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(3), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign;
+  campaign.id = "range";
+  campaign.scope = {"S3-C1-RA3101"};
+  campaign.tree = "react";
+  campaign.profile_hash = onion::domain::profile_hash(*profile);
+  campaign.children_min = 3;  // must lose to the profile's 2..2 contract
+  campaign.max_attempts = 1;
+  campaign.loop_budget = 20;
+  campaign.structure = false;
+  campaign.review_all = true;
+  engine.run(campaign, nullptr);
+
+  std::string error;
+  const auto children =
+      writer_->db().nodes_with_path_prefix("S3-C1-RA3101", &error);
+  ASSERT_TRUE(error.empty()) << error;
+  int direct_children = 0;
+  std::vector<int> orders;
+  for (const auto& node : children)
+    if (node.layer == 3) {
+      ++direct_children;
+      orders.push_back(node.sibling_order);
+    }
+  EXPECT_EQ(direct_children, 2);
+  EXPECT_EQ(orders, (std::vector<int>{0, 1}));
+  EXPECT_TRUE(writer_->needs_review("S3-C1-RA3101"));
+  const auto stored = writer_->campaign(campaign.id);
+  ASSERT_TRUE(stored);
+  const json persisted = json::parse(stored->spec);
+  ASSERT_TRUE(persisted.contains("review_all")) << persisted.dump();
+  EXPECT_TRUE(persisted["review_all"].get<bool>());
+  // The stop record restates the whole spec, so the tree binding survives.
+  EXPECT_EQ(persisted.value("tree", ""), "react");
+  EXPECT_EQ(persisted.value("profile_hash", ""), campaign.profile_hash);
+}
+
 // F-GATE-2 at the engine: while the provider is down nothing is settled and
 // no node becomes a leaf; when it recovers the very same node is worked.
 TEST_F(EngineTest, ProviderOutageLeavesNothingSettledAndRecovers) {
@@ -424,6 +609,18 @@ TEST_F(EngineTest, StopRuleEndsAnAtomicFrontierCampaign) {
   EXPECT_EQ(result.end_reason, "stop rule");
   EXPECT_GT(result.settled, 0);
   EXPECT_GT(result.atomic, 0);
+  // Decision 0029: a PLANNING campaign's terminal stop record keeps its
+  // historical seven-key spec (byte-identical records).
+  const auto stored = writer_->campaign(campaign.id);
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->state, "stopped");
+  const json persisted = json::parse(stored->spec);
+  std::vector<std::string> keys;
+  for (auto it = persisted.begin(); it != persisted.end(); ++it)
+    keys.push_back(it.key());
+  EXPECT_EQ(keys, (std::vector<std::string>{"chunk", "floor", "gate",
+                                            "loop_budget", "mode", "model",
+                                            "scope"}));
 }
 
 TEST_F(EngineTest, WaitingTicketStartsWhenTheReservationIsReleased) {

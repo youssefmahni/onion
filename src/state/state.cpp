@@ -9,6 +9,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 #include <zstd.h>
 
@@ -67,14 +68,28 @@ void upsert_node(store::Db& db, const log::Record& record,
   // Decision 0027: the record carries the node's domain tree; legacy
   // records (no field) default to the planning tree (empty).
   const std::string tree = payload.value("tree", std::string{});
+  int sibling_order = -1;
+  if (payload.contains("sibling_order")) {
+    if (!payload["sibling_order"].is_number_integer()) {
+      if (error) *error = "ADD_NODE sibling_order must be an integer";
+      return;
+    }
+    const std::int64_t order = payload["sibling_order"].get<std::int64_t>();
+    if (order < 0 || order > 1000000) {
+      if (error) *error = "ADD_NODE sibling_order out of range";
+      return;
+    }
+    sibling_order = static_cast<int>(order);
+  }
   auto statement = db.prepare(
       "INSERT INTO nodes(id, code, path, parent_id, layer, title, origin, "
-      "hlc, source, tree) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) "
+      "hlc, source, tree, sibling_order) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) "
       "+ 1, ?1, ?2, "
       "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7, ?8, "
-      "?9) "
+      "?9, ?10) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
-      "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
+      "layer=excluded.layer, sibling_order=excluded.sibling_order "
+      "WHERE excluded.hlc > nodes.hlc OR "
       "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
       error);
   if (!statement) return;
@@ -87,7 +102,8 @@ void upsert_node(store::Db& db, const log::Record& record,
       !statement->bind(6, origin, &bind_error) ||
       !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error) ||
       !statement->bind(8, source, &bind_error) ||
-      !statement->bind(9, tree, &bind_error)) {
+      !statement->bind(9, tree, &bind_error) ||
+      !statement->bind(10, static_cast<std::int64_t>(sibling_order), &bind_error)) {
     if (error) *error = "fold node bind failed: " + bind_error;
     return;
   }
@@ -1336,9 +1352,9 @@ void StateWriter::run() {
         // an existence check per row.
         auto statement = db_.prepare(
             "INSERT OR IGNORE INTO nodes(code, path, parent_id, layer, "
-            "title, origin, hlc, source, tree) VALUES (?1, ?2, (SELECT n2.id "
+            "title, origin, hlc, source, tree, sibling_order) VALUES (?1, ?2, (SELECT n2.id "
             "FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6, "
-            "'import', ?7);",
+            "'import', ?7, ?8);",
             &error);
         auto exists = db_.prepare(
             "SELECT 1 FROM nodes WHERE path = ?1;", &error);
@@ -1370,7 +1386,9 @@ void StateWriter::run() {
               !statement->bind(4, static_cast<std::int64_t>(node.layer), &bind_error) ||
               !statement->bind(5, node.title, &bind_error) ||
               !statement->bind(6, static_cast<std::int64_t>(hlc_.now()), &bind_error) ||
-              !statement->bind(7, node.tree, &bind_error)) {
+              !statement->bind(7, node.tree, &bind_error) ||
+              !statement->bind(8, static_cast<std::int64_t>(node.sibling_order),
+                               &bind_error)) {
             error = "import bind failed: " + bind_error;
             break;
           }
@@ -1427,19 +1445,30 @@ ImportCollisionReport check_import_collisions(
   ImportCollisionReport report;
   auto existing_path =
       db.prepare("SELECT code, title FROM nodes WHERE path = ?1;", error);
-  // Decision 0027: codes may repeat across different trees, so the code
-  // collision check is scoped to the imported node's tree.
+  // Decision 0027: in the planning tree (tree "") a code is unique within the
+  // whole tree, exactly as before. Decision 0029: in a named domain tree a
+  // code is unique only among the siblings of one parent, because a RE&CT
+  // category such as C1 legitimately repeats under every stage; a duplicate
+  // sibling code is still an ambiguous import.
   auto existing_code = db.prepare(
-      "SELECT path FROM nodes WHERE code = ?1 AND tree = ?2 LIMIT 1;",
+      "SELECT path FROM nodes WHERE code = ?1 AND tree = ?2 LIMIT 1;", error);
+  auto existing_sibling_code = db.prepare(
+      "SELECT n.path FROM nodes n LEFT JOIN nodes parent ON parent.id=n.parent_id "
+      "WHERE n.code = ?1 AND n.tree = ?2 AND COALESCE(parent.path, '') = ?3 "
+      "LIMIT 1;",
       error);
-  if (!existing_path || !existing_code) {
+  if (!existing_path || !existing_code || !existing_sibling_code) {
     if (error && error->empty()) *error = "cannot prepare collision checks";
     report.refused = true;
     return report;
   }
   std::vector<DevImportedNode> kept;
   kept.reserve(nodes.size());
+  std::set<std::tuple<std::string, std::string, std::string>> incoming_codes;
   for (const auto& node : nodes) {
+    const std::size_t dash = node.path.rfind('-');
+    const std::string parent =
+        dash == std::string::npos ? std::string{} : node.path.substr(0, dash);
     std::string step_error;
     existing_path->reset(&step_error);
     existing_path->bind(1, node.path, &step_error);
@@ -1454,14 +1483,35 @@ ImportCollisionReport check_import_collisions(
       report.rows.push_back(node.path + "\t" + node.code +
                             "\tpath exists with different content");
     }
-    existing_code->reset(&step_error);
-    existing_code->bind(1, node.code, &step_error);
-    existing_code->bind(2, node.tree, &step_error);
-    if (!collides && existing_code->step_row(&step_error)) {
-      collides = true;
-      report.rows.push_back(node.path + "\t" + node.code +
-                            "\tcode already used by " +
-                            existing_code->text(0));
+    if (node.tree.empty()) {
+      // Planning tree: the tree-wide rule of decision 0027, unchanged.
+      existing_code->reset(&step_error);
+      existing_code->bind(1, node.code, &step_error);
+      existing_code->bind(2, node.tree, &step_error);
+      if (!collides && existing_code->step_row(&step_error)) {
+        collides = true;
+        report.rows.push_back(node.path + "\t" + node.code +
+                              "\tcode already used by " +
+                              existing_code->text(0));
+      }
+    } else {
+      // Named domain tree: unique among the siblings of one parent, checked
+      // against the store and against the rows of this same import.
+      const bool duplicate_in_input =
+          !incoming_codes.insert(std::make_tuple(node.tree, parent, node.code))
+               .second;
+      existing_sibling_code->reset(&step_error);
+      existing_sibling_code->bind(1, node.code, &step_error);
+      existing_sibling_code->bind(2, node.tree, &step_error);
+      existing_sibling_code->bind(3, parent, &step_error);
+      if (!collides &&
+          (duplicate_in_input || existing_sibling_code->step_row(&step_error))) {
+        collides = true;
+        report.rows.push_back(
+            node.path + "\t" + node.code + "\tcode already used by a sibling" +
+            (duplicate_in_input ? std::string{}
+                                : " " + existing_sibling_code->text(0)));
+      }
     }
     if (collides && allow_skip) continue;  // dropped from the import
     kept.push_back(node);

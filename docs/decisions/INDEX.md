@@ -42,8 +42,9 @@ Note column). Last audited 2026-10-14 against `origin/main` @ `cb0f3ab`
 | 0026 | Dashboard frontend stack (Preact+htm+uPlot, vendored, no build), 127.0.0.1-only access with SSH tunnel, and the `--allow-remote-dashboard` bind gate | **Proposed** | covers DASHBOARD_PLAN.md D-1, D-2, §3.3 | claimed 2026-10-15 (dashboard D0) |
 | 0027 | Import safety and domain profiles (RE&CT readiness) | Accepted (owner directive) | amends 0025 (source field) | on b3-gate-funnel |
 | 0028 | Remove audit sampling from the engine | Accepted (owner directive) | supersedes 0024's audit-sampling clauses; renumbered from 0026 after the dashboard record claimed it first | on b3-gate-funnel |
+| 0029 | Domain-profile level semantics and ordered children | Accepted (owner directive) | amends 0027 (named-tree code collisions are per parent; profile ranges own the fallback floor) | on `b4-react-profile-support`; claimed 2026-10-15 |
 
-Next free number: **0029**.
+Next free number: **0030**.
 
 ## Rules
 

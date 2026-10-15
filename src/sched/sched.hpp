@@ -30,7 +30,10 @@ struct CampaignSpec {
   double floor{0.5};
   std::int64_t chunk{50};                 // RESERVE chunk size
   int light_funnel_from{6};  // decision 0017: light funnel from L6
-  bool structure{false};                  // L1..L3 expansion allowed (M3: no)
+  bool structure{false};  // profile structure-layer expansion allowed
+  // A conservative campaign control for pilots: accepted child sets are
+  // persisted in NEEDS_REVIEW rather than auto-settled at every level.
+  bool review_all{false};
   bool spillover{true};  // M7: steal from budget-empty lanes when true
   std::string model{"deepseek-flash"};
   std::string critic_model;               // empty = same as model

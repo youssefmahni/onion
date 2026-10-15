@@ -432,3 +432,92 @@ commits 984125b, 9d47386, merge a4c2320; pushed to origin).
 **Next step:** poll `gh pr checks 52`; if TSan fails again, pull the
 job log, reproduce locally (build with ONION_ENABLE_TSAN) and fix;
 when every job passes, `gh pr merge 52 --merge`.
+
+## 2026-10-15 — RE&CT domain profile support (decision 0029) + 12-action pilot
+
+Worktree `.build-tmp/wt-audit-removal`, branch `b4-react-profile-support`
+(from `origin/main` @ 50e4184, after PR #52). A previous session had left
+~1,300 uncommitted lines here with no handoff; they were reviewed before
+anything was built on them.
+
+**Result.** The owner's RE&CT profile (`docs/react.domain-profile.json`)
+is the second profile the engine supports: strict load-time validation,
+`style_levels` enforced in the gate and rendered into `{title_rules}`,
+per-level child ranges (which also own the exhausted-attempts floor),
+`ordered_children` as signed `sibling_order` preserved through commit,
+fold, CSV export and `/api/tree`, `levels.max` as a depth limit,
+`review_all` for the pilot, and a converter that builds the three imported
+layers (S/C/RA) with human titles from RE&CT's `react.json`. Decision 0029
+records it, including the rollout rule.
+
+**Defects in the inherited work, found and fixed** (each would have broken
+"planning byte-identical"): the gate floor changed 3 -> campaign target
+(2 gate tests failed); ORDER BY changed in the store; the planning CSV
+header gained a column; /api/tree nodes gained a field; dev-import assigned
+an order to every planning row (and rejected its own export's `-1`); the
+planning code-collision rule changed; the planning stop record changed; and
+existing planning assertions in the store/state tests had been rewritten to
+match. An independent review then found one more: the unconditional
+code-span flag rejected backticked PLANNING titles (fixed: tri-state, with a
+regression test), plus gaps in placeholder/coherence validation, a size cap
+that held for the input but not the signed form, and vacuous tests (one
+mutation-checked: removing `fallback_min` now fails
+`EngineTest.ProfileRangeMinimumIsTheFallbackFloor`). The reviewer also
+showed my first rollout note was wrong: an older binary's profile loader is
+lenient, so it diverges quietly instead of failing (0029 corrected).
+
+**Evidence (2026-10-15, linux-debug, final binaries).**
+- Full suite: `ctest --preset linux-debug -j4`: 416/416, 412 passed, 4
+  `llm.*` skipped by design (opt-nightly). Includes the 300-node offline
+  engine campaign and kill-at-every-commit-step, which main skips under the
+  1-minute cap. Targeted rerun before it: 183/183.
+- Planning byte-identity at corpus scale: the planning corpus copy
+  (`~/onion-opt-data`, 316,133 nodes) imported with the `origin/main`
+  binary and with this one: all ten `export-csv` files byte-identical (also
+  with `--tree planning`), node tables identical, 0 ordered rows. The
+  checkpoint Merkle roots differ only because each leaf carries the
+  per-import HLC (all 316,133 differ); every other leaf field is identical
+  and `checkpoint.cpp` is untouched.
+- RE&CT: converter -> 6 stages, 35 categories, 216 actions (257 nodes);
+  export round trip byte-identical over a 374-node tree; an offline pilot
+  rehearsal in a network namespace put 12/12 in review; a deeper offline
+  run showed steps in execution order (not alphabetical) with
+  `sibling_order` 0..3 in the store, the CSV export and `/api/tree`.
+- Real pilot (owner cap $1.00, `--budget-usd 1`): `p12-react-pilot`, profile
+  `97e29cb6…`, 12 tickets: 10 results open in review (8-10 environments
+  each), 2 leaves at the pre-check (RA1001 Practice, RA6001 Develop incident
+  report), 0 auto-settled; 14 attempts (RA1103 and RA1401 needed 3);
+  $0.0452 (see PROGRESS.md, Real API usage). Titles all passed the level-3
+  rules; a reviewer should still look at RA1308 and RA1401, whose lists mix
+  operating systems with tools of those operating systems.
+
+**Open items for the owner** (none changed without a record):
+1. Your draft sets `ordered_children` only on level 3, so steps are ordered
+   but the operations of a step are not. Probably also wanted on level 4.
+2. The draft defines levels 0-6 but `levels.max` is 9. Levels 7-9 repeat the
+   last definition (0029); say if that is not what you meant.
+3. Four profile fields are validated but not read by the engine
+   (`atomic.expected_from_level`, `label_format`, `import_csv_pattern`,
+   `import_codes`).
+4. Anchor scores are strings in the checked-in profile (decision 0003); the
+   backslash in level 5-9 `allowed_punctuation` is preserved.
+5. Fleet rollout: upgrade every device before publishing the profile. Older
+   nodes drop `sibling_order` silently and the Merkle leaf cannot show it;
+   putting `sibling_order` in the leaf (ordered nodes only) would make it
+   loud but changes decision 0009's leaf encoding.
+6. The 2 pre-check leaves bypass review (nothing to review); a wrong "cannot
+   split" is possible.
+7. The `campaign start` cost projection is planning-shaped and meaningless
+   past level 2 for `review_all` campaigns. Attempt-level gate failure
+   reasons are not persisted with the critic off (the quality guard shows
+   `flagged` from the zero critic score).
+8. `dash/d1-tree` rewrites `/api/tree` (src/api/tree_json.cpp); the ordering
+   rule (`layer, tree, ordered-first, sibling_order, id`) must be carried
+   over when it merges main. The untracked copy of the profile in the main
+   checkout must be deleted before that merge.
+
+**Next step:** push `b4-react-profile-support`, open the PR against main,
+run the 8 CI jobs (watch macOS Apple-clang and Windows for the new test
+code), fix anything they find, then `gh pr merge --merge` only when all pass.
+Then the owner reviews the 10 pilot results in the review queue
+(`data_depot review`) on `.build-tmp/react-pilot-final`.

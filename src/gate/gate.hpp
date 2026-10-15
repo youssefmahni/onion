@@ -114,6 +114,11 @@ enum class Decision { Commit, Retry, Leaf, Defer };
 struct GateParams {
   int max_attempts{3};
   int children_min{8};  // the campaign target's lower bound (default 8)
+  // The fewest valid children the exhausted-attempts fallback may commit.
+  // 3 is decision 0024's fixed floor for the planning default; a domain
+  // profile's per-level child range replaces it with the range minimum
+  // (decision 0029), so a legitimate 2-step procedure is not leafed.
+  int fallback_min{3};
 };
 
 struct Outcome {

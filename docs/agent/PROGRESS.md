@@ -2,6 +2,7 @@
 
 ## Current
 
+- Domain profiles (decisions 0027, 0029) on `b4-react-profile-support`: the owner's RE&CT profile (`docs/react.domain-profile.json`) loads under strict validation; `style_levels` are enforced in the gate and rendered into `{title_rules}`; per-level child ranges own the fallback floor; `ordered_children` survives commit, export and `/api/tree`; the planning profile is the byte-identical default. The 12-action pilot ran on a corpus copy (10 actions in review, 2 leaves, $0.0452; see Real API usage). Not merged; see WORKLOG for the open items.
 - Dashboard (DASHBOARD_PLAN.md): D0 PR #51 open (`dash/d0-foundation`) — decision 0026, sign-in/sessions, cross-site guards, CSP, embedded shell, bind gate. Prerequisite PR #50 (0025 allowance fix) MERGED.
 - Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed; CI green on the recent b3 runs and the main merge (PR #48).
 - Landed: branch-share pools and no-spend depth checkpoints; 30-day compact checkpoint summaries with exact totals; measured log-growth projection; L6 light-funnel default; `/api/state` and dashboard lanes, claims/steals, backlog, spend rate, disk and quality observability.
@@ -41,6 +42,7 @@
 | 2026-10-10 | M2 | Real-call validation (decision 0004 update): models list, request shape, usage fields, truncation, 401 | 5 (1 free /models, 1 unbilled 401, 4 billed) | $0.0000126 |
 | 2026-10-10 | M2 | Real concurrency probe (adaptive limiter start 4 / ceiling 50) | 100 | ≤ $0.0003 (upper-bound estimate; build predated per-run token totals) |
 | 2026-10-10 | M3 | Real small campaign: one node ("Order Processing"), light funnel, real DeepSeek — 3 attempts scored 0.35 / 0.35 / 0.22, all below the gate, nothing committed (P7 live), node went to review | ≤ 22 (pre-check + 3 attempts; exact per-run call counting added after this run) | $0.0135 (5,907 input + 9,772 output tokens at peak prices 0.30/1.20) |
+| 2026-10-15 | 0027/0029 | RE&CT 12-action pilot on a corpus copy (`deepseek-flash`, profile `97e29cb6…`, `review_all`, critic off); owner cap $1.00 (`--budget-usd 1`, poll stop at $0.90). 14 attempts over 10 actions (RA1103 and RA1401 needed 3) + 12 pre-checks (the 2 leaves, RA1001 and RA6001, made no attempt); 10 results open in review, 0 auto-settled. Exact call count is not exposed; tokens are summed from the ATTEMPT records | 14 attempts + 12 pre-checks | $0.0452 (59,239 input miss + 1,536 hit + 22,879 output tokens at 0.30 / 0.006 / 1.20; attempt-metered, so the 2 pre-check-only leaves add a few hundred tokens not counted) |
 
 ## Background processes started
 

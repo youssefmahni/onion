@@ -177,6 +177,35 @@ TEST(GateDecide, LeafWhenNoAttemptHasThreeValidChildren) {
   EXPECT_EQ(outcome.end_reason, "cannot split");
 }
 
+TEST(GateDecide, TheFallbackFloorIsThreeByDefaultAndAProfileRangeMinimumOtherwise) {
+  // Planning default (decision 0024): 2 valid children never commit, whatever
+  // the campaign target is.
+  EXPECT_EQ(decide({failing_attempt(1, 2), failing_attempt(2, 2),
+                    failing_attempt(3, 2)},
+                   GateParams{})
+                .decision,
+            Decision::Leaf);
+  // A domain profile whose range minimum is 2 (decision 0029) commits the
+  // two valid children instead of leafing a legitimate two-step procedure.
+  GateParams profile_params;
+  profile_params.children_min = 2;
+  profile_params.fallback_min = 2;
+  const Outcome committed =
+      decide({failing_attempt(1, 2), failing_attempt(2, 1),
+              failing_attempt(3, 0)},
+             profile_params);
+  EXPECT_EQ(committed.decision, Decision::Commit);
+  EXPECT_EQ(committed.chosen, 0);
+  // ... and a profile minimum of 4 refuses a 3-child set.
+  profile_params.children_min = 4;
+  profile_params.fallback_min = 4;
+  EXPECT_EQ(decide({failing_attempt(1, 3), failing_attempt(2, 3),
+                    failing_attempt(3, 3)},
+                   profile_params)
+                .decision,
+            Decision::Leaf);
+}
+
 TEST(GateDecide, ExhaustedAttemptsCommitTheMostValidChildrenBelowTarget) {
   // 4, 7, 5 valid children and no passing attempt: the 7-child attempt
   // commits its valid children, flagged below the target of 8.
