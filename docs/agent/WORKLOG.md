@@ -1,4 +1,28 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D1 · tree + counters + viewcache + screens 5–7 → PR #53
+
+Result: PR open (dash/d1-tree). D1 exit criteria met locally.
+Evidence:
+- §8 budgets on the 316k corpus copy (production cache config): children
+  3.9 ms p95, node 1.5 ms, stats 1.9 ms (≤30 ms), search 74.5 ms p95
+  (≤100 ms); viewcache build 5.1 s one-time. bench api prints p50/p95/p99.
+- Browser smoke (chrome-devtools, view --db on the corpus): tree/search/
+  stats screens render with zero console errors; virtual list bounded
+  (12.5k items → 34 DOM rows) with a synthetic 10k-children parent.
+- Bugs fixed on the way: preact core UMD has no hooks (vendored
+  hooks.umd.js); children root query needed `parent_id IS`; dev-import
+  bypasses fold so counters now recompute at import end; stats fallback
+  gated so the counter fast path never scans; FTS external-content
+  semantics; load-more double-click guard.
+- Mockups: colors extracted programmatically (no image input on this
+  model); layouts aligned via density analysis (search filters left
+  column, stats side-by-side tables). Deviation recorded in the PR.
+- Tests local: api 27/27, viewcache 4/4, state 35/35, platform 12/12,
+  store 10/10 + sched/log/gate/sync/swim green. Full ctest deferred to CI
+  (per the owner's 10-minute cap on local steps).
+Next step: 3 green CI runs on PR #53 then merge; D2 (summary, alerts,
+events, metrics.db, stream, screen 1).
+
 ## 2026-10-15 · dashboard D1 · tree endpoints + viewcache + screens 5–7 (WIP, handoff)
 
 Result: in progress — branch `dash/d1-tree` (local, pushed as WIP). NOT yet
