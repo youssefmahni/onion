@@ -1,4 +1,37 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D3–D6 · campaigns, review, fleet, finish — all done locally
+
+Result: D3 (eab48dd), D4 (b0061fd), D5 (f9ff557), D6 (8690c8d) committed on
+the local stack (dash/d2-control -> dash/d3-campaigns). GitHub ops remain
+deferred to the owner; the whole plan D0–D6 is implemented and locally
+verified.
+Evidence:
+- D3: plan-before-start (plan_id gate, 10 min, same-spec), start/pause/
+  resume/budget (never below reserved)/settings/stop (typed id); the same
+  signed CAMPAIGN records the CLI writes; 202 {op_id} + Idempotency-Key +
+  stream op frames; live-verified start->pause->budget 150->stop.
+- D4: review list/detail; accept (selected children only — rest
+  tombstoned), retry (re-expansion lock), leaf; auto-accept settings in
+  metrics.db; live + unit-verified end to end.
+- D5: members (table merged with SWIM/lane probes; self always present),
+  invites (signed token shown once — fixed a binary-nonce UTF-8 crash),
+  eviction propose/sign/reject, llm-key stored never echoed, typed
+  restart (exit code 3 for the service manager).
+- D6: gen_corpus.py (1M nodes) + dash-nightly.yml (perf budgets as a
+  fail gate + Playwright/axe smoke); arrow-key roving; old dashboard.html
+  deleted; /api/state deprecated (X-Onion-Deprecated header); OPERATOR.md
+  and DESIGN.md dashboard sections.
+- Final sweep: all seven screens rendered in the browser with zero
+  console errors; tests green across every suite (api 37, metrics 4,
+  viewcache 4, state 35, platform 12, store 10, sched 32, log 25,
+  gate 42, sync 18, swim 27).
+- The recurring preact-hooks trap (core UMD has no hooks) bit three new
+  screens; all fixed. Full ctest (engine/multi-process) left to CI —
+  GitHub deferred by the owner.
+Next step: owner merges the branches (dash/d1-tree PR #53, then d2/d3
+stacks) and enables the nightly workflow; after the merge the dashboard
+runs the 24-hour soak from screen 1.
+
 ## 2026-10-15 · dashboard D2 · control center done locally (GitHub deferred by owner)
 
 Result: complete on `dash/d2-control` (23ba6fa, stacked on d1; no GitHub

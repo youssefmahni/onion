@@ -1,7 +1,7 @@
 # Progress
 
 ## Current
-- Dashboard (DASHBOARD_PLAN.md): D0 merged (PR #51). D1 complete locally (`dash/d1-tree`, PR #53 merge deferred to owner). D2 complete locally on `dash/d2-control` (stacked): summary/alerts/events/metrics.db/SSE stream + control-center screen; live updates ≤3 s verified in-browser; every §4.4 alert raise+clear tested. GitHub ops deferred per owner.
+- Dashboard (DASHBOARD_PLAN.md): D0–D6 IMPLEMENTED and locally verified on a local branch stack (`dash/d1-tree` → `dash/d3-campaigns`, heads 7b7cf8c/0872afe/8690c8d). Control, campaigns, fleet, review, tree explorer/search/stats screens; §6.1 counters, viewcache.db, metrics.db, SSE stream, plan-before-start, typed confirmations, Idempotency-Key writes. All tests green locally; all seven screens render with zero console errors. GitHub merges + the nightly workflow activation are owner-deferred (PR #53 carries D1).
 - Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed.
 
 
