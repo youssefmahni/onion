@@ -23,19 +23,19 @@ async function v1(method, path, body) {
 }
 
 const CampaignsScreen = () => {
-  const [campaigns, setCampaigns] = preact.useState([]);
-  const [selected, setSelected] = preact.useState(null);
-  const [detail, setDetail] = preact.useState(null);
-  const [planSpec, setPlanSpec] = preact.useState(
+  const [campaigns, setCampaigns] = preactHooks.useState([]);
+  const [selected, setSelected] = preactHooks.useState(null);
+  const [detail, setDetail] = preactHooks.useState(null);
+  const [planSpec, setPlanSpec] = preactHooks.useState(
     '{"id": "c1", "scope": [""], "loop_budget": 100}',
   );
-  const [plan, setPlan] = preact.useState(null);
-  const [planId, setPlanId] = preact.useState("");
-  const [message, setMessage] = preact.useState("");
-  const [confirmText, setConfirmText] = preact.useState("");
-  const [events, setEvents] = preact.useState([]);
+  const [plan, setPlan] = preactHooks.useState(null);
+  const [planId, setPlanId] = preactHooks.useState("");
+  const [message, setMessage] = preactHooks.useState("");
+  const [confirmText, setConfirmText] = preactHooks.useState("");
+  const [events, setEvents] = preactHooks.useState([]);
 
-  const load = preact.useCallback(async () => {
+  const load = preactHooks.useCallback(async () => {
     const response = await fetch("/api/v1/campaigns").then((r) => r.json());
     setCampaigns((response.items || []).sort((a, b) =>
       (a.state === "running" ? 0 : 1) - (b.state === "running" ? 0 : 1) ||
@@ -43,7 +43,7 @@ const CampaignsScreen = () => {
     ));
   }, []);
 
-  preact.useEffect(() => {
+  preactHooks.useEffect(() => {
     load();
     const timer = setInterval(load, 5000);
     const source = new EventSource("/api/v1/stream");
@@ -65,7 +65,7 @@ const CampaignsScreen = () => {
     };
   }, [load]);
 
-  const open = preact.useCallback(async (id) => {
+  const open = preactHooks.useCallback(async (id) => {
     setSelected(id);
     const detail = await fetch("/api/v1/campaigns/" + id).then((r) => r.json());
     setDetail(detail);

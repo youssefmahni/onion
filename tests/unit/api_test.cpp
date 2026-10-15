@@ -861,3 +861,97 @@ TEST_F(ApiDashTest, CampaignWriteRoutesNeedTheFullGuard) {
   EXPECT_EQ(repeat->status, 202);
   EXPECT_EQ(repeat->body, accepted->body);
 }
+
+// ---------------------------------------------------------------- D4 (§4.3)
+
+#include "api/review_json.hpp"
+
+TEST_F(ApiTest, ReviewListAndDetail) {
+  onion::log::Record record;
+  record.type = "ADD_NODE";
+  record.payload = {{"path", "P01-T01"}, {"layer", 1}, {"title", "Task"}};
+  writer_->submit(onion::state::CommitTerminal{{record}});
+  onion::log::Record review;
+  review.type = "NEEDS_REVIEW";
+  review.payload = {{"path", "P01-T01"}, {"reason", "below floor"},
+                    {"attempts", 3}, {"score", "0.4"}};
+  writer_->submit(onion::state::CommitTerminal{{review}});
+  writer_->sync();
+
+  const auto list = onion::api::review_json::list(writer_->read_db(), "", "",
+                                                  50);
+  ASSERT_EQ(list["items"].size(), 1u);
+  EXPECT_EQ(list["items"][0]["path"], "P01-T01");
+  EXPECT_EQ(list["items"][0]["reason"], "below floor");
+
+  const auto filtered =
+      onion::api::review_json::list(writer_->read_db(), "other", "", 50);
+  EXPECT_EQ(filtered["items"].size(), 0u);
+
+  const auto detail =
+      onion::api::review_json::detail(writer_->read_db(), "P01-T01");
+  EXPECT_EQ(detail["reason"], "below floor");
+  EXPECT_EQ(detail["title"], "Task");
+}
+
+TEST_F(ApiTest, ReviewAcceptRetryLeafEndToEnd) {
+  // A review item with two proposed children.
+  for (const auto& [path, layer, title] :
+       {std::tuple<std::string, int, std::string>{"P01", 0, "Root"},
+        {"P01-T01", 1, "Task"}, {"P01-T01-C1", 2, "Child 1"},
+        {"P01-T01-C2", 2, "Child 2"}}) {
+    onion::log::Record record;
+    record.type = "ADD_NODE";
+    record.payload = {{"path", path}, {"layer", layer}, {"title", title}};
+    writer_->submit(onion::state::CommitTerminal{{record}});
+  }
+  onion::log::Record review;
+  review.type = "NEEDS_REVIEW";
+  review.payload = {{"path", "P01-T01"}, {"reason", "below floor"},
+                    {"attempts", 3}, {"score", "0.4"}};
+  writer_->submit(onion::state::CommitTerminal{{review}});
+  writer_->sync();
+
+  // Accept keeping only child 1: C2 is tombstoned, the node settles kept=1.
+  std::string error;
+  auto records = onion::api::review_json::action_records(
+      writer_->read_db(), "P01-T01", "accept",
+      nlohmann::json{{"children", nlohmann::json::array({0})}}, &error);
+  ASSERT_EQ(records.size(), 3u);  // 1 tombstone + review + settle
+  writer_->submit(onion::state::CommitTerminal{std::move(records)});
+  writer_->sync();
+  EXPECT_FALSE(writer_->needs_review("P01-T01"));
+  const auto settle = writer_->db().settle_by_path("P01-T01", &error);
+  ASSERT_TRUE(settle.has_value());
+  EXPECT_EQ(settle->kept, 1);
+  const auto child2 = writer_->db().node_by_path("P01-T01-C2", &error);
+  ASSERT_TRUE(child2.has_value());
+  EXPECT_EQ(child2->tombstone, 1);
+
+  // Retry: re-opens the review and takes a re-expansion lock (REEKPAND
+  // records fold; the review state returns to open).
+  records = onion::api::review_json::action_records(
+      writer_->read_db(), "P01-T01", "retry", nlohmann::json::object(),
+      &error);
+  ASSERT_EQ(records.size(), 2u);
+  writer_->submit(onion::state::CommitTerminal{std::move(records)});
+  writer_->sync();
+  // Retry decides the review and opens the re-expansion lock (the engine
+  // re-attempts the node); the review itself is decided.
+  EXPECT_TRUE(writer_->reexpand_open("P01-T01"));
+  EXPECT_EQ(writer_->read_db().review_state("P01-T01", &error),
+            std::optional<std::string>("decided"));
+
+  // Leaf: settles without children.
+  records = onion::api::review_json::action_records(
+      writer_->read_db(), "P01-T01", "leaf", nlohmann::json::object(),
+      &error);
+  ASSERT_EQ(records.size(), 2u);
+  writer_->submit(onion::state::CommitTerminal{std::move(records)});
+  writer_->sync();
+  EXPECT_FALSE(writer_->needs_review("P01-T01"));
+  const auto leaf_settle = writer_->db().settle_by_path("P01-T01", &error);
+  ASSERT_TRUE(leaf_settle.has_value());
+  EXPECT_EQ(leaf_settle->kept, 0);
+  EXPECT_EQ(leaf_settle->end, "cannot split");
+}

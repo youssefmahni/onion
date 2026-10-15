@@ -84,6 +84,13 @@ class Store {
                                   std::string* error) const;
   std::int64_t latest_event_seq(std::string* error) const;
 
+  // Local device settings (node policy, never synced): the review
+  // auto-accept knobs live here.
+  std::optional<std::string> get_setting(std::string_view key,
+                                         std::string* error) const;
+  bool put_setting(std::string_view key, std::string_view value,
+                   std::string* error);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

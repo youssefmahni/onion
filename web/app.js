@@ -13,7 +13,7 @@ const SCREEN_DEFS = [
   ["control", "Control center", ""],
   ["campaigns", "Campaigns", ""],
   ["fleet", "Fleet", "Members, lanes, invitations, evictions. (arrives in D5)"],
-  ["review", "Review queue", "Items by reason, attempts, accept/retry/leaf. (arrives in D4)"],
+  ["review", "Review queue", ""],
 ];
 
 function stub(key, title, note) {
@@ -50,6 +50,9 @@ function route() {
       break;
     case "campaigns":
       render(preact.h(CampaignsScreen, null));
+      break;
+    case "review":
+      render(preact.h(ReviewScreen, null));
       break;
     case "tree": {
       const path = rest ? decodeURIComponent(rest) : "";

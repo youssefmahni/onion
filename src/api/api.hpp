@@ -80,6 +80,16 @@ class Server {
     std::function<std::string(std::string id, std::string action,
                               std::string body)>
         campaign_action_json;
+    // D4 review providers.
+    std::function<std::string(std::string reason, std::string cursor,
+                              int limit)>
+        review_list_json;
+    std::function<std::string(std::string path)> review_detail_json;
+    std::function<std::string(std::string path, std::string action,
+                              std::string body)>
+        review_action_json;
+    std::function<std::string()> review_settings_get_json;
+    std::function<std::string(std::string body)> review_settings_put_json;
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;

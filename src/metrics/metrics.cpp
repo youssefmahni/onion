@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS spend(ts_hour INTEGER NOT NULL, campaign TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS spend_ts ON spend(ts_hour);
 CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
                         kind TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 )sql";
 
 std::string money(double value) {
@@ -271,6 +272,39 @@ std::int64_t Store::latest_event_seq(std::string* error) const {
   std::string step_error;
   if (!statement->step_row(&step_error)) return 0;
   return statement->integer(0);
+}
+
+std::optional<std::string> Store::get_setting(std::string_view key,
+                                                std::string* error) const {
+  auto statement = impl_->db.prepare(
+      "SELECT value FROM settings WHERE key = ?1;", error);
+  if (!statement) return std::nullopt;
+  std::string bind_error;
+  statement->bind(1, std::string(key), &bind_error);
+  std::string step_error;
+  if (!statement->step_row(&step_error)) return std::nullopt;
+  return statement->text(0);
+}
+
+bool Store::put_setting(std::string_view key, std::string_view value,
+                        std::string* error) {
+  auto statement = impl_->db.prepare(
+      "INSERT INTO settings(key, value) VALUES (?1, ?2) "
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+      error);
+  if (!statement) return false;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(key), &bind_error) ||
+      !statement->bind(2, std::string(value), &bind_error)) {
+    if (error) *error = "settings bind failed: " + bind_error;
+    return false;
+  }
+  statement->step(&bind_error);
+  if (!bind_error.empty()) {
+    if (error) *error = "settings insert failed: " + bind_error;
+    return false;
+  }
+  return true;
 }
 
 }  // namespace onion::metrics

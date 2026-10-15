@@ -818,6 +818,139 @@ bool Server::start(std::string* error) {
   campaign_action_route(R"(/api/v1/campaigns/(.+)/settings)", "settings");
   campaign_action_route(R"(/api/v1/campaigns/(.+)/stop)", "stop");
 
+  // D4 review queue (plan §4.1/§4.3).
+  impl_->server->Get(
+      "/api/v1/reviews",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.review_list_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        int limit = 50;
+        if (request.has_param("limit")) {
+          try {
+            limit = std::clamp(std::stoi(request.get_param_value("limit")),
+                               1, 200);
+          } catch (const std::exception&) {
+            limit = 50;
+          }
+        }
+        try {
+          response.set_content(
+              impl_->options.review_list_json(
+                  request.get_param_value("reason"),
+                  request.get_param_value("cursor"), limit),
+              "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      R"(/api/v1/reviews/(.+))",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.review_detail_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(
+              impl_->options.review_detail_json(request.matches[1].str()),
+              "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/review-settings",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.review_settings_get_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.review_settings_get_json(),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Put(
+      "/api/v1/review-settings",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.review_settings_put_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body =
+              impl_->options.review_settings_put_json(request.body);
+          record_idempotent(request, 200, body);
+          response.status = 200;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  const auto review_action_route =
+      [this, authorized_v1, record_idempotent](const std::string& action) {
+        impl_->server->Post(
+            R"(/api/v1/reviews/(.+)/)" + action,
+            [this, authorized_v1, record_idempotent, action](
+                const httplib::Request& request, httplib::Response& response) {
+              if (!authorized_v1(request, response)) return;
+              if (!impl_->options.review_action_json) {
+                response.status = 404;
+                response.set_content("{\"error\":\"no provider\"}",
+                                     "application/json");
+                return;
+              }
+              try {
+                const std::string body = impl_->options.review_action_json(
+                    request.matches[1].str(), action, request.body);
+                record_idempotent(request, 202, body);
+                response.status = 202;
+                response.set_content(body, "application/json");
+              } catch (const std::exception& exception) {
+                response.status = 500;
+                response.set_content(
+                    std::string("{\"error\":\"") + exception.what() +
+                        "\"}",
+                    "application/json");
+              }
+            });
+      };
+  review_action_route("accept");
+  review_action_route("retry");
+  review_action_route("leaf");
+
   impl_->server->Get("/", serve_static);
   impl_->server->Get(R"(/(.+))", serve_static);
 

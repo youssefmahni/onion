@@ -32,6 +32,7 @@
 #include "api/alerts.hpp"
 #include "api/campaign_json.hpp"
 #include "api/control_json.hpp"
+#include "api/review_json.hpp"
 #include "api/tree_json.hpp"
 #include "core/depot_core.hpp"
 #include "profile/profile.hpp"
@@ -1855,6 +1856,90 @@ int node_cmd(int argc, char** argv) {
         result["error"] = "unknown campaign action";
         return result.dump();
       };
+
+  // D4 review queue (plan §4.1/§4.3). Actions write the same signed
+  // records the CLI writes; `accept` keeps only the selected children
+  // (the rest are tombstoned), `retry` re-queues with the note, `leaf`
+  // settles the node without children.
+  api_options.review_list_json = [&](std::string reason, std::string cursor,
+                                     int limit) {
+    return onion::api::review_json::list(writer->read_db(),
+                                         std::move(reason),
+                                         std::move(cursor), limit)
+        .dump();
+  };
+  api_options.review_detail_json = [&](std::string path) {
+    return onion::api::review_json::detail(writer->read_db(),
+                                           std::move(path))
+        .dump();
+  };
+  api_options.review_action_json =
+      [&](std::string path, std::string action, std::string body) {
+        nlohmann::json result;
+        const auto parsed = nlohmann::json::parse(body, nullptr, false);
+        if (!writer->needs_review(path)) {
+          result["error"] = "the path is not open for review";
+          return result.dump();
+        }
+        std::string record_error;
+        std::vector<onion::log::Record> records =
+            onion::api::review_json::action_records(writer->read_db(), path,
+                                                    action, parsed,
+                                                    &record_error);
+        if (!record_error.empty()) {
+          result["error"] = record_error;
+          return result.dump();
+        }
+        if (records.empty() &&
+            action != "accept" && action != "retry" && action != "leaf") {
+          result["error"] = "unknown review action";
+          return result.dump();
+        }
+        const auto op_id = mint_op_id();
+        writer->submit(onion::state::CommitTerminal{std::move(records)});
+        writer->sync();
+        server_ptr->push_stream(
+            "op",
+            nlohmann::json{{"op_id", op_id}, {"status", "applied"}}.dump());
+        result["op_id"] = op_id;
+        return result.dump();
+      };
+  api_options.review_settings_get_json = [&]() {
+    nlohmann::json settings;
+    std::string settings_error;
+    settings["auto_accept_after_days"] =
+        metrics_store->get_setting("auto_accept_after_days", &settings_error)
+            .value_or("0");
+    settings["reasons"] =
+        metrics_store->get_setting("auto_accept_reasons", &settings_error)
+            .value_or("");
+    return settings.dump();
+  };
+  api_options.review_settings_put_json = [&](std::string body) {
+    const auto parsed = nlohmann::json::parse(body, nullptr, false);
+    std::string settings_error;
+    if (parsed.is_object()) {
+      if (parsed.contains("auto_accept_after_days"))
+        metrics_store->put_setting(
+            "auto_accept_after_days",
+            parsed["auto_accept_after_days"].is_number()
+                ? std::to_string(
+                      parsed["auto_accept_after_days"].get<std::int64_t>())
+                : parsed["auto_accept_after_days"].get<std::string>(),
+            &settings_error);
+      if (parsed.contains("reasons"))
+        metrics_store->put_setting(
+            "auto_accept_reasons",
+            parsed["reasons"].is_array()
+                ? parsed["reasons"].dump()
+                : parsed["reasons"].get<std::string>(),
+            &settings_error);
+    }
+    nlohmann::json response;
+    if (!settings_error.empty()) response["error"] = settings_error;
+    else response["ok"] = true;
+    return response.dump();
+  };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
   };
