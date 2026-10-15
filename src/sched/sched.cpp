@@ -526,13 +526,16 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   // hard-coded rules). A device that does not hold the exact profile
   // does not run the campaign: pause it with a clear reason.
   onion::domain::Profile profile = onion::domain::planning_profile();
-  if (!spec.profile_hash.empty()) {
+  const std::string planning_profile_hash =
+      onion::domain::profile_hash(profile);
+  if (!spec.profile_hash.empty() && spec.profile_hash != planning_profile_hash) {
     std::string profile_error;
     const auto held =
         writer.db().domain_profile(spec.profile_hash, &profile_error);
     if (!held) {
       writer.submit(state::CommitTerminal{{make_record(
           "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
                        {"state", "paused"},
                        {"reason", "profile " + spec.profile_hash +
                                       " not held"}})}});
@@ -545,6 +548,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     if (!parsed) {
       writer.submit(state::CommitTerminal{{make_record(
           "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
                        {"state", "paused"},
                        {"reason", "profile parse failed: " +
                                       profile_error}})}});

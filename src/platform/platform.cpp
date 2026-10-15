@@ -120,7 +120,8 @@ SyncCounts sync_counts_for_test() { return sync_counts; }
 DataDirLock::~DataDirLock() {
 #ifdef _WIN32
   if (handle_) {
-    UnlockFileEx(handle_, 0, 1, 0, nullptr);
+    OVERLAPPED overlapped{};
+    UnlockFileEx(static_cast<HANDLE>(handle_), 0, 1, 0, &overlapped);
     CloseHandle(static_cast<HANDLE>(handle_));
   }
 #else
@@ -140,11 +141,16 @@ DataDirLock::DataDirLock(DataDirLock&& other) noexcept {
 
 DataDirLock& DataDirLock::operator=(DataDirLock&& other) noexcept {
   if (this == &other) return *this;
-  this->~DataDirLock();
 #ifdef _WIN32
+  if (handle_) {
+    OVERLAPPED overlapped{};
+    UnlockFileEx(static_cast<HANDLE>(handle_), 0, 1, 0, &overlapped);
+    CloseHandle(static_cast<HANDLE>(handle_));
+  }
   handle_ = other.handle_;
   other.handle_ = nullptr;
 #else
+  if (fd_ >= 0) ::close(fd_);
   fd_ = other.fd_;
   other.fd_ = -1;
 #endif
