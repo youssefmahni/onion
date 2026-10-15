@@ -1,4 +1,32 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D0 · §2 verify-and-adapt (inventories + prerequisite gate)
+
+Result: in progress
+Evidence:
+- §2.1 prerequisites: the quality-gate change (decision 0024, critic off by
+  default, deterministic gate, verified-atomic stop rule) is MERGED on
+  origin/main (58945d7 via PR #48, 7f7889c). The allowance-leaf fix for
+  imported tickets (decision 0025, src/sched/sched.cpp:932 "imported tickets
+  are never leafed by allowance") is NOT merged: it rides on the local,
+  unpushed commit 260093d on `b3-gate-funnel` (bundled with the CLI --help
+  work, the tree viewer and docs). Per §2.1 it must merge first.
+- §2.2–2.4 written to docs/dashboard/INVENTORY.md: full route table
+  (/api/state, /api/tree, /, 7 authed POSTs), the token/Origin/Content-Type
+  mechanism, the store schema (no reserves/claims/invites/evictions tables;
+  they are in-memory or files), the missing dashboard inputs (stats counters,
+  viewcache.db, metrics.db, event feed, per-device OS/name), and the
+  read-only connections CONFIRMED PRESENT (StateWriter::read_db, per-thread
+  map, store::Db::open_readonly) — §2.4 needs no new pool.
+- §2.5 plan adjustments recorded there: (1) httplib is built without zlib
+  (CMakeLists.txt:208) so §3.1 gzip needs a vendored deflate or a decision
+  record to drop it; (2) /api/state is unauthenticated and must keep working
+  through D0; (3) web/ is disk-loaded (ONION_WEB_DIR), embedding is new;
+  (4) no `dashboard` CLI command exists yet.
+Next step: merge the 0025 allowance-leaf prerequisite (full local ctest on
+b3-gate-funnel, push, PR, 3 green CI runs, merge), then open `dash/d0-foundation`
+from fresh origin/main for D0 (decision record, bind gate, sign-in, CSP,
+embedded files, /api/v1 skeleton, empty shell).
+
 ## 2026-10-14 · docs · OA-14 withdrawn by the owner
 
 Result: done. The owner confirmed the repo is public and there is no GitHub

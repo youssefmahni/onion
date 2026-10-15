@@ -2,6 +2,7 @@
 
 ## Current
 
+- Dashboard (DASHBOARD_PLAN.md): D0 started. §2 inventories done (docs/dashboard/INVENTORY.md). Prerequisite gate: 0024 quality gate merged ✓; 0025 allowance-leaf fix must merge first (unpushed commit 260093d on `b3-gate-funnel`). After the PR, D0 proceeds on `dash/d0-foundation`.
 - Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed; CI green on the recent b3 runs and the main merge (PR #48).
 - Landed: branch-share pools and no-spend depth checkpoints; 30-day compact checkpoint summaries with exact totals; measured log-growth projection; L6 light-funnel default; `/api/state` and dashboard lanes, claims/steals, backlog, spend rate, disk and quality observability.
 - Next: finish B3 on `b3-gate-funnel` (gate/funnel/stop-rule findings), then B2/B5 (mp quiescence CI fix, F-TEST-1) and B6 (security hardening) from REVIEW.md, then M9. OA-15 (Linux join) and OA-16 (Mac power pull) remain M7 owner live checks.
