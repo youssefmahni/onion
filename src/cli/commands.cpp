@@ -1523,8 +1523,15 @@ int node_cmd(int argc, char** argv) {
       std::lock_guard fleet_lock(fleet_mutex);
       lane_members = std::move(new_lanes);
       sync_members = std::move(new_members);
-      member_urls = std::move(new_urls);
-      member_swim_urls = std::move(new_swim_urls);
+      // Merge, don't replace: the members table (MEMBER_ADDR records)
+      // and swim gossip also feed these maps, and a members.json rewrite
+      // must not wipe a joined device's address that the file lacks
+      // (a real fleet failure: reload wiped urls every round, so the
+      // sync scheduler kept dialling the file's stale/empty addresses).
+      for (const auto& [member_id, url] : new_urls)
+        member_urls[member_id] = url;
+      for (const auto& [member_id, url] : new_swim_urls)
+        member_swim_urls[member_id] = url;
       // Read inside the lock: the scheduler thread may swap these maps
       // concurrently (fleet_mutex is the only gate on them).
       if (std::getenv("ONION_SYNC_DEBUG"))
