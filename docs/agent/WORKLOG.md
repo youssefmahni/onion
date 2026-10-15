@@ -293,3 +293,30 @@ audits field on either machine, campaign p04-first running.
 viewer, checkpoint endpoint, help/OPERATOR.md); fix reload_members()
 URL wipe; note the 0026 numbering collision with the dash branch's
 uncommitted 0026-dashboard-frontend-remote-bind claim.
+
+## 2026-10-15 — PR1(0027) lock, source, collisions, checkpoint done
+
+Worktree .build-tmp/wt-audit-removal on b3-gate-funnel (main working
+dir stays on dash/d0-foundation, untouched). PR1 pieces committed:
+- 434a0e5 data-dir lock (platform DataDirLock flock/LockFileEx at
+  node.lock; node run holds; campaign/review/dev-import/genesis-import/
+  node join acquire; refuses with clear message). platform 11 green.
+- c278cd7 nodes.source ('import' vs 'engine'); 0025 exemption keys on
+  source == "import"; suites at commit green (engine 21, sched 31,
+  state 34, store 10, api 7, platform 11).
+- abb6cb8 WriteCheckpoint command + /api/checkpoint endpoint + CLI
+  checkpoint hook; dev-import collision pre-check (duplicate content,
+  path/code) reporting import-collisions.tsv, fail unless --allow-skip,
+  checkpoint on success; 2 new state tests. state 36, api 7 green.
+
+The earlier state_test "hang" was a bug in my own new tests: they
+omitted writer_->start(), so the writer thread never ran and sync()
+waited forever (one thread in futex). Standalone repro + /proc thread
+inspection isolated it; both new tests pass after adding start().
+
+**Next step:** PR2(0027) domain profiles: signed profile record +
+hash in campaign (device without exact profile can't work campaign);
+style checks move into the profile; expandable_layers ->
+structure_layers; nodes.tree field (codes may repeat across trees);
+planning profile embedded default byte-identical (golden + engine
+tests unchanged). Then RE&CT converter + test import + 12-action pilot.
