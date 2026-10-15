@@ -1,10 +1,12 @@
-# D1 handoff — tree endpoints, viewcache, screens 5–7
+# D1 — tree endpoints, viewcache, screens 5–7 — FINAL
 
-Status: **implemented, tests green locally, not yet PR'd.** Branch
-`dash/d1-tree` (WIP commit, pushed). The §8 performance proof was mid-run at
-handoff: `dev-import` of the 316k corpus (`~/onion-opt-data`) into
-`$PWD/.build-tmp/corpus-bench` may still be running in the background; wait
-for it (`pgrep -f dev-import`) or re-run it before benchmarking.
+Status: **complete locally** on `dash/d1-tree` (head 86b842f). PR #53 open;
+the owner deferred the GitHub merge/CI, so the merge is theirs. §8 budgets
+measured on the 316k corpus copy (`$PWD/.build-tmp/corpus-bench`):
+children 3.9 ms p95, node 1.5 ms, stats 1.9 ms (budget 30 ms), search
+74.5 ms p95 (budget 100 ms); viewcache build 5.1 s one-time. Browser smoke
+clean (tree/search/stats, zero console errors, vlist bounded). Local tests:
+api 27/27, viewcache 4/4, state 35/35 + the rest green.
 
 ## What landed (branch dash/d1-tree, on top of merged D0/main)
 

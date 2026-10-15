@@ -1,11 +1,8 @@
 # Progress
 
 ## Current
-
-- Dashboard (DASHBOARD_PLAN.md): D0 PR #51 open (`dash/d0-foundation`) — decision 0026, sign-in/sessions, cross-site guards, CSP, embedded shell, bind gate. Prerequisite PR #50 (0025 allowance fix) MERGED.
-- Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed; CI green on the recent b3 runs and the main merge (PR #48).
-- Landed: branch-share pools and no-spend depth checkpoints; 30-day compact checkpoint summaries with exact totals; measured log-growth projection; L6 light-funnel default; `/api/state` and dashboard lanes, claims/steals, backlog, spend rate, disk and quality observability.
-- Next: finish B3 on `b3-gate-funnel` (gate/funnel/stop-rule findings), then B2/B5 (mp quiescence CI fix, F-TEST-1) and B6 (security hardening) from REVIEW.md, then M9. OA-15 (Linux join) and OA-16 (Mac power pull) remain M7 owner live checks.
+- Dashboard (DASHBOARD_PLAN.md): D0 merged (PR #51). D1 complete locally on `dash/d1-tree` (tree endpoints, §6.1 counters, viewcache.db, screens 5–7, view --db, bench api; §8 budgets met on the 316k corpus; browser smoke clean). PR #53 open — merge deferred to the owner per instruction.
+- Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed.
 
 
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
