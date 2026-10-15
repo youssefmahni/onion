@@ -209,7 +209,7 @@ target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
 
 # Interface layer
-onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp src/api/alerts.cpp src/api/control_json.cpp src/api/campaign_json.cpp src/api/review_json.cpp)
+onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp src/api/alerts.cpp src/api/control_json.cpp src/api/campaign_json.cpp src/api/review_json.cpp src/api/fleet_json.cpp)
 # The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
 # httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
 # httplib::httplib CMake target would pull a Homebrew OpenSSL that cannot

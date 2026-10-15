@@ -951,6 +951,197 @@ bool Server::start(std::string* error) {
   review_action_route("retry");
   review_action_route("leaf");
 
+  // D5 fleet + device (plan §4.1/§4.3).
+  impl_->server->Get(
+      "/api/v1/members",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.members_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.members_json(),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/invites",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.invites_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.invites_json(),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Post(
+      "/api/v1/invites",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.invite_post_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body =
+              impl_->options.invite_post_json(request.body);
+          record_idempotent(request, 200, body);
+          response.status = 200;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/evictions",
+      [this, control_guard](const httplib::Request& request,
+                            httplib::Response& response) {
+        if (!control_guard(request, response)) return;
+        if (!impl_->options.evictions_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.evictions_json(),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Post(
+      "/api/v1/evictions",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.eviction_action_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body = impl_->options.eviction_action_json(
+              "", "propose", request.body);
+          record_idempotent(request, 202, body);
+          response.status = 202;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  const auto eviction_action_route =
+      [this, authorized_v1, record_idempotent](const std::string& action) {
+        impl_->server->Post(
+            R"(/api/v1/evictions/(.+)/)" + action,
+            [this, authorized_v1, record_idempotent, action](
+                const httplib::Request& request, httplib::Response& response) {
+              if (!authorized_v1(request, response)) return;
+              if (!impl_->options.eviction_action_json) {
+                response.status = 404;
+                response.set_content("{\"error\":\"no provider\"}",
+                                     "application/json");
+                return;
+              }
+              try {
+                const std::string body = impl_->options.eviction_action_json(
+                    request.matches[1].str(), action, request.body);
+                record_idempotent(request, 202, body);
+                response.status = 202;
+                response.set_content(body, "application/json");
+              } catch (const std::exception& exception) {
+                response.status = 500;
+                response.set_content(
+                    std::string("{\"error\":\"") + exception.what() +
+                        "\"}",
+                    "application/json");
+              }
+            });
+      };
+  eviction_action_route("sign");
+  eviction_action_route("reject");
+  impl_->server->Post(
+      "/api/v1/device/llm-key",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.device_llm_key_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body =
+              impl_->options.device_llm_key_json(request.body);
+          record_idempotent(request, 200, body);
+          response.status = 200;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Post(
+      "/api/v1/device/restart-service",
+      [this, authorized_v1, record_idempotent](
+          const httplib::Request& request, httplib::Response& response) {
+        if (!authorized_v1(request, response)) return;
+        if (!impl_->options.device_restart_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          const std::string body =
+              impl_->options.device_restart_json(request.body);
+          record_idempotent(request, 202, body);
+          response.status = 202;
+          response.set_content(body, "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+
   impl_->server->Get("/", serve_static);
   impl_->server->Get(R"(/(.+))", serve_static);
 

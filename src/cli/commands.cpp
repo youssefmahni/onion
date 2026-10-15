@@ -32,6 +32,7 @@
 #include "api/alerts.hpp"
 #include "api/campaign_json.hpp"
 #include "api/control_json.hpp"
+#include "api/fleet_json.hpp"
 #include "api/review_json.hpp"
 #include "api/tree_json.hpp"
 #include "core/depot_core.hpp"
@@ -1940,6 +1941,206 @@ int node_cmd(int argc, char** argv) {
     else response["ok"] = true;
     return response.dump();
   };
+
+  // D5 fleet + device (plan §4.1/§4.3).
+  api_options.members_json = [&]() {
+    std::vector<onion::api::fleet_json::MemberProbe> probes;
+    if (swim) {
+      for (const auto& member : swim->membership().list()) {
+        onion::api::fleet_json::MemberProbe probe;
+        probe.device_id = member.device_id;
+        probe.state = onion::swim::to_string(member.state);
+        probe.last_seen_s = -1;  // the protocol engine does not timestamp
+        probe.lane_weight = 1.0;
+        probes.push_back(std::move(probe));
+      }
+    }
+    {
+      std::lock_guard fleet_lock(fleet_mutex);
+      for (const auto& member : lane_members) {
+        bool found = false;
+        for (auto& probe : probes)
+          if (probe.device_id == member.device_id) {
+            probe.lane_weight = member.weight;
+            found = true;
+          }
+        if (!found)
+          probes.push_back(
+              {member.device_id, "ACTIVE", -1, member.weight});
+      }
+    }
+    // This device is always a member, even before any join folds.
+    {
+      bool found = false;
+      for (const auto& probe : probes)
+        if (probe.device_id == device_key->device_id) found = true;
+      if (!found)
+        probes.push_back({device_key->device_id, "ACTIVE", -1, 1.0});
+    }
+    return onion::api::fleet_json::members(writer->read_db(), probes).dump();
+  };
+  struct IssuedInvite {
+    std::string token;
+    std::int64_t expires_at;
+  };
+  std::mutex invite_mutex;
+  std::map<std::string, IssuedInvite> issued_invites;  // id -> token
+  api_options.invites_json = [&]() {
+    nlohmann::json items = nlohmann::json::array();
+    std::lock_guard lock(invite_mutex);
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now()
+                                     .time_since_epoch())
+                                 .count();
+    for (const auto& [id, invite] : issued_invites)
+      items.push_back(
+          {{"id", id}, {"expires_at", invite.expires_at},
+           {"expired", invite.expires_at <= now}});
+    return nlohmann::json{{"items", std::move(items)}}.dump();
+  };
+  api_options.invite_post_json = [&](std::string body) {
+    nlohmann::json result;
+    const auto parsed = nlohmann::json::parse(body, nullptr, false);
+    if (!parsed.is_object() || !parsed.contains("pubkey") ||
+        !parsed["pubkey"].is_string() || parsed["pubkey"].get<std::string>().size() != 64) {
+      result["error"] = "pubkey must be the 64-hex device key";
+      return result.dump();
+    }
+    const std::int64_t ttl_hours =
+        parsed.value("ttl_hours", std::int64_t{24});
+    onion::log::Ed25519Signer signer(*device_key);
+    const std::int64_t now_s =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    const std::string nonce = onion::log::blake2b_hex(
+        onion::platform::secure_random(16));
+    const auto token = onion::log::issue_invite(
+        parsed["pubkey"].get<std::string>(), device_key->device_id,
+        ttl_hours * 3600, nonce, now_s, signer);
+    const std::string id = "inv-" + token.nonce.substr(0, 8);
+    {
+      std::lock_guard lock(invite_mutex);
+      issued_invites[id] =
+          IssuedInvite{onion::log::invite_to_string(token),
+                       now_s + ttl_hours * 3600};
+    }
+    // The token is shown once (never echoed again).
+    result["id"] = id;
+    result["token"] = issued_invites[id].token;
+    result["expires_at"] = issued_invites[id].expires_at;
+    return result.dump();
+  };
+  api_options.evictions_json = [&]() {
+    nlohmann::json items = nlohmann::json::array();
+    const auto proposals = dir / "eviction-proposals";
+    std::error_code ec;
+    if (!std::filesystem::exists(proposals)) return nlohmann::json{{"items", items}}.dump();
+    for (const auto& entry : std::filesystem::directory_iterator(proposals,
+                                                                 ec)) {
+      if (!entry.is_regular_file()) continue;
+      std::ifstream in(entry.path());
+      const nlohmann::json proposal =
+          nlohmann::json::parse(std::string((std::istreambuf_iterator<char>(in)),
+                                            std::istreambuf_iterator<char>()),
+                                nullptr, false);
+      if (proposal.is_discarded()) continue;
+      items.push_back(
+          {{"id", proposal["payload"].value("device_id", "")},
+           {"device_id", proposal["payload"].value("device_id", "")},
+           {"accept_until_seq",
+            proposal["payload"].value("accept_until_seq", 0)},
+           {"sigs", proposal["payload"].value("sigs", nlohmann::json::array())}});
+    }
+    return nlohmann::json{{"items", std::move(items)}}.dump();
+  };
+  api_options.eviction_action_json =
+      [&](std::string id, std::string action, std::string body) {
+        nlohmann::json result;
+        const auto parsed = nlohmann::json::parse(body, nullptr, false);
+        const auto proposals = dir / "eviction-proposals";
+        std::filesystem::create_directories(proposals);
+        if (action == "propose") {
+          const std::string device_id =
+              parsed.is_object() ? parsed.value("device_id", "") : "";
+          if (device_id.empty()) {
+            result["error"] = "device_id is required";
+            return result.dump();
+          }
+          nlohmann::json record = {
+              {"type", "MEMBER_EVICT"},
+              {"payload",
+               {{"device_id", device_id},
+                {"accept_until_seq", parsed.value("accept_until_seq", 0)},
+                {"sigs", nlohmann::json::array()},
+                {"kind", "majority"}}}};
+          onion::log::Ed25519Signer signer(*device_key);
+          nlohmann::json unsigned_payload = record["payload"];
+          unsigned_payload.erase("sigs");
+          record["payload"]["sigs"].push_back(
+              signer.sign(onion::log::canonical_json(unsigned_payload)));
+          std::ofstream draft(proposals / (device_id + ".json"));
+          if (!draft) {
+            result["error"] = "cannot write the proposal";
+            return result.dump();
+          }
+          draft << record.dump() << "\n";
+          result["op_id"] = "evict-" + device_id;
+          return result.dump();
+        }
+        if (action == "sign" || action == "reject") {
+          const auto path = proposals / (id + ".json");
+          if (!std::filesystem::exists(path)) {
+            result["error"] = "proposal not found";
+            return result.dump();
+          }
+          if (action == "reject") {
+            std::filesystem::remove(path);
+            result["op_id"] = "evict-" + id + "-rejected";
+            return result.dump();
+          }
+          std::ifstream in(path);
+          nlohmann::json record = nlohmann::json::parse(in, nullptr, false);
+          in.close();
+          if (record.is_discarded()) {
+            result["error"] = "corrupt proposal";
+            return result.dump();
+          }
+          onion::log::Ed25519Signer signer(*device_key);
+          nlohmann::json unsigned_payload = record["payload"];
+          unsigned_payload.erase("sigs");
+          record["payload"]["sigs"].push_back(
+              signer.sign(onion::log::canonical_json(unsigned_payload)));
+          std::ofstream out(path);
+          out << record.dump() << "\n";
+          result["op_id"] = "evict-" + id + "-signed";
+          return result.dump();
+        }
+        result["error"] = "unknown eviction action";
+        return result.dump();
+      };
+  api_options.device_llm_key_json = [&](std::string body) {
+    const auto parsed = nlohmann::json::parse(body, nullptr, false);
+    if (!parsed.is_object() || !parsed.contains("key") ||
+        !parsed["key"].is_string() || parsed["key"].get<std::string>().empty()) {
+      return nlohmann::json{{"error", "key is required"}}.dump();
+    }
+    key_store.put("deepseek-key", parsed["key"].get<std::string>());
+    // §5.7: never echoed, never logged — only "set".
+    return nlohmann::json{{"set", true}}.dump();
+  };
+  std::atomic<bool> restart_requested{false};
+  api_options.device_restart_json = [&](std::string body) {
+    const auto parsed = nlohmann::json::parse(body, nullptr, false);
+    if (!parsed.is_object() ||
+        parsed.value("confirm", "") != "restart") {
+      return nlohmann::json{{"error",
+                             "restart needs \"confirm\": \"restart\""}}
+          .dump();
+    }
+    restart_requested.store(true);
+    return nlohmann::json{{"op_id", "restart"}, {"status", "accepted"}}.dump();
+  };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
   };
@@ -2224,7 +2425,7 @@ int node_cmd(int argc, char** argv) {
       }
     });
   }
-  while (!stop_flag.load()) {
+  while (!stop_flag.load() && !restart_requested.load()) {
     static std::uint64_t loop_visits = 0;
     if (std::getenv("ONION_SYNC_DEBUG") && ++loop_visits % 50 == 0)
       std::fprintf(stderr, "node loop heartbeat visits=%llu\n",
@@ -2476,6 +2677,11 @@ if (!members_path.empty()) reload_members();
   server.stop();
   writer->stop();
   return 0;
+
+  if (restart_requested.load()) {
+    std::cout << "restart requested by the dashboard\n";
+    return 3;
+  }
 }
 
 int campaign_cmd(int argc, char** argv) {

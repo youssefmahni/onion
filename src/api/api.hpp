@@ -90,6 +90,16 @@ class Server {
         review_action_json;
     std::function<std::string()> review_settings_get_json;
     std::function<std::string(std::string body)> review_settings_put_json;
+    // D5 fleet/device providers.
+    std::function<std::string()> members_json;
+    std::function<std::string()> invites_json;
+    std::function<std::string(std::string body)> invite_post_json;
+    std::function<std::string()> evictions_json;
+    std::function<std::string(std::string id, std::string action,
+                              std::string body)>
+        eviction_action_json;
+    std::function<std::string(std::string body)> device_llm_key_json;
+    std::function<std::string(std::string body)> device_restart_json;
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;

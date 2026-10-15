@@ -12,7 +12,7 @@ const root = document.getElementById("screen");
 const SCREEN_DEFS = [
   ["control", "Control center", ""],
   ["campaigns", "Campaigns", ""],
-  ["fleet", "Fleet", "Members, lanes, invitations, evictions. (arrives in D5)"],
+  ["fleet", "Fleet", ""],
   ["review", "Review queue", ""],
 ];
 
@@ -53,6 +53,9 @@ function route() {
       break;
     case "review":
       render(preact.h(ReviewScreen, null));
+      break;
+    case "fleet":
+      render(preact.h(FleetScreen, null));
       break;
     case "tree": {
       const path = rest ? decodeURIComponent(rest) : "";

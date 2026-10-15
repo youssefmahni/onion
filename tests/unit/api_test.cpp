@@ -955,3 +955,27 @@ TEST_F(ApiTest, ReviewAcceptRetryLeafEndToEnd) {
   EXPECT_EQ(leaf_settle->kept, 0);
   EXPECT_EQ(leaf_settle->end, "cannot split");
 }
+
+// ---------------------------------------------------------------- D5 (§4.1)
+
+#include "api/fleet_json.hpp"
+
+TEST_F(ApiTest, FleetMembersMergeProbesWithTheTable) {
+  onion::log::Record record;
+  record.type = "MEMBER_ADD";
+  record.payload = {{"pubkey", std::string(64, '0')},
+                    {"nonce", "0123456789abcdef"}};
+  writer_->submit(onion::state::CommitTerminal{{record}});
+  writer_->sync();
+
+  std::vector<onion::api::fleet_json::MemberProbe> probes;
+  probes.push_back({"89eb0d6a8a691dae", "SUSPECT", 12, 0.5});
+  const auto members =
+      onion::api::fleet_json::members(writer_->read_db(), probes);
+  ASSERT_TRUE(members.contains("items"));
+  ASSERT_EQ(members["items"].size(), 1u);
+  EXPECT_EQ(members["items"][0]["device_id"], "89eb0d6a8a691dae");
+  EXPECT_EQ(members["items"][0]["live_state"], "SUSPECT");
+  EXPECT_EQ(members["items"][0]["last_seen_s"], 12);
+  EXPECT_DOUBLE_EQ(members["items"][0]["lane_weight"].get<double>(), 0.5);
+}
