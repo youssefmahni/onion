@@ -403,7 +403,7 @@ bool Server::start(std::string* error) {
       return;
     auto json = body_or_error(request, response);
     if (json.is_discarded()) return;
-    const auto& action = impl_->options.force_checkpoint;
+    const auto& action = impl_->options.checkpoint;
     if (!action || !action("checkpoint", "")) {
       response.status = 409;
       response.set_content("{\"error\":\"checkpoint rejected\"}",

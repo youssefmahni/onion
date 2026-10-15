@@ -13,6 +13,8 @@
 #endif
 
 #include "state/state.hpp"
+
+#include "domain/domain.hpp"
 #include "store/checkpoint.hpp"
 
 namespace {
@@ -1434,4 +1436,176 @@ TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
   writer_->sync();
   EXPECT_EQ(writer_->audits_open("mp1"), 0);
   EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
+}
+
+TEST_F(StateWriterTest, ProfileRecordFoldsIntoDomainProfiles) {
+  // Decision 0027: PROFILE records fold into the content-addressed
+  // domain_profiles table; campaigns match on the hash.
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer_->start(&start_error)) << start_error;
+  }
+  const auto profile = onion::domain::planning_profile();
+  writer_->submit(CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(profile))}});
+  writer_->sync();
+  const std::string hash = onion::domain::profile_hash(profile);
+  std::string error;
+  const auto held = writer_->db().domain_profile(hash, &error);
+  ASSERT_TRUE(held) << error;
+  EXPECT_EQ(held->name, "planning");
+  EXPECT_EQ(held->tree, "");
+  EXPECT_EQ(held->hash, hash);
+  // An unknown hash is simply not held.
+  EXPECT_FALSE(
+      writer_->db()
+          .domain_profile(std::string(64, 'f'), &error)
+          .has_value());
+  // A custom profile with a tree folds under its own hash.
+  onion::domain::Profile react = onion::domain::planning_profile();
+  react.name = "react";
+  react.tree = "react";
+  react.structure_layers.clear();
+  writer_->submit(CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(react))}});
+  writer_->sync();
+  const auto react_held =
+      writer_->db().domain_profile(onion::domain::profile_hash(react), &error);
+  ASSERT_TRUE(react_held) << error;
+  EXPECT_EQ(react_held->tree, "react");
+}
+
+TEST(ImportCollisions, DuplicateContentSkipsContentCollisionRefusesCodeCollisionRefuses) {
+  using onion::state::check_import_collisions;
+  using onion::state::DevImportedNode;
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("onion_collision_test_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  StateWriter::Options options;
+  options.data_dir = dir;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<StateWriter>(std::move(options));
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer->start(&start_error)) << start_error;
+  }
+  writer->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01"}, {"layer", 0},
+                               {"title", "Initiation"},
+                               {"code", "P01"}}),
+      make_record("ADD_NODE", {{"path", "P01-IN01"}, {"layer", 1},
+                               {"title", "Identify Problem"},
+                               {"code", "IN01"}}),
+  }});
+  writer->sync();
+
+  // Identical rows: counted as duplicates, dropped, import NOT refused.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"P01", "P01", 0, "Initiation"},
+        {"IN01", "P01-IN01", 1, "Identify Problem"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_TRUE(error.empty());
+    EXPECT_TRUE(nodes.empty());
+    EXPECT_EQ(report.duplicates, 2u);
+    EXPECT_TRUE(report.rows.empty());
+    EXPECT_FALSE(report.refused);
+  }
+  // Different content under an existing path: refused without --allow-skip.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-IN01", 1, "CHANGED TITLE"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_TRUE(report.refused);
+    EXPECT_EQ(nodes.size(), 1u);  // kept: the caller refuses
+    EXPECT_NE(report.rows[0].find("different content"), std::string::npos);
+  }
+  // --allow-skip drops the colliding row but still reports it.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-IN01", 1, "CHANGED TITLE"},
+        {"IN02", "P01-IN02", 1, "Business Goals"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, true, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_FALSE(report.refused);
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes[0].code, "IN02");
+  }
+  // A code already used by another path: refused.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "P01-SOMEWHERE-ELSE", 1, "Another Node"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_EQ(report.rows.size(), 1u);
+    EXPECT_TRUE(report.refused);
+    EXPECT_NE(report.rows[0].find("already used"), std::string::npos);
+  }
+  // Decision 0027: codes may repeat across different trees — the same
+  // code in another tree is not a collision.
+  {
+    std::vector<DevImportedNode> nodes = {
+        {"IN01", "R01-IN01", 1, "Identify Problem", "react"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_FALSE(report.refused);
+    EXPECT_TRUE(report.rows.empty());
+    EXPECT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes[0].tree, "react");
+  }
+  // The same code inside the same tree still collides.
+  {
+    writer->submit(CommitTerminal{{
+        make_record("ADD_NODE", {{"path", "R01"}, {"layer", 0},
+                                 {"title", "React Root"},
+                                 {"code", "R01"}, {"tree", "react"}}),
+    }});
+    writer->sync();
+    std::vector<DevImportedNode> nodes = {
+        {"R01", "R01-OTHER", 1, "Other React Node", "react"}};
+    std::string error;
+    const auto report = check_import_collisions(writer->db(), nodes, false, &error);
+    EXPECT_TRUE(report.refused);
+    EXPECT_EQ(report.rows.size(), 1u);
+  }
+  // The folded node carries its tree.
+  {
+    std::string read_error;
+    const auto react_root = writer->db().node_by_path("R01", &read_error);
+    ASSERT_TRUE(react_root) << read_error;
+    EXPECT_EQ(react_root->tree, "react");
+  }
+  writer->stop();
+  std::filesystem::remove_all(dir);
+}
+
+TEST_F(StateWriterTest, WriteCheckpointCommandSnapshotsTheFoldedState) {
+  // Decision 0027: the forced checkpoint runs on the writer thread and
+  // leaves a checkpoint pair in the data dir.
+  {
+    std::string start_error;
+    ASSERT_TRUE(writer_->start(&start_error)) << start_error;
+  }
+  writer_->submit(CommitTerminal{{
+      make_record("ADD_NODE", {{"path", "P01"}, {"layer", 0},
+                               {"title", "Initiation"}, {"code", "P01"}}),
+  }});
+  writer_->sync();
+  const auto count_checkpoints = [&] {
+    std::size_t count = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_, ec))
+      if (!ec && entry.path().filename().string().rfind("checkpoint-", 0) == 0)
+        ++count;
+    return count;
+  };
+  const std::size_t before = count_checkpoints();
+  writer_->submit(onion::state::WriteCheckpoint{});
+  writer_->sync();
+  EXPECT_GT(count_checkpoints(), before);
 }

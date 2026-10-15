@@ -332,7 +332,8 @@ bool Checks::passed() const {
 }
 
 Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
-                  int max_children, int min_children) {
+                  int max_children, int min_children,
+                  const onion::domain::StyleChecks* style) {
   Checks checks;
   checks.count_ok =
       children.size() >= static_cast<std::size_t>(min_children) &&
@@ -364,7 +365,11 @@ Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
       checks.child_valid[index] = 0;
       checks.failures.push_back("repeated title: " + child.title);
     }
-    const auto flags = depot::style_flags(child.title);
+    // Decision 0027: the style rules come from the domain profile
+    // (nullptr = the embedded planning profile's checks).
+    const auto flags = style
+                           ? onion::domain::style_flags(child.title, *style)
+                           : depot::style_flags(child.title);
     if (!flags.empty()) {
       checks.style_ok = false;
       checks.child_valid[index] = 0;
@@ -771,7 +776,8 @@ FunnelResult Funnel::run(const NodeContext& ctx, const SyncAsk& ask) {
     if (!failed && !children.empty()) {
       const Checks checks =
           run_checks(children, ctx, impl_->options.synth_max_children,
-                     impl_->options.params.children_min);
+                     impl_->options.params.children_min,
+                     &impl_->options.profile.style);
       attempt.checks_passed = checks.passed();
       attempt.valid_count = checks.valid_count;
       attempt.child_valid = checks.child_valid;

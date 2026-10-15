@@ -63,6 +63,33 @@ std::string secure_random(std::size_t bytes);
 std::size_t outbound_request_ceiling();
 std::size_t effective_open_file_limit();
 
+// The exclusive data-directory lock (decision 0027): node run holds it
+// for its whole lifetime; every import/writer command acquires it before
+// touching the data dir and refuses when it is held. The OS releases the
+// lock with the process, so a crash never strands it.
+class DataDirLock {
+ public:
+  DataDirLock() = default;
+  ~DataDirLock();
+  DataDirLock(DataDirLock&& other) noexcept;
+  DataDirLock& operator=(DataDirLock&& other) noexcept;
+  DataDirLock(const DataDirLock&) = delete;
+  DataDirLock& operator=(const DataDirLock&) = delete;
+
+  // Non-blocking exclusive acquisition of <data_dir>/node.lock. Returns
+  // nullopt (with *error set) when the lock is held elsewhere or the
+  // lock file cannot be created.
+  static std::optional<DataDirLock> acquire(
+      const std::filesystem::path& data_dir, std::string* error);
+
+ private:
+#ifdef _WIN32
+  void* handle_{nullptr};
+#else
+  int fd_{-1};
+#endif
+};
+
 class KeyStore {
  public:
   explicit KeyStore(std::filesystem::path directory);

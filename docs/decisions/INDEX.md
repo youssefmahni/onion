@@ -40,9 +40,10 @@ Note column). Last audited 2026-10-14 against `origin/main` @ `cb0f3ab`
 | 0024 | Quality gate and funnel fixes (B3) | *claimed, not yet written* | supersedes 0020; amends 0008 stop rule and 0017 gate defaults | claimed 2026-10-14 by the takeover agent |
 | 0025 | Branch-share allowances apply to engine-created expansion only (imported tickets never leaf as "allowance spent"); the no-progress churn guard | *claimed 2026-10-14 (Mac Pro live-test finding)* | amends 0023 (the pool ledger) |
 | 0026 | Dashboard frontend stack (Preact+htm+uPlot, vendored, no build), 127.0.0.1-only access with SSH tunnel, and the `--allow-remote-dashboard` bind gate | **Proposed** | covers DASHBOARD_PLAN.md D-1, D-2, §3.3 | claimed 2026-10-15 (dashboard D0) |
+| 0027 | Import safety and domain profiles (RE&CT readiness) | Accepted (owner directive) | amends 0025 (source field) | on b3-gate-funnel |
+| 0028 | Remove audit sampling from the engine | Accepted (owner directive) | supersedes 0024's audit-sampling clauses; renumbered from 0026 after the dashboard record claimed it first | on b3-gate-funnel |
 
-Next free number: **0027**.
-
+Next free number: **0029**.
 
 ## Rules
 

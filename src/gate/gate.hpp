@@ -9,6 +9,8 @@
 
 #include "llm/llm.hpp"
 
+#include "domain/domain.hpp"
+
 namespace onion::gate {
 inline constexpr std::string_view component_name{"gate"};
 
@@ -100,7 +102,8 @@ struct Checks {
   bool passed() const;
 };
 Checks run_checks(const std::vector<Child>& children, const NodeContext& ctx,
-                  int max_children = 100, int min_children = 3);
+                  int max_children = 100, int min_children = 3,
+                  const onion::domain::StyleChecks* style = nullptr);
 
 // Defer: the provider failed (outage, rate limit, rejected credentials,
 // empty balance). Nothing about the node was learned, so nothing is
@@ -179,6 +182,10 @@ struct FunnelOptions {
   // the new model labels ~70% of children atomic, which makes the sweep
   // expensive (see DR 0018).
   bool verify_atomic{true};  // decision 0021: batched, on by default
+  // Decision 0027: the domain profile that owns the deterministic checks
+  // (style, structure layers). Defaults to the embedded planning profile,
+  // byte-identical to the historical hard-coded rules.
+  onion::domain::Profile profile{onion::domain::planning_profile()};
   // Optional per-1M-token prices (USD per 1M). When set, the attempt cost
   // is computed from usage; when absent, cost stays 0 (node.conf arrives
   // with M5 — decision 0004: no implicit monetary defaults).

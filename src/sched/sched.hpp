@@ -39,7 +39,6 @@ struct CampaignSpec {
   // above stay parseable for old campaign files and are ignored.
   bool critic{false};          // "on": critique runs and is recorded; never gates
   int children_min{8};         // target lower bound (hard max: synth_max_children, 30)
-  double audit_rate{0.02};     // deterministic audit sample of committed nodes
   double stop_atomic_share{0.90};  // stop rule: verified atomic share threshold
   // W5 funnel variants (absent = the FunnelOptions default): V1 workers'
   // candidates per aspect, V2 planner aspect range, V3 trim rounds, V4
@@ -65,6 +64,13 @@ struct CampaignSpec {
   // checkpoint) without spending an attempt. Both 0 = off.
   int depth_checkpoint_from{0};
   int depth_checkpoint_every{0};
+  // Decision 0027: the domain tree this campaign works in (empty = the
+  // planning tree). Every ADD_NODE the campaign emits carries it.
+  std::string tree;
+  // Decision 0027: the domain profile's hash. Empty = the embedded
+  // planning profile. A device that does not hold the exact profile
+  // refuses to run the campaign.
+  std::string profile_hash;
 };
 
 std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
@@ -342,6 +348,9 @@ struct PoolEvent {
   std::string path;
   log::Hlc hlc{};
   std::string origin;
+  // Decision 0027: the node's source ("import" nodes are exempt from
+  // the halving fold, decision 0025); empty for Attempt events.
+  std::string source;
 };
 
 // allowance(child) = floor(0.5 x remaining(parent)) at the child's
@@ -352,8 +361,7 @@ struct PoolEvent {
 // the events in ANY order; the fold sorts them.
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events,
-    std::uint64_t imported_before_hlc = 0);
+    const std::vector<PoolEvent>& events);
 
 // Decision 0020: starting pools — the campaign's loop budget split
 // across its scope roots in proportion to each root's OPEN ticket count
@@ -362,11 +370,5 @@ std::map<std::string, std::int64_t> fold_pool_allowances(
 std::map<std::string, std::int64_t> compute_starting_pools(
     state::StateWriter& writer, const CampaignSpec& spec,
     std::string* error);
-
-// B3 audit sampling (decision 0024): deterministic per-replica sampling
-// of committed nodes. BLAKE2b(campaign ‖ path) taken modulo 10^6 falls
-// below audit_rate x 10^6. Pure, so every replica samples the same set.
-bool audit_sampled(std::string_view campaign, std::string_view path,
-                   double audit_rate);
 
 }  // namespace onion::sched
