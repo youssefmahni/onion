@@ -68,6 +68,7 @@ struct CampaignInfo {
   std::string state;   // running | paused | stopped
   log::Hlc hlc{};      // latest (hlc, origin) wins
   std::string origin;
+  std::string reason;  // e.g. "no progress" (churn guard, decision 0025)
 };
 
 class StateWriter {

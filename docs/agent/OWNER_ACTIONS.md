@@ -182,18 +182,6 @@ Pass criteria: B reaches ACTIVE with lag < 100 and participates in the next camp
 
 Cost / duration: ~10 minutes.
 
-### OA-14 · GitHub Actions billing is blocking CI · all milestones · status: open
-
-Why: all CI jobs fail at start with "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings". First seen on run 38168705416 (2026-10-11T19:4xZ) right after the OA-13 closure commit; the immediately preceding run (38167851946) was fully green.
-
-Steps:
-1. GitHub → Settings → Billing & plans → fix the failed payment and/or raise the Actions spending limit.
-2. Re-run the failed jobs on the latest m7-dynamic-fleet run (or push an empty commit) and confirm all 8 jobs green.
-
-Impact while blocked: CI cannot verify merges, so no milestone merge may proceed per the merge checklist (§9.4) until this is resolved. Local verification continues in the meantime (full ctest + repeated multi-process runs).
-
-Cost / duration: none (billing), ~5 minutes once the payment works.
-
 ### OA-13 · macOS sync 401 diagnosis (multi-process convergence) · M6 (revisited in M7) · status: RESOLVED (agent) — 2026-10-11
 
 Why it was open: on macOS arm64 CI every sync round was rejected with 401 by the signed-request authenticate(), so the multi-process convergence test skipped there.

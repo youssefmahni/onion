@@ -377,6 +377,10 @@ struct Engine::Impl {
   std::mt19937 rng_{std::random_device{}()};
   std::map<std::string, std::vector<log::Hlc>> own_reserve_hlcs;
   log::HlcClock hlc;
+  // Decision 0025: consecutive settles with zero attempts and zero
+  // spend — the churn guard pauses the campaign after 50 of them
+  // (reason "no progress"). Persists across run() re-entries.
+  int zero_attempt_settles{0};
   // M8 pre-work (the sync scheduler thread): note_sync_round() runs on
   // the scheduler thread while run() runs on the node loop thread. This
   // mutex guards round_states and stolen_claims. Lock order (the ONLY
@@ -587,6 +591,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   // the rule.
   std::map<std::string, std::int64_t> allowances;
   std::vector<std::string> attempt_paths;
+  std::unordered_set<std::string> imported_paths;
   const auto refresh_tickets = [&]() {
     std::string error;
     if (!cache_valid) {
@@ -611,19 +616,31 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     // sort before every attempt and break the remaining-pool math).
     allowances.clear();
     attempt_paths.clear();
+    imported_paths.clear();
+    // Decision 0025: imported (pre-campaign) tickets start a fresh chain
+    // and are NEVER leafed as "allowance spent".
+    const auto campaign_info = writer.campaign(spec.id);
+    const std::uint64_t campaign_start_hlc =
+        campaign_info ? campaign_info->hlc : 0;
     if (!spec.pools.empty()) {
       std::vector<PoolEvent> events;
       std::string nodes_error;
       if (spec.scope.empty()) {
-        for (const store::Node& node : writer.db().all_nodes(&nodes_error))
+        for (const store::Node& node : writer.db().all_nodes(&nodes_error)) {
           events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
                                      node.hlc, node.origin});
+          if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
+            imported_paths.insert(node.path);
+        }
       } else {
         for (const std::string& prefix : spec.scope)
           for (const store::Node& node : writer.db().nodes_with_path_prefix(
-                   prefix, &nodes_error))
+                   prefix, &nodes_error)) {
             events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
                                        node.hlc, node.origin});
+            if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
+              imported_paths.insert(node.path);
+          }
       }
       std::string attempt_error;
       auto statement = writer.db().prepare(
@@ -643,7 +660,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           attempt_paths.push_back(path);
         }
       }
-      allowances = fold_pool_allowances(spec.pools, events);
+      allowances = fold_pool_allowances(spec.pools, events,
+                                       campaign_start_hlc);
     }
     return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
@@ -754,6 +772,19 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     }
     if (stop_rule_met(settled_samples, 50, spec.stop_atomic_share)) {
       result.end_reason = "stop rule";
+      break;
+    }
+    // Decision 0025 churn guard: 50 consecutive settles with zero
+    // attempts and zero spend means the engine is settling without
+    // working — pause the campaign (resumable) with a visible reason.
+    if (impl_->zero_attempt_settles >= 50) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
+                       {"state", "paused"},
+                       {"reason", "no progress"}})}});
+      writer.sync();
+      result.end_reason = "paused";
       break;
     }
     // F-GATE-2: the provider failed recently; start nothing until the
@@ -898,6 +929,12 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         return false;
       };
       for (auto it = tickets.begin(); it != tickets.end();) {
+        // Decision 0025: imported tickets are never leafed by allowance;
+        // if the budget cannot pay them they stay OPEN (0010 liveness).
+        if (imported_paths.count(it->path)) {
+          ++it;
+          continue;
+        }
         if (share_exhausted(it->path)) {
           writer.submit(state::CommitTerminal{{make_record(
               "SETTLE", {{"path", it->path},
@@ -910,11 +947,25 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           writer.sync();
           settled_samples.push_back(SettledSample{0, 0});
           result.leaves++;  // the allowance leaf counts like cannot-split
+          ++impl_->zero_attempt_settles;
           it = tickets.erase(it);
           continue;
         }
         ++it;
       }
+    }
+    // The leaf-out above can settle dozens of zero-call tickets in one
+    // pass; the guard must fire before the drained check short-circuits
+    // the loop (decision 0025).
+    if (impl_->zero_attempt_settles >= 50) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
+                       {"state", "paused"},
+                       {"reason", "no progress"}})}});
+      writer.sync();
+      result.end_reason = "paused";
+      break;
     }
     if (tickets.empty() && waiting.empty()) {
       // No work here. In fleet mode the campaign is over once the fleet
@@ -1110,6 +1161,12 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                        {"campaign", spec.id}})}});
         writer.sync();  // the pool fold reads durable attempts
         result.leaves++;
+        // The guard counts settles with zero LLM calls: a cannot-split
+        // leaf still ran the pre-check (a call), so it is not churn.
+        if (funnel_result.calls == 0)
+          ++impl_->zero_attempt_settles;
+        else
+          impl_->zero_attempt_settles = 0;
         break;
       }
       case gate::Decision::Commit: {
@@ -1182,6 +1239,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         }
         result.settled++;
         result.atomic += atomic;
+        impl_->zero_attempt_settles = 0;  // real work happened
         // DESIGN › Quality gate: a child labelled atomic is a leaf only
         // after the separate verification agrees; unverified labels must
         // not make leaves.  The stop rule's atomic clause is the one
@@ -1750,7 +1808,8 @@ std::map<std::string, std::int64_t> compute_starting_pools(
 
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events) {
+    const std::vector<PoolEvent>& events,
+    std::uint64_t imported_before_hlc) {
   // The fold is order-independent by construction: events sort by
   // (hlc, origin), and the allowance of a child is frozen at its
   // creation from the parent's remaining pool AT THAT POINT.
@@ -1775,6 +1834,15 @@ std::map<std::string, std::int64_t> fold_pool_allowances(
       if (node == path || node.rfind(prefix, 0) == 0) total += count;
     return total;
   };
+  // Decision 0025: a node created BEFORE the campaign (an imported
+  // ticket; the import stamps tiny hlcs) starts a FRESH chain at the
+  // scope root's remaining pool — the 50%-halving applies only to
+  // engine-created expansion children.
+  const auto root_of = [&](std::string_view path) -> std::string {
+    const std::size_t dash = path.find('-');
+    return dash == std::string_view::npos ? std::string(path)
+                                          : std::string(path.substr(0, dash));
+  };
 
   for (const PoolEvent* event : sorted) {
     switch (event->kind) {
@@ -1782,6 +1850,19 @@ std::map<std::string, std::int64_t> fold_pool_allowances(
         ++spent[event->path];
         break;
       case PoolEvent::Kind::Create: {
+        // Imported (pre-campaign) node: a fresh chain, never halved.
+        if (imported_before_hlc > 0 &&
+            event->hlc < imported_before_hlc) {
+          const std::string root = root_of(event->path);
+          const auto pool = root_pools.find(root);
+          if (pool != root_pools.end())
+            allowances[event->path] =
+                std::max<std::int64_t>(0, pool->second -
+                                              subtree_spent(root));
+          else
+            allowances[event->path] = 0;
+          break;
+        }
         // The parent: the nearest existing scoped ancestor (every node
         // in the ledger has one once its ancestors were created; a child
         // event always follows its ancestors' events in path depth —

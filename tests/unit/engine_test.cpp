@@ -854,3 +854,149 @@ TEST_F(EngineTest, FunnelCampaignPastL9EndsWithinItsPools) {
   // ...and the spend stayed within the pools (attempts <= budget).
   EXPECT_LE(result.attempts, campaign.loop_budget);
 }
+
+TEST_F(EngineTest, ImportedDeepTicketsAreWorkedAndNeverLeafedByAllowance) {
+  // Decision 0025: imported (pre-campaign) tickets start a fresh chain
+  // at the scope root's remaining pool and are NEVER leafed as
+  // "allowance spent" — a deep imported fixture makes progress even
+  // under a small budget. The imported records carry tiny hlcs (the
+  // genesis import stamps hlc from 1 upward).
+  std::vector<onion::log::Record> records;
+  const std::vector<std::string> chain = {
+      "P01", "P01-IN01", "P01-IN01-T01", "P01-IN01-T01-TK00001",
+      "P01-IN01-T01-TK00001-TK00002", "P01-IN01-T01-TK00001-TK00002-TK00003"};
+  for (std::size_t i = 0; i < chain.size(); ++i) {
+    onion::log::Record record;
+    record.type = "ADD_NODE";
+    record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
+                      {"title", "Imported " + std::to_string(i)}};
+    record.hlc = static_cast<onion::log::Hlc>(i + 1);  // tiny, like the import
+    records.push_back(std::move(record));
+  }
+  writer_->submit(CommitTerminal{std::move(records)});
+  writer_->sync();
+
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 50;
+  campaign.structure = true;
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  // Real work happened: attempts above zero, the imported nodes settle
+  // through the funnel, not through the allowance leaf.
+  EXPECT_GT(result.attempts, 0);
+  EXPECT_GT(result.settled, 0);
+  // Engine-created children may exhaust their halved shares, but NO
+  // imported ticket is ever leafed as "allowance spent" (decision 0025).
+  std::ifstream in(writer_->segments().active_path());
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    auto batch = json::parse(line, nullptr, false);
+    if (batch.is_discarded()) continue;
+    for (const auto& record_json : batch["recs"]) {
+      if (record_json.value("t", "") != "SETTLE") continue;
+      if (record_json["p"].value("end", "") != "allowance spent") continue;
+      const std::string path = record_json["p"].value("path", "");
+      const bool imported =
+          std::find(chain.begin(), chain.end(), path) != chain.end();
+      EXPECT_FALSE(imported)
+          << "imported ticket leafed as allowance spent: " << path;
+    }
+  }
+}
+
+TEST_F(EngineTest, RaisingTheBudgetResumesImportedTickets) {
+  // Decision 0025 + 0010 liveness: with a tiny budget the engine works
+  // what it can and the rest of the imported tickets stay OPEN — a
+  // budget raise (a fresh spec, like the dashboard edit) resumes them.
+  seed_root();
+  std::vector<onion::log::Record> records;
+  const std::vector<std::string> chain = {
+      "P01", "P01-IN01", "P01-IN01-T01", "P01-IN01-T01-TK00001",
+      "P01-IN01-T01-TK00001-TK00002", "P01-IN01-T01-TK00001-TK00002-TK00003"};
+  for (std::size_t i = 1; i < chain.size(); ++i) {
+    onion::log::Record record;
+    record.type = "ADD_NODE";
+    record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
+                      {"title", "Imported " + std::to_string(i)}};
+    record.hlc = static_cast<onion::log::Hlc>(i);
+    records.push_back(std::move(record));
+  }
+  writer_->submit(CommitTerminal{std::move(records)});
+  writer_->sync();
+
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 2;
+  campaign.structure = true;
+  const Engine::RunResult first = engine.run(campaign, nullptr);
+  EXPECT_GT(first.attempts, 0);
+  // Some imported tickets stay open: the budget cannot pay them all.
+  std::string error;
+  int open = 0;
+  for (const onion::store::Node& node : writer_->db().all_nodes(&error))
+    if (node.path != "P01" && !writer_->settled(node.path) &&
+        !writer_->leaf(node.path))
+      ++open;
+  EXPECT_GT(open, 0);
+
+  // Raise the budget: the dashboard edit reaches the engine as a fresh
+  // spec on the next run — the open tickets resume (never leafed by
+  // the allowance fold, decision 0025).
+  const std::int64_t settled_before = first.settled;
+  campaign.loop_budget = 1000;
+  const Engine::RunResult second = engine.run(campaign, nullptr);
+  EXPECT_GT(second.settled, settled_before);
+  EXPECT_GT(second.attempts, 0);
+}
+
+TEST_F(EngineTest, ChurnGuardPausesAfterFiftyZeroAttemptSettles) {
+  // Decision 0025: 50 consecutive settles with zero LLM calls pause the
+  // campaign (reason "no progress"). The fixture is engine-created —
+  // every record's hlc follows the campaign's start hlc, so the imported
+  // exemption does not apply — and the fold gives every node share 0:
+  // one pass leafs all 61 tickets without a single call.
+  std::vector<onion::log::Record> records;
+  {
+    onion::log::Record campaign;
+    campaign.type = "CAMPAIGN";
+    campaign.payload = {{"id", "c1"},
+                        {"spec", json::object()},
+                        {"state", "running"}};
+    campaign.hlc = 100;
+    records.push_back(std::move(campaign));
+  }
+  const auto add = [&](const std::string& path, std::uint64_t hlc) {
+    onion::log::Record record;
+    record.type = "ADD_NODE";
+    record.payload = {{"path", path},
+                      {"layer", path == "P01" ? 0 : 1},
+                      {"title", path}};
+    record.hlc = hlc;
+    records.push_back(std::move(record));
+  };
+  add("P01", 101);
+  for (int i = 0; i < 60; ++i) add("P01-K" + std::to_string(i), 102 + i);
+  writer_->submit(CommitTerminal{std::move(records)});
+  writer_->sync();
+
+  Budget budget("10");
+  Engine engine(Engine::Options{*writer_, funnel_fake(1), budget, 1,
+                                "dev0000000000000001", "0.001"});
+  CampaignSpec campaign = spec();
+  campaign.loop_budget = 1000;
+  campaign.structure = true;
+  campaign.pools = {{"P01", 0}};  // the fold gives every node share 0
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_EQ(result.end_reason, "paused");
+  const auto info = writer_->campaign("c1");
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->state, "paused");
+  EXPECT_EQ(info->reason, "no progress");
+  EXPECT_EQ(result.leaves, 61);
+  EXPECT_EQ(result.attempts, 0);
+}

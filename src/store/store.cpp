@@ -291,6 +291,10 @@ bool Db::open(std::string* error) {
                "ALTER TABLE members ADD COLUMN sync_url TEXT; "
                "ALTER TABLE members ADD COLUMN swim_url TEXT;",
                nullptr, nullptr, nullptr);
+  // B5 (decision 0025): campaigns carry the pause reason ("no progress").
+  sqlite3_exec(handle_,
+               "ALTER TABLE campaigns ADD COLUMN reason TEXT;",
+               nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
         "INSERT INTO schema_version(version) SELECT ? WHERE NOT EXISTS "
@@ -492,7 +496,7 @@ std::vector<Review> Db::open_reviews(std::string* error) const {
 
 std::vector<Campaign> Db::campaigns(std::string* error) const {
   std::optional<Statement> stmt = prepare(
-      "SELECT id, spec, state, hlc, origin FROM campaigns ORDER BY id;", error);
+      "SELECT id, spec, state, hlc, origin, reason FROM campaigns ORDER BY id;", error);
   if (!stmt) return {};
   std::string step_error;
   std::vector<Campaign> campaigns;
@@ -503,6 +507,7 @@ std::vector<Campaign> Db::campaigns(std::string* error) const {
     campaign.state = stmt->text(2);
     campaign.hlc = static_cast<std::uint64_t>(stmt->integer(3));
     campaign.origin = stmt->text(4);
+    campaign.reason = stmt->text(5);
     campaigns.push_back(std::move(campaign));
   }
   if (!step_error.empty()) set_error(error, handle_, "campaign query failed");

@@ -2,9 +2,10 @@
 
 ## Current
 
-- Milestone: M8 implementation complete locally on `m8-depth-scale`; gate report `docs/agent/gates/M8.md`. CI confirmation remains blocked by OA-14 (GitHub Actions billing); no M8 merge/tag claimed.
+- Dashboard (DASHBOARD_PLAN.md): D0 started. §2 inventories done (docs/dashboard/INVENTORY.md). Prerequisite gate: 0024 quality gate merged ✓; 0025 allowance-leaf fix must merge first (unpushed commit 260093d on `b3-gate-funnel`). After the PR, D0 proceeds on `dash/d0-foundation`.
+- Milestone: M8 merged (PR #49, `f21d23d`), tagged `m8-rc`. B3 (decision 0024) in progress on `b3-gate-funnel`: deterministic quality gate, optional critic (default off), verified-atomic stop rule, audit sampling landed; CI green on the recent b3 runs and the main merge (PR #48).
 - Landed: branch-share pools and no-spend depth checkpoints; 30-day compact checkpoint summaries with exact totals; measured log-growth projection; L6 light-funnel default; `/api/state` and dashboard lanes, claims/steals, backlog, spend rate, disk and quality observability.
-- Next: resolve OA-14, run CI, then decide whether to merge/tag M8. OA-15 (Linux join) and OA-16 (Mac power pull) remain M7 owner live checks.
+- Next: finish B3 on `b3-gate-funnel` (gate/funnel/stop-rule findings), then B2/B5 (mp quiescence CI fix, F-TEST-1) and B6 (security hardening) from REVIEW.md, then M9. OA-15 (Linux join) and OA-16 (Mac power pull) remain M7 owner live checks.
 
 - Milestone: M7 · branch m7-dynamic-fleet · started 2026-10-11
 - Landed so far: signed LAN beacon + `node run` swim wiring (decision 0013 canonical signing over the updates payload, signer/verifier hooks, tolerant UDP bind so co-located nodes survive; ASAN smoke of two real nodes exchanging over UDP clean) — CI green 8/8 (run 38160064783, includes the multi-process test); three review rounds, all findings fixed (stack-use-after-scope signer capture, malformed-datagram sig/ts crash, vacuous signing test, doc drift)

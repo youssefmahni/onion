@@ -203,11 +203,12 @@ void upsert_campaign(store::Db& db, const log::Record& record,
                      std::string_view writer_origin, std::string* error) {
   const auto& payload = record.payload;
   auto statement = db.prepare(
-      "INSERT INTO campaigns(id, spec, state, hlc, origin) "
-      "VALUES (?1, ?2, ?3, ?4, ?5) "
+      "INSERT INTO campaigns(id, spec, state, hlc, origin, reason) "
+      "VALUES (?1, ?2, ?3, ?4, ?5, ?6) "
       "ON CONFLICT(id) DO UPDATE SET spec=excluded.spec, "
       "state=CASE WHEN campaigns.state = 'stopped' THEN 'stopped' "
-      "ELSE excluded.state END, hlc=excluded.hlc, origin=excluded.origin "
+      "ELSE excluded.state END, hlc=excluded.hlc, origin=excluded.origin, "
+      "reason=excluded.reason "
       "WHERE excluded.hlc > campaigns.hlc OR "
       "(excluded.hlc = campaigns.hlc AND excluded.origin > campaigns.origin);",
       error);
@@ -217,7 +218,8 @@ void upsert_campaign(store::Db& db, const log::Record& record,
       !statement->bind(2, payload.at("spec").dump(), &bind_error) ||
       !statement->bind(3, payload.at("state").get<std::string>(), &bind_error) ||
       !statement->bind(4, static_cast<std::int64_t>(record.hlc), &bind_error) ||
-      !statement->bind(5, payload.value("origin", std::string(writer_origin)), &bind_error)) {
+      !statement->bind(5, payload.value("origin", std::string(writer_origin)), &bind_error) ||
+      !statement->bind(6, payload.value("reason", std::string{}), &bind_error)) {
     if (error) *error = "fold campaign bind failed: " + bind_error;
     return;
   }
@@ -545,7 +547,7 @@ void StateWriter::rebuild_index() {
   for (const store::Campaign& campaign : db_.campaigns(&error)) {
     campaigns_.push_back(CampaignInfo{campaign.id, campaign.spec,
                                       campaign.state, campaign.hlc,
-                                      campaign.origin});
+                                      campaign.origin, campaign.reason});
     const auto spec = nlohmann::json::parse(campaign.spec, nullptr, false);
     if (spec.is_object() && spec.contains("loop_budget") &&
         spec["loop_budget"].is_number_integer())
@@ -877,7 +879,8 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
                                     [&](const CampaignInfo& c) { return c.id == id; }),
                      campaigns_.end());
     campaigns_.push_back(CampaignInfo{id, payload.at("spec").dump(), state,
-                                      record.hlc, origin});
+                                      record.hlc, origin,
+                                      payload.value("reason", std::string{})});
     // Decision 0014: the capped fold uses the LATEST spec's loop budget.
     const auto spec = payload.at("spec");
     if (spec.is_object() && spec.contains("loop_budget") &&

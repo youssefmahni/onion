@@ -352,7 +352,8 @@ struct PoolEvent {
 // the events in ANY order; the fold sorts them.
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events);
+    const std::vector<PoolEvent>& events,
+    std::uint64_t imported_before_hlc = 0);
 
 // Decision 0020: starting pools — the campaign's loop budget split
 // across its scope roots in proportion to each root's OPEN ticket count
