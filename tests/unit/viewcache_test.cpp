@@ -61,7 +61,12 @@ class ViewCacheTest : public ::testing::Test {
   void TearDown() override {
     if (cache_) cache_->stop();
     if (writer_) writer_->stop();
-    std::filesystem::remove_all(dir_);
+    // The read-only pool keeps per-thread handles until thread exit, so
+    // the remove can fail on Windows while they drain; the runner's temp
+    // cleanup reclaims the directory, so the failure is ignored (same
+    // policy as the state tests).
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
   }
 
   using StateWriterOptions = onion::state::StateWriter::Options;
