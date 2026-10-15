@@ -28,6 +28,10 @@ struct Node {
   std::string origin;
   std::uint64_t hlc{};
   int tombstone{};
+  // Decision 0027: how the node entered the tree — "import" (corpus
+  // import, exempt from the allowance fold per decision 0025) or
+  // "engine" (created by a campaign settle). Empty = engine (legacy).
+  std::string source;
 };
 
 struct Settle {

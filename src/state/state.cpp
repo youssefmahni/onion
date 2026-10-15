@@ -39,10 +39,14 @@ void upsert_node(store::Db& db, const log::Record& record,
       dash == std::string::npos ? std::string{} : path.substr(0, dash);
   const std::string origin = payload.value("origin", std::string(writer_origin));
 
+  // Decision 0027: the record carries the node's source; legacy
+  // records (no field) default to "engine".
+  const std::string source = payload.value("source", std::string{"engine"});
   auto statement = db.prepare(
       "INSERT INTO nodes(id, code, path, parent_id, layer, title, origin, "
-      "hlc) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, ?1, ?2, "
-      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7) "
+      "hlc, source) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, "
+      "?1, ?2, "
+      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7, ?8) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
       "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
       "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
@@ -55,7 +59,8 @@ void upsert_node(store::Db& db, const log::Record& record,
       !statement->bind(4, layer, &bind_error) ||
       !statement->bind(5, title, &bind_error) ||
       !statement->bind(6, origin, &bind_error) ||
-      !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error)) {
+      !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error) ||
+      !statement->bind(8, source, &bind_error)) {
     if (error) *error = "fold node bind failed: " + bind_error;
     return;
   }
@@ -1295,8 +1300,9 @@ void StateWriter::run() {
         // an existence check per row.
         auto statement = db_.prepare(
             "INSERT OR IGNORE INTO nodes(code, path, parent_id, layer, "
-            "title, origin, hlc) VALUES (?1, ?2, (SELECT n2.id FROM nodes n2 "
-            "WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6);",
+            "title, origin, hlc, source) VALUES (?1, ?2, (SELECT n2.id FROM "
+            "nodes n2 WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6, "
+            "'import');",
             &error);
         auto exists = db_.prepare(
             "SELECT 1 FROM nodes WHERE path = ?1;", &error);

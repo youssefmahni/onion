@@ -839,7 +839,8 @@ TEST_F(EngineTest, ImportedDeepTicketsAreWorkedAndNeverLeafedByAllowance) {
     onion::log::Record record;
     record.type = "ADD_NODE";
     record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
-                      {"title", "Imported " + std::to_string(i)}};
+                      {"title", "Imported " + std::to_string(i)},
+                      {"source", "import"}};
     record.hlc = static_cast<onion::log::Hlc>(i + 1);  // tiny, like the import
     records.push_back(std::move(record));
   }
@@ -890,7 +891,8 @@ TEST_F(EngineTest, RaisingTheBudgetResumesImportedTickets) {
     onion::log::Record record;
     record.type = "ADD_NODE";
     record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
-                      {"title", "Imported " + std::to_string(i)}};
+                      {"title", "Imported " + std::to_string(i)},
+                      {"source", "import"}};
     record.hlc = static_cast<onion::log::Hlc>(i);
     records.push_back(std::move(record));
   }

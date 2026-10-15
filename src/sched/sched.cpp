@@ -613,29 +613,24 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     allowances.clear();
     attempt_paths.clear();
     imported_paths.clear();
-    // Decision 0025: imported (pre-campaign) tickets start a fresh chain
-    // and are NEVER leafed as "allowance spent".
-    const auto campaign_info = writer.campaign(spec.id);
-    const std::uint64_t campaign_start_hlc =
-        campaign_info ? campaign_info->hlc : 0;
+    // Decision 0025/0027: imported tickets (nodes with source "import")
+    // start a fresh chain and are NEVER leafed as "allowance spent".
     if (!spec.pools.empty()) {
       std::vector<PoolEvent> events;
       std::string nodes_error;
       if (spec.scope.empty()) {
         for (const store::Node& node : writer.db().all_nodes(&nodes_error)) {
           events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
-                                     node.hlc, node.origin});
-          if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
-            imported_paths.insert(node.path);
+                                     node.hlc, node.origin, node.source});
+          if (node.source == "import") imported_paths.insert(node.path);
         }
       } else {
         for (const std::string& prefix : spec.scope)
           for (const store::Node& node : writer.db().nodes_with_path_prefix(
                    prefix, &nodes_error)) {
             events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
-                                       node.hlc, node.origin});
-            if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
-              imported_paths.insert(node.path);
+                                       node.hlc, node.origin, node.source});
+            if (node.source == "import") imported_paths.insert(node.path);
           }
       }
       std::string attempt_error;
@@ -656,8 +651,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           attempt_paths.push_back(path);
         }
       }
-      allowances = fold_pool_allowances(spec.pools, events,
-                                       campaign_start_hlc);
+      allowances = fold_pool_allowances(spec.pools, events);
     }
     return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
@@ -1121,7 +1115,8 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         records.push_back(make_record(
             "ADD_NODE", {{"path", ticket.path + "-" + id},
                          {"layer", ticket.layer + 1},
-                         {"title", child.title}}));
+                         {"title", child.title},
+                         {"source", "engine"}}));
       }
       records.push_back(make_record(
           "CRITIQUE", {{"path", ticket.path},
@@ -1753,8 +1748,7 @@ std::map<std::string, std::int64_t> compute_starting_pools(
 
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events,
-    std::uint64_t imported_before_hlc) {
+    const std::vector<PoolEvent>& events) {
   // The fold is order-independent by construction: events sort by
   // (hlc, origin), and the allowance of a child is frozen at its
   // creation from the parent's remaining pool AT THAT POINT.
@@ -1795,9 +1789,9 @@ std::map<std::string, std::int64_t> fold_pool_allowances(
         ++spent[event->path];
         break;
       case PoolEvent::Kind::Create: {
-        // Imported (pre-campaign) node: a fresh chain, never halved.
-        if (imported_before_hlc > 0 &&
-            event->hlc < imported_before_hlc) {
+        // Imported node (decision 0025/0027): a fresh chain at the
+        // scope root's remaining pool, never halved.
+        if (event->source == "import") {
           const std::string root = root_of(event->path);
           const auto pool = root_pools.find(root);
           if (pool != root_pools.end())

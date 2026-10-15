@@ -295,6 +295,10 @@ bool Db::open(std::string* error) {
   sqlite3_exec(handle_,
                "ALTER TABLE campaigns ADD COLUMN reason TEXT;",
                nullptr, nullptr, nullptr);
+  // Decision 0027: nodes carry their source ("import" | "engine").
+  sqlite3_exec(handle_,
+               "ALTER TABLE nodes ADD COLUMN source TEXT;",
+               nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
         "INSERT INTO schema_version(version) SELECT ? WHERE NOT EXISTS "
@@ -363,11 +367,13 @@ Node read_node(Statement& stmt) {
   node.origin = stmt.text(6);
   node.hlc = static_cast<std::uint64_t>(stmt.integer(7));
   node.tombstone = stmt.integer_int(8);
+  node.source = stmt.text(9);
   return node;
 }
 
 constexpr const char* kNodeColumns =
-    "id, code, path, parent_id, layer, title, origin, hlc, tombstone";
+    "id, code, path, parent_id, layer, title, origin, hlc, tombstone, "
+    "source";
 
 }  // namespace
 

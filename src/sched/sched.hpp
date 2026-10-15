@@ -341,6 +341,9 @@ struct PoolEvent {
   std::string path;
   log::Hlc hlc{};
   std::string origin;
+  // Decision 0027: the node's source ("import" nodes are exempt from
+  // the halving fold, decision 0025); empty for Attempt events.
+  std::string source;
 };
 
 // allowance(child) = floor(0.5 x remaining(parent)) at the child's
@@ -351,8 +354,7 @@ struct PoolEvent {
 // the events in ANY order; the fold sorts them.
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events,
-    std::uint64_t imported_before_hlc = 0);
+    const std::vector<PoolEvent>& events);
 
 // Decision 0020: starting pools — the campaign's loop budget split
 // across its scope roots in proportion to each root's OPEN ticket count
