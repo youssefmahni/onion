@@ -211,3 +211,36 @@ Evidence:
 - Owner manual steps remaining: (1) node key set deepseek-key <key> + restart, (2) sudo LaunchDaemon for reboot persistence, (3) first campaign plan/start, (4) firewall allow for 7946/7947 when the fleet joins.
 
 Next step: owner's three manual steps above; then the first real campaign (one phase, small budget).
+
+## 2026-10-14 — Knowledge tree viewer (dashboard) + Mac live check
+
+**Done:**
+- 0025 deployed to the Mac Pro and verified live: campaign `p01-first` (scope P01, budget 50, deepseek-flash) settled 25 nodes with $0.12 real spend — no mass "allowance spent" leafing (before the fix: 30,794 zero-attempt leaves). Root cause of the first stalled restart: the node must run with `--base-url https://api.deepseek.com --model deepseek-flash` (missing flags → "provider unavailable").
+- Knowledge tree viewer: new `GET /api/tree?path=<p>&depth=<n>&offset=<k>` (lazy subtree, per-node 200-child cap with `has_more`, pagination; reads via the read-only connection so polls never serialize behind writer). Provider `tree_json` in commands.cpp; route + exception guard in api.cpp; hook in api.hpp Options.
+- Dashboard: "Knowledge tree" section with expand/collapse, lazy loading (children fetch at depth 2 on expand), live settle badges (15 s poll of expanded subtrees, capped fan-out), client-side filter with ancestor highlight, expand/collapse-all, reload, "+ load more" pagination.
+- Fixed two real bugs found while building it: (1) json* frame slots into children arrays dangle on reallocation (batched push, slots after); (2) `sqlite3_step` auto-resets on DONE, so the post-loop "clipped" probe replayed row 1 — probe only when the loop stops at the cap.
+- Tests: api_test.cpp +TreeEndpointPassesPathAndDepthToTheProvider (7/7 pass). Local UI smoke-tested in-browser against a fixture corpus (expand/collapse/search/load-more verified via DOM + network log).
+- Deployed to the Mac: sources + web/ rsynced, rebuilt, node restarted; `/api/tree` serves the live corpus (P01 now 37 children), dashboard serves the tree over LAN.
+
+**Evidence:** Mac `curl /api/tree` output (P01 child_count 37, settled badges), /api/state settled 25 spend 0.121, LAN 200 on "/" with "Knowledge tree", api_test 7/7.
+
+**Next step:** run the full local ctest + push the 0025 + tree work through a PR (branch `b3-gate-funnel`, all CI jobs), then re-run the full suite on CI before merge.
+
+## 2026-10-14 — Two-Mac-Pro fleet formed
+
+**Done:**
+- Mac #2 (192.168.1.57, wiped home dir, no dev tools) provisioned with #1's compiled binary (identical x86_64 macOS 12.7.6) — no toolchain needed.
+- Fleet flow: #2 `node identity` → #1 `node invite --pubkey <hex>` → #2 `node join --token @file --seed 192.168.1.63:7947` → members.json written + checkpoint cloned (316k-node tree synced, 29 settles visible).
+- Fixed along the way: #1's node must run with `--host <LAN IP>` (not 0.0.0.0) so the join response advertises a reachable sync URL; #1 needed `--members ~/members.json` self-listing for the sync server to start (it only binds with a members list — the join endpoint lives there); the CLI-written CAMPAIGN record folds only at node startup (restart required to raise the budget 50→1000, decision 0010 resume).
+- Fleet live: #1 40 settles / $0.22, #2 29 settles / $0.14, lanes split by weighted rendezvous, #2 pulls #1 (rounds completing), members-table url fallback makes joined devices reachable.
+- #2 still JOINING on #1's side until lag < 100 ops (automatic).
+
+**Evidence:** /api/state on both (settles, spend, lanes 267/234 split on #2), members table on #1 with #2's sync_url 192.168.1.57:7947, swim groups 2 members.
+
+**Next step:** full local ctest + PR for 0025 + tree viewer + fleet tooling changes (b3-gate-funnel → CI).
+
+## 2026-10-14 — Fleet sync URL bug found + worked around
+
+**Finding (real bug, to fix in the PR):** `reload_members()` (commands.cpp, sync thread) replaces `member_urls` from the static members.json every round, wiping URLs the main loop had merged from the members table (the M7 "deterministic fallback" for joined devices). Symptom: the seed never pulls a joined device — rounds verdict `answered=1/2 majority=no`, vector stuck at 2. Workaround: list both members with `url`/`swim` in the seed's members.json. After that: rounds completing, lanes split ~50/50 (158,298 / 158,961 tickets), vector 913/958 both ways, 110 settles, $0.35.
+
+**Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.

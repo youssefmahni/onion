@@ -12,7 +12,7 @@
 | `/api/state` exposes lanes, claims/steals, review backlog, spend rate, disk use and quality guard; dashboard renders them | `m8.observability_state`, `ApiTest.*` | ✅ local |
 | Light funnel starts at L6 | `ParseCampaign.AcceptsAValidFile`, decision 0017 | ✅ local |
 
-CI status is pending OA-14; see `docs/agent/gates/M8.md`.
+CI status: M8 merged (PR #49) and tagged `m8-rc`; see `docs/agent/gates/M8.md`.
 
 ## M7 scope: DESIGN.md › Membership, Joining, Eviction, Stealing, Eligibility
 

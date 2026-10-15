@@ -19,11 +19,17 @@ class Server {
  public:
   struct Options {
     int port{8080};              // 0 = pick an ephemeral port
+    std::string host{"127.0.0.1"};  // bind address (--host; the LAN for a fleet)
     std::string token;           // per-device token (from the key store)
     std::string dashboard_html;  // served at /
     state::StateWriter* writer{};
     // Action hooks (set by the CLI): each runs in the handler thread.
     std::function<std::string()> state_json;
+    // The lazy tree provider (dashboard): returns the subtree at `path`
+    // down `depth` levels, capped per node (has_more on overflow) and
+    // pageable per node via `offset`.
+    std::function<std::string(std::string path, int depth, int offset)>
+        tree_json;
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;

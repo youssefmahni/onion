@@ -303,12 +303,27 @@ int adaptive_bench(int argc, char** argv) {
 }
 }  // namespace
 
+#include "cli.hpp"
 #include "commands.hpp"
 
 int llm_main(int argc, char** argv) {
-  if (argc < 3) {
-    std::cerr << "usage: data_depot llm bench --url <fake-server-url> --requests N\n";
-    return 2;
+  const bool wants_help = [&] {
+    for (int i = 2; i < argc; ++i)
+      if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h")
+        return true;
+    return false;
+  }();
+  if (wants_help || argc < 3) {
+    std::cout
+        << "usage: data_depot llm bench --url <fake-server-url> --requests "
+           "N\n"
+        << "\nllm subcommands:\n"
+        << "  bench          load the transport against a fake server and "
+           "print latency/budget stats\n"
+        << "  limiter-trace  replay a concurrency limiter scenario\n"
+        << "  models         list the known model ids\n"
+        << "  probe          probe the provider configuration\n";
+    return wants_help ? 0 : 2;
   }
   if (std::string(argv[2]) == "limiter-trace") return limiter_trace(argc, argv);
   if (std::string(argv[2]) == "models") return llm_models(argc, argv);
@@ -390,13 +405,170 @@ int llm_main(int argc, char** argv) {
   return failed == 0 ? 0 : 1;
 }
 
+namespace onion::cli {
+namespace {
+struct HelpEntry {
+  const char* name;
+  const char* usage;
+  const char* summary;
+};
+
+const HelpEntry kTopLevel[] = {
+    {"llm", "llm bench --url <fake-server-url> --requests N",
+     "benchmark the LLM transport against a test server (also: llm "
+     "limiter-trace, models, probe)"},
+    {"node",
+     "node run|identity|invite|join|stop|evict|profile|key|install-service|"
+     "debug-state|chaos-hooks",
+     "run the engine node, manage the fleet (invite/join/evict), store "
+     "keys, install the OS service"},
+    {"campaign", "campaign start|plan|pause|resume|stop ...",
+     "start and steer campaigns from JSON spec files"},
+    {"review", "review list|accept|retry|reject ...",
+     "inspect and decide the review queue"},
+    {"dev-import", "dev-import --root <corpus-copy>",
+     "import a development corpus (per-layer CSVs) into the data dir"},
+    {"export-csv", "export-csv --out <dir>",
+     "export the knowledge tree to per-layer CSVs"},
+    {"admin", "admin keygen --out <path>",
+     "administrator key management (the admin key never lives in the data "
+     "dir)"},
+    {"genesis-import",
+     "genesis-import --root <corpus-copy> --data-dir <dir> [--propose "
+     "<file>] [--resolution <file>]",
+     "import a corpus with an optional proposal/resolution pair (genesis "
+     "tooling)"},
+};
+
+const HelpEntry kNodeSubs[] = {
+    {"run",
+     "node run --base-url <url> [--model <id>] [--host <ip>] [--api-port "
+     "8080] [--sync-port 7947] [--members <file>] [--budget-usd 1000] "
+     "[--price-in <usd>] [--price-cache <usd>] [--price-out <usd>] "
+     "[--key-file <path>] [--data-dir <dir>]",
+     "run the node: engine loop, sync server, swim gossip and the "
+     "dashboard API"},
+    {"identity", "node identity",
+     "print this device's device_id and public_key (the 64-hex key the "
+     "invite command needs)"},
+    {"invite", "node invite --pubkey <64-hex> [--ttl 24h] [--nonce <hex>]",
+     "issue a signed join invitation token for the given public key "
+     "(print it and hand it to the joiner)"},
+    {"join", "node join --token <token|@file> --seed <host:port>",
+     "join a fleet: present an invitation token to a seed member and "
+     "clone its checkpoint"},
+    {"stop", "node stop [--leave] [--api-port 8080]",
+     "gracefully stop a running node; --leave drains in-flight work and "
+     "records MEMBER_LEAVE"},
+    {"evict",
+     "node evict --device <id> [--sigs-file <f>] [--accept-until <seq>] "
+     "[--api-port <p>]",
+     "evict a device from the fleet"},
+    {"profile", "node profile [--base-url <url>]",
+     "scan this machine and print the derived performance profile "
+     "(weight, concurrency limits)"},
+    {"key", "node key set <name> <value>",
+     "store a named key in the node key store (deepseek-key, api-token, "
+     "device-key)"},
+    {"install-service",
+     "node install-service --binary <path> [--base-url <url>] [--model "
+     "<id>] [--api-port 8080]",
+     "print the OS service unit: a systemd unit, a launchd plist or a "
+     "Windows service script — install it with the OS tooling"},
+    {"debug-state", "node debug-state [--members <file>]",
+     "read-only diagnostic dump: campaigns, open tickets, reserves, "
+     "applied vector, attempts"},
+    {"chaos-hooks", "node chaos-hooks",
+     "print 1 when the chaos test hooks are compiled in, else 0 (test "
+     "harness probe)"},
+};
+
+const HelpEntry kCampaignSubs[] = {
+    {"start", "campaign start <file>",
+     "start a campaign from a JSON spec file; re-starting the same id "
+     "with a bigger budget resumes its open tickets (decision 0010)"},
+    {"plan", "campaign plan <file> [--depth-to 8] [--one-level] "
+             "[--grow-levels N] [--from-counts ...]",
+     "project a campaign plan over the current corpus"},
+    {"pause", "campaign pause <id>", "pause a running campaign"},
+    {"resume", "campaign resume <id>", "resume a paused campaign"},
+    {"stop", "campaign stop <id>", "stop a campaign (final)"},
+};
+
+const HelpEntry kReviewSubs[] = {
+    {"list", "review list", "list the open review queue"},
+    {"accept", "review accept <path> [--note <text>]",
+     "accept a review: release the node for work"},
+    {"retry", "review retry <path> [--note <text>]",
+     "retry the reviewed node"},
+    {"reject", "review reject <path> [--note <text>]",
+     "reject the review and tombstone the node"},
+};
+
+const HelpEntry* table_for(const std::string& command, std::size_t* size) {
+  if (command == "node") {
+    *size = sizeof(kNodeSubs) / sizeof(kNodeSubs[0]);
+    return kNodeSubs;
+  }
+  if (command == "campaign") {
+    *size = sizeof(kCampaignSubs) / sizeof(kCampaignSubs[0]);
+    return kCampaignSubs;
+  }
+  if (command == "review") {
+    *size = sizeof(kReviewSubs) / sizeof(kReviewSubs[0]);
+    return kReviewSubs;
+  }
+  return nullptr;
+}
+}  // namespace
+
+bool print_cli_help(const std::string& command,
+                    const std::string& subcommand) {
+  if (command.empty()) {
+    std::cout << "usage: data_depot <command> [<args>]\n\ncommands:\n";
+    for (const HelpEntry& entry : kTopLevel)
+      std::cout << "  " << entry.name << "\n      " << entry.summary << "\n"
+                << "      usage: data_depot " << entry.usage << "\n";
+    std::cout << "\nrun 'data_depot <command> --help' for the subcommand "
+                 "list.\n";
+    return true;
+  }
+  std::size_t size = 0;
+  const HelpEntry* table = table_for(command, &size);
+  if (!table) {
+    std::cout << "no help page for '" << command << "'\n";
+    return false;
+  }
+  if (subcommand.empty()) {
+    std::cout << "usage: data_depot " << command << " <subcommand>\n"
+              << "\nsubcommands:\n";
+    for (std::size_t i = 0; i < size; ++i)
+      std::cout << "  " << table[i].name << "\n      " << table[i].summary
+                << "\n      usage: data_depot " << table[i].usage << "\n";
+    return true;
+  }
+  for (std::size_t i = 0; i < size; ++i) {
+    if (subcommand != table[i].name) continue;
+    std::cout << "usage: data_depot " << table[i].usage << "\n\n"
+              << table[i].summary << "\n";
+    return true;
+  }
+  std::cout << "unknown " << command << " subcommand: " << subcommand << "\n";
+  std::cout << "usage: data_depot " << command << " <subcommand>\n";
+  return false;
+}
+}  // namespace onion::cli
+
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr
-        << "usage: data_depot llm|node|campaign|review|dev-import|export-csv ...\n";
+    onion::cli::print_cli_help("", "");
     return 2;
   }
   const std::string command(argv[1]);
+  if (command == "--help" || command == "-h" || command == "help") {
+    onion::cli::print_cli_help("", "");
+    return 0;
+  }
   if (command == "llm") return llm_main(argc, argv);
   if (command == "node") return node_cmd(argc, argv);
   if (command == "campaign") return campaign_cmd(argc, argv);
@@ -405,6 +577,6 @@ int main(int argc, char** argv) {
   if (command == "export-csv") return export_csv_cmd(argc, argv);
   if (command == "admin") return admin_cmd(argc, argv);
   if (command == "genesis-import") return genesis_import_cmd(argc, argv);
-  std::cerr << "unknown command: " << command << "\n";
+  std::cerr << "unknown command: " << command << " (run 'data_depot --help')\n";
   return 2;
 }

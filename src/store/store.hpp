@@ -81,6 +81,7 @@ struct Campaign {
   std::string state;  // running | paused | stopped
   std::uint64_t hlc{};
   std::string origin;
+  std::string reason;  // e.g. "no progress" (the churn guard, decision 0025)
 };
 
 // RAII prepared statement: fails hard on misuse in debug, reports errors out.

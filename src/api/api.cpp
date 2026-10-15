@@ -93,6 +93,46 @@ bool Server::start(std::string* error) {
     response.set_content(impl_->options.dashboard_html, "text/html");
   });
 
+  // The lazy tree endpoint (dashboard): GET /api/tree?path=<path>&depth=<n>.
+  // Depth defaults to 2 and clamps to [0, 6] inside the provider.
+  impl_->server->Get("/api/tree", [this](const httplib::Request& request,
+                                         httplib::Response& response) {
+    if (!impl_->options.tree_json) {
+      response.status = 404;
+      response.set_content("{\"error\":\"no tree provider\"}",
+                           "application/json");
+      return;
+    }
+    std::string path;
+    if (request.has_param("path")) path = request.get_param_value("path");
+    int depth = 2;
+    if (request.has_param("depth")) {
+      try {
+        depth = std::stoi(request.get_param_value("depth"));
+      } catch (const std::exception&) {
+        depth = 2;
+      }
+    }
+    int offset = 0;
+    if (request.has_param("offset")) {
+      try {
+        offset = std::max(0, std::stoi(request.get_param_value("offset")));
+      } catch (const std::exception&) {
+        offset = 0;
+      }
+    }
+    try {
+      response.set_content(
+          impl_->options.tree_json(std::move(path), depth, offset),
+          "application/json");
+    } catch (const std::exception& exception) {
+      response.status = 500;
+      response.set_content(
+          std::string("{\"error\":\"") + exception.what() + "\"}",
+          "application/json");
+    }
+  });
+
   const auto bind_post = [this](const char* path,
                                 std::function<bool(std::string, std::string)> action) {
     impl_->server->Post(
@@ -146,12 +186,14 @@ bool Server::start(std::string* error) {
   impl_->running.store(true);
   impl_->thread = std::thread([this] {
     if (impl_->options.port == 0) {
-      const int bound = impl_->server->bind_to_any_port("127.0.0.1");
+      const int bound =
+          impl_->server->bind_to_any_port(impl_->options.host.c_str());
       impl_->port.store(bound);
       if (bound < 0) impl_->running.store(false);
     } else {
       impl_->port.store(impl_->options.port);
-      if (!impl_->server->bind_to_port("127.0.0.1", impl_->options.port))
+      if (!impl_->server->bind_to_port(impl_->options.host.c_str(),
+                                       impl_->options.port))
         impl_->running.store(false);
     }
     while (impl_->running.load()) {
