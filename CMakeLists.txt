@@ -118,6 +118,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(sqlite)
 add_library(onion_sqlite STATIC "${sqlite_SOURCE_DIR}/sqlite3.c")
 target_include_directories(onion_sqlite PUBLIC "${sqlite_SOURCE_DIR}")
+# FTS5 powers the dashboard's full-text search (viewcache.db, plan §6.2).
+target_compile_definitions(onion_sqlite PRIVATE SQLITE_ENABLE_FTS5)
 
 FetchContent_Declare(
   zstd
@@ -149,6 +151,8 @@ target_link_libraries(domain INTERFACE nlohmann_json::nlohmann_json
   onion::log)
 target_link_libraries(store PUBLIC onion_sqlite onion::log)
 target_link_libraries(store PUBLIC onion::core onion::platform)
+onion_add_compiled_module(viewcache src/viewcache/viewcache.cpp)
+target_link_libraries(viewcache PUBLIC onion::store)
 if(WIN32)
   # Windows is the sole platform that builds the pinned curl source.  Schannel
   # keeps certificate validation on the Windows trust store.
@@ -213,7 +217,7 @@ target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static onion::domain)
 
 # Interface layer
-onion_add_compiled_module(api src/api/api.cpp)
+onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp)
 # The local API is plain HTTP on 127.0.0.1: no TLS and no compression, so
 # httplib is compiled without its OpenSSL/zlib/brotli support. Linking the
 # httplib::httplib CMake target would pull a Homebrew OpenSSL that cannot
@@ -224,6 +228,7 @@ if(WIN32)
   target_link_libraries(api PUBLIC ws2_32)
 endif()
 target_link_libraries(api PUBLIC onion::state)
+target_link_libraries(api PUBLIC onion::viewcache)
 onion_add_module(cli)
 target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state onion::reactconv onion::domain)
 
@@ -266,6 +271,11 @@ if(BUILD_TESTING)
   add_executable(onion_store_test tests/unit/store_test.cpp)
   target_link_libraries(onion_store_test PRIVATE onion::store GTest::gtest_main)
   gtest_discover_tests(onion_store_test)
+
+  add_executable(onion_viewcache_test tests/unit/viewcache_test.cpp)
+  target_link_libraries(onion_viewcache_test PRIVATE onion::viewcache
+    onion::state GTest::gtest_main)
+  gtest_discover_tests(onion_viewcache_test)
 
   add_executable(onion_state_test tests/unit/state_test.cpp)
   target_link_libraries(onion_state_test PRIVATE onion::state GTest::gtest_main)
@@ -395,7 +405,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::profile onion::sync onion::swim onion::reactconv)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::viewcache onion::profile onion::sync onion::swim onion::reactconv)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 if(ONION_CHAOS_HOOKS)

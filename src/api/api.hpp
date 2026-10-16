@@ -52,6 +52,17 @@ class Server {
     // pageable per node via `offset`.
     std::function<std::string(std::string path, int depth, int offset)>
         tree_json;
+    // D1 /api/v1 tree providers (all run in the handler thread and read
+    // through the read-only pool; absent hooks answer 404).
+    std::function<std::string(std::string path, std::string cursor,
+                              int limit)>
+        tree_children_json;
+    std::function<std::string(std::string path)> tree_node_json;
+    std::function<std::string(std::string query, std::string levels,
+                              std::string status, std::string cursor)>
+        tree_search_json;
+    std::function<std::string()> tree_stats_json;
+    std::function<std::string(std::string path)> tree_export_csv;
     std::function<bool(std::string, std::string)> campaign_pause;
     std::function<bool(std::string, std::string)> campaign_resume;
     std::function<bool(std::string, std::string)> campaign_stop;

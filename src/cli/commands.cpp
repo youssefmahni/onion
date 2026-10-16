@@ -4,7 +4,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <csignal>
+#include <deque>
+#include <mutex>
 #include <cstdio>
+#include <unordered_map>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -24,6 +29,7 @@
 #include <vector>
 
 #include "api/api.hpp"
+#include "api/tree_json.hpp"
 #include "core/depot_core.hpp"
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
@@ -41,6 +47,7 @@
 #include "log/invite.hpp"
 #include "state/state.hpp"
 #include "store/store.hpp"
+#include "viewcache/viewcache.hpp"
 
 // The build-time embedded web assets (generated web_assets.cpp, plan §3.1).
 namespace onion::cli {
@@ -131,7 +138,8 @@ std::optional<onion::platform::DataDirLock> lock_data_dir(
 }
 
 std::unique_ptr<onion::state::StateWriter> open_writer(
-    const std::filesystem::path& dir, std::string* error) {
+    const std::filesystem::path& dir, std::string* error,
+    std::function<void(const onion::log::Record&)> on_folded_record = {}) {
   onion::platform::KeyStore store(dir / "keys");
   auto key = load_device_key(store, error);
   if (!key) return nullptr;
@@ -150,6 +158,7 @@ std::unique_ptr<onion::state::StateWriter> open_writer(
     };
   }
 #endif  // ONION_CHAOS_HOOKS
+  options.on_folded_record = std::move(on_folded_record);
   auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
   if (!writer->start(error)) return nullptr;
   return writer;
@@ -1026,7 +1035,31 @@ int node_cmd(int argc, char** argv) {
   // 0027): writer commands refuse while this process holds it.
   auto data_lock = lock_data_dir(dir);
   if (!data_lock) return 1;
-  auto writer = open_writer(dir, &error);
+
+  // viewcache.db (plan §6.2): counts + FTS beside onion.db. The fold hook
+  // queues cheap notes; a maintenance thread applies them incrementally and
+  // rebuilds on a vector/version mismatch (throttled to 30 s).
+  struct CacheNote {
+    std::string type;
+    std::string path;
+    std::string title;
+  };
+  std::mutex cache_mutex;
+  std::deque<CacheNote> cache_notes;
+  auto view_cache = std::make_shared<onion::viewcache::Cache>(
+      onion::viewcache::Cache::Options{dir / "viewcache.db", dir / "onion.db"});
+  std::string cache_error;
+  view_cache->start(&cache_error);  // best effort; rebuild reports errors
+  auto writer = open_writer(
+      dir, &error, [&](const onion::log::Record& record) {
+        if (record.type != "ADD_NODE" && record.type != "TOMBSTONE") return;
+        std::lock_guard lock(cache_mutex);
+        if (cache_notes.size() >= 10000) return;
+        cache_notes.push_back(
+            {record.type, record.payload.value("path", std::string{}),
+             record.payload.value("title", std::string{})});
+      });
+
   if (!writer) {
     std::cerr << "cannot open node state: " << error << "\n";
     return 1;
@@ -1418,6 +1451,38 @@ int node_cmd(int argc, char** argv) {
   std::atomic<bool> sync_stop{false};
   std::thread sync_thread;
 
+  // viewcache maintenance: initial rebuild (ready=false => stale), then
+  // incremental fold notes + throttled rebuilds on mismatch.
+  std::atomic<bool> cache_stop{false};
+  std::thread cache_thread([&] {
+    auto last_rebuild = std::chrono::steady_clock::now() -
+                        std::chrono::seconds(30);
+    while (!cache_stop.load()) {
+      std::deque<CacheNote> batch;
+      {
+        std::lock_guard lock(cache_mutex);
+        batch.swap(cache_notes);
+      }
+      std::string cache_error;
+      for (const auto& note : batch) {
+        if (note.type == "ADD_NODE")
+          view_cache->node_added(note.path, note.title, &cache_error);
+        else if (note.type == "TOMBSTONE")
+          view_cache->node_removed(note.path, &cache_error);
+      }
+      bool stale = false;
+      view_cache->stale(writer->read_db(), &stale, &cache_error);
+      const auto now = std::chrono::steady_clock::now();
+      if (stale && now - last_rebuild >= std::chrono::seconds(30)) {
+        if (!view_cache->rebuild(writer->read_db(), &cache_error))
+          std::fprintf(stderr, "viewcache rebuild failed: %s\n",
+                       cache_error.c_str());
+        last_rebuild = now;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    }
+  });
+
   onion::api::Server::Options api_options;
   api_options.port = api_port;
   api_options.host = self_host;
@@ -1443,6 +1508,39 @@ int node_cmd(int argc, char** argv) {
   api_options.tree_json = [&](std::string path, int depth, int offset) {
     return tree_json(writer->read_db(), std::move(path), depth, offset)
         .dump();
+  };
+  // D1 /api/v1/tree providers (all read through the per-thread read-only
+  // connections; counts/search prefer the viewcache when it is ready).
+  api_options.tree_children_json =
+      [&](std::string path, std::string cursor, int limit) {
+        return onion::api::tree_json::children(writer->read_db(),
+                                               view_cache.get(),
+                                               std::move(path),
+                                               std::move(cursor), limit)
+            .dump();
+      };
+  api_options.tree_node_json = [&](std::string path) {
+    return onion::api::tree_json::node(writer->read_db(), view_cache.get(),
+                                       std::move(path))
+        .dump();
+  };
+  api_options.tree_search_json =
+      [&](std::string query, std::string levels, std::string status,
+          std::string cursor) {
+        return onion::api::tree_json::search(writer->read_db(),
+                                             view_cache.get(),
+                                             std::move(query),
+                                             std::move(levels),
+                                             std::move(status),
+                                             std::move(cursor))
+            .dump();
+      };
+  api_options.tree_stats_json = [&]() {
+    return onion::api::tree_json::stats(writer->read_db()).dump();
+  };
+  api_options.tree_export_csv = [&](std::string path) {
+    return onion::api::tree_json::export_csv(writer->read_db(),
+                                             std::move(path));
   };
   api_options.campaign_pause = [&](std::string id, std::string) {
     return campaign_action(std::move(id), "paused");
@@ -1974,6 +2072,8 @@ if (!members_path.empty()) reload_members();
   }
   sync_stop.store(true);
   if (sync_thread.joinable()) sync_thread.join();
+  cache_stop.store(true);
+  if (cache_thread.joinable()) cache_thread.join();
   if (sync_server) sync_server->stop();
   server.stop();
   writer->stop();
@@ -2640,5 +2740,271 @@ int dashboard_cmd(int argc, char** argv) {
   }
   std::cout << "dashboard (one-time, valid 2 minutes):\n  "
             << body["url"].get<std::string>() << "\n";
+  return 0;
+}
+
+// `data_depot view --db <path>` (plan §1): serves screens 5–7 read-only
+// from any copy of onion.db — no engine, no sync, no auth, no mutations.
+namespace {
+std::atomic<bool> g_view_stop{false};
+void view_signal_handler(int) { g_view_stop.store(true); }
+}  // namespace
+
+int view_cmd(int argc, char** argv) {
+  const std::string db_path = flag(argc, argv, "--db", "");
+  if (db_path.empty()) {
+    std::cerr << "usage: data_depot view --db <onion.db path> [--port 8081]\n";
+    return 2;
+  }
+  const int port = parse_port(flag(argc, argv, "--port", "8081"), 8081);
+  std::string error;
+
+  // Per-thread read-only connections (the same rule as the node's
+  // /api/state reads): no handle is ever shared across handler threads.
+  struct ReadPool {
+    std::filesystem::path path;
+    const onion::store::Db* get(std::string* error) {
+      static thread_local std::unordered_map<std::string,
+                                             std::unique_ptr<onion::store::Db>>
+          connections;
+      auto& slot = connections[path.string()];
+      if (!slot) {
+        slot = std::make_unique<onion::store::Db>(path);
+        if (!slot->open_readonly(error)) {
+          slot.reset();
+          return nullptr;
+        }
+      }
+      return slot.get();
+    }
+  };
+
+  ReadPool pool{db_path};
+  if (!pool.get(&error)) {
+    std::cerr << "cannot open " << db_path << " read-only: " << error
+              << "\n";
+    return 1;
+  }
+
+  onion::viewcache::Cache::Options cache_options;
+  cache_options.sidecar_path =
+      std::filesystem::path(db_path).parent_path() / "viewcache.db";
+  cache_options.source_path = db_path;
+  auto cache = std::make_shared<onion::viewcache::Cache>(cache_options);
+  if (!cache->start(&error)) {
+    std::cerr << "viewcache: " << error << "\n";
+    return 1;
+  }
+
+  onion::api::Server::Options api_options;
+  api_options.port = port;
+  api_options.dashboard_auth = false;  // read-only: open reads, no actions
+  api_options.static_files = onion::cli::web_assets();
+  api_options.tree_children_json =
+      [&](std::string path, std::string cursor, int limit) {
+        return onion::api::tree_json::children(*pool.get(&error),
+                                               cache.get(), std::move(path),
+                                               std::move(cursor), limit)
+            .dump();
+      };
+  api_options.tree_node_json = [&](std::string path) {
+    return onion::api::tree_json::node(*pool.get(&error), cache.get(),
+                                       std::move(path))
+        .dump();
+  };
+  api_options.tree_search_json =
+      [&](std::string query, std::string levels, std::string status,
+          std::string cursor) {
+        return onion::api::tree_json::search(
+                   *pool.get(&error), cache.get(), std::move(query),
+                   std::move(levels), std::move(status), std::move(cursor))
+            .dump();
+      };
+  api_options.tree_stats_json = [&]() {
+    return onion::api::tree_json::stats(*pool.get(&error)).dump();
+  };
+  api_options.tree_export_csv = [&](std::string path) {
+    return onion::api::tree_json::export_csv(*pool.get(&error),
+                                             std::move(path));
+  };
+
+  onion::api::Server server(std::move(api_options));
+  if (!server.start(&error)) {
+    std::cerr << error << "\n";
+    return 1;
+  }
+
+  // Build the sidecar when absent or stale, then serve.
+  bool stale = true;
+  cache->stale(*pool.get(&error), &stale, &error);
+  if (stale) {
+    std::cout << "building view cache (one-time)…\n";
+    if (!cache->rebuild(*pool.get(&error), &error))
+      std::cerr << "viewcache rebuild failed: " << error
+                << "; serving without counts/search\n";
+  }
+
+  std::cout << "view: http://127.0.0.1:" << server.bound_port()
+            << "  (read-only tree viewer; Ctrl-C stops)\n";
+
+  std::signal(SIGINT, view_signal_handler);
+  std::signal(SIGTERM, view_signal_handler);
+  g_view_stop.store(false);
+  while (!g_view_stop.load()) std::this_thread::sleep_for(
+      std::chrono::milliseconds(200));
+  server.stop();
+  return 0;
+}
+
+// `data_depot bench api --db <copy>` (plan §8): measures each tree
+// endpoint on a read-only server over the given corpus copy and prints
+// p50/p95/p99. CI's nightly job fails on budget violations.
+int bench_cmd(int argc, char** argv) {
+  const std::string db_path = flag(argc, argv, "--db", "");
+  if (db_path.empty()) {
+    std::cerr << "usage: data_depot bench api --db <onion.db path> "
+                 "[--requests N]\n";
+    return 2;
+  }
+  const int requests =
+      std::max(1, std::atoi(flag(argc, argv, "--requests", "50").c_str()));
+  std::string error;
+
+  struct ReadPool {
+    std::filesystem::path path;
+    const onion::store::Db* get(std::string* error) {
+      static thread_local std::unordered_map<std::string,
+                                             std::unique_ptr<onion::store::Db>>
+          connections;
+      auto& slot = connections[path.string()];
+      if (!slot) {
+        slot = std::make_unique<onion::store::Db>(path);
+        if (!slot->open_readonly(error)) {
+          slot.reset();
+          return nullptr;
+        }
+      }
+      return slot.get();
+    }
+  };
+  ReadPool pool{db_path};
+  if (!pool.get(&error)) {
+    std::cerr << "cannot open " << db_path << ": " << error << "\n";
+    return 1;
+  }
+
+  // Deepest node: a representative worst-case path for node/children.
+  std::string deep_path;
+  {
+    auto statement = pool.get(&error)->prepare(
+        "SELECT path FROM nodes ORDER BY length(path) DESC LIMIT 1;",
+        &error);
+    if (statement) {
+      std::string step_error;
+      if (statement->step_row(&step_error)) deep_path = statement->text(0);
+    }
+  }
+  if (deep_path.empty()) {
+    std::cerr << "no nodes in " << db_path << "\n";
+    return 1;
+  }
+
+  // The production configuration: the sidecar cache supplies the counts and
+  // the FTS index, exactly as `view --db` and the node serve them.
+  onion::viewcache::Cache::Options cache_options;
+  cache_options.sidecar_path =
+      std::filesystem::path(db_path).parent_path() / "viewcache.db";
+  cache_options.source_path = db_path;
+  auto cache = std::make_shared<onion::viewcache::Cache>(cache_options);
+  if (!cache->start(&error)) {
+    std::cerr << "viewcache: " << error << "\n";
+    return 1;
+  }
+  {
+    const auto build_start = std::chrono::steady_clock::now();
+    bool stale = true;
+    cache->stale(*pool.get(&error), &stale, &error);
+    if (stale && !cache->rebuild(*pool.get(&error), &error)) {
+      std::cerr << "viewcache rebuild failed: " << error << "\n";
+      return 1;
+    }
+    std::printf("viewcache build: %.1f s\n",
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - build_start)
+                    .count());
+  }
+
+  onion::api::Server::Options api_options;
+  api_options.port = 0;
+  api_options.tree_children_json = [&](std::string path,
+                                       std::string cursor, int limit) {
+    return onion::api::tree_json::children(*pool.get(&error), cache.get(),
+                                           std::move(path),
+                                           std::move(cursor), limit)
+        .dump();
+  };
+  api_options.tree_node_json = [&](std::string path) {
+    return onion::api::tree_json::node(*pool.get(&error), cache.get(),
+                                       std::move(path))
+        .dump();
+  };
+  api_options.tree_search_json =
+      [&](std::string query, std::string levels, std::string status,
+          std::string cursor) {
+        return onion::api::tree_json::search(*pool.get(&error), cache.get(),
+                                             std::move(query),
+                                             std::move(levels),
+                                             std::move(status),
+                                             std::move(cursor))
+            .dump();
+      };
+  api_options.tree_stats_json = [&]() {
+    return onion::api::tree_json::stats(*pool.get(&error)).dump();
+  };
+  onion::api::Server server(std::move(api_options));
+  if (!server.start(&error)) {
+    std::cerr << error << "\n";
+    return 1;
+  }
+  const int port = server.bound_port();
+
+  const auto percentile = [](std::vector<double> sorted, double p) {
+    const std::size_t index =
+        std::min(sorted.size() - 1,
+                 static_cast<std::size_t>(sorted.size() * p));
+    return sorted[index];
+  };
+  const auto measure = [&](std::string_view name, std::string_view path) {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(30, 0);
+    std::vector<double> millis;
+    millis.reserve(requests);
+    for (int i = 0; i < requests; ++i) {
+      const auto start = std::chrono::steady_clock::now();
+      const auto response = client.Get(std::string(path));
+      if (!response || response->status != 200) {
+        std::cout << name << ": FAILED (status "
+                  << (response ? response->status : -1) << ")\n";
+        return;
+      }
+      millis.push_back(std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    }
+    std::sort(millis.begin(), millis.end());
+    std::printf("%-24s p50 %6.1f ms  p95 %6.1f ms  p99 %6.1f ms\n",
+                std::string(name).c_str(), percentile(millis, 0.50),
+                percentile(millis, 0.95), percentile(millis, 0.99));
+  };
+
+  std::cout << "bench api: " << requests << " requests per endpoint, corpus "
+            << db_path << "\n";
+  measure("tree/children(root)", "/api/v1/tree/children?path=&limit=50");
+  measure("tree/children(deep)", "/api/v1/tree/children?path=" + deep_path);
+  measure("tree/node", "/api/v1/tree/node?path=" + deep_path);
+  measure("tree/search", "/api/v1/tree/search?q=plan");
+  measure("tree/stats", "/api/v1/tree/stats");
+  server.stop();
   return 0;
 }

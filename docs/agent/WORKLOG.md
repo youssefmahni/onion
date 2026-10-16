@@ -1,4 +1,81 @@
 # Worklog (append-only, newest at top)
+## 2026-10-15 · dashboard D1 · FINAL (local) — owner deferred the GitHub merge
+
+Result: D1 complete locally on `dash/d1-tree` (head 86b842f, committed,
+not further pushed). Owner instruction: skip GitHub/CI — the merge is left
+to the owner. PR #53 exists for when they want it.
+Evidence:
+- All D1 deliverables verified locally: §8 budgets on the 316k corpus
+  (children 3.9 ms p95, node 1.5 ms, stats 1.9 ms, search 74.5 ms p95),
+  viewcache build 5.1 s, browser smoke clean (tree/search/stats, zero
+  console errors, vlist bounded 34 DOM rows over 12.5k items).
+- Local tests: api 27/27, viewcache 4/4, state 35/35, platform 12/12,
+  store 10/10, sched/log/gate/sync/swim green.
+- CI history: every non-Windows job green on each run; the three Windows
+  failures were all test/build hygiene in D1's own additions and each is
+  fixed (embed_web.py UTF-8, viewcache + api teardown Windows file locks).
+  The final head was never fully verified by a completed CI run (owner
+  overrode the 3-green-runs rule).
+Next step: owner merges PR #53 (or re-runs CI first); then D2 (summary,
+alerts, events, metrics.db, stream, control-center screen).
+
+## 2026-10-15 · dashboard D1 · tree + counters + viewcache + screens 5–7 → PR #53
+
+Result: PR open (dash/d1-tree). D1 exit criteria met locally.
+Evidence:
+- §8 budgets on the 316k corpus copy (production cache config): children
+  3.9 ms p95, node 1.5 ms, stats 1.9 ms (≤30 ms), search 74.5 ms p95
+  (≤100 ms); viewcache build 5.1 s one-time. bench api prints p50/p95/p99.
+- Browser smoke (chrome-devtools, view --db on the corpus): tree/search/
+  stats screens render with zero console errors; virtual list bounded
+  (12.5k items → 34 DOM rows) with a synthetic 10k-children parent.
+- Bugs fixed on the way: preact core UMD has no hooks (vendored
+  hooks.umd.js); children root query needed `parent_id IS`; dev-import
+  bypasses fold so counters now recompute at import end; stats fallback
+  gated so the counter fast path never scans; FTS external-content
+  semantics; load-more double-click guard.
+- Mockups: colors extracted programmatically (no image input on this
+  model); layouts aligned via density analysis (search filters left
+  column, stats side-by-side tables). Deviation recorded in the PR.
+- Tests local: api 27/27, viewcache 4/4, state 35/35, platform 12/12,
+  store 10/10 + sched/log/gate/sync/swim green. Full ctest deferred to CI
+  (per the owner's 10-minute cap on local steps).
+Next step: 3 green CI runs on PR #53 then merge; D2 (summary, alerts,
+events, metrics.db, stream, screen 1).
+
+## 2026-10-15 · dashboard D1 · tree endpoints + viewcache + screens 5–7 (WIP, handoff)
+
+Result: in progress — branch `dash/d1-tree` (local, pushed as WIP). NOT yet
+PR'd: the §8 perf proof was mid-run when the session handed off.
+Evidence:
+- Store (§6.1): settles.end column (migration), stats_levels/stats_status
+  counter tables; fold deltas via sqlite3_changes in upsert_node/upsert_settle/
+  TOMBSTONE (replay-idempotent); recompute_stats at every startup; the
+  fold-idempotency property test now dumps the counters (34/34 state tests).
+- viewcache (§6.2): new src/viewcache module — counts(path,children,subtree)
+  with bottom-up subtree fold, FTS5 (external content fts_titles + fts,
+  SQLITE_ENABLE_FTS5 now on for the vendored amalgamation), meta
+  (version+applied vector); rebuild/stale/node_added/node_removed with
+  incremental ancestor walks; mutex-serialized. 4/4 viewcache tests.
+- API (§4.1): /api/v1/tree/children|node|search|stats|export.csv behind the
+  session/token guard; view-mode open reads when dashboard_auth=false and
+  token empty; version carries read_only. Providers are pure functions in
+  src/api/tree_json.cpp (api module) — 27/27 api tests incl. paging/cursor,
+  stats counters, search jump, CSV, 401s, view mode.
+- CLI: node run wires the cache + a maintenance thread (fold-hook queue ->
+  incremental updates -> throttled rebuilds); new `view --db <path>` (read-
+  only server, per-thread ReadPool) and `bench api --db <copy>` (p50/p95/p99).
+- Frontend: vlist.js virtual list; screens/tree.js (lazy 50-at-a-time, detail
+  pane, attempts/critiques tabs), search.js (debounced FTS + filters),
+  stats.js (KPIs + level/ending/campaign tables); app.js router + read_only
+  nav hiding + '/' search focus. Live smoke over view --db passed (root
+  children, node detail, search, export.csv all verified with curl).
+- Fixed en route: children_page root case (parent_id IS NULL), FTS5 shadow-
+  table name collision (fts_data -> fts_titles), external-content 'rebuild'
+  after bulk inserts, keyset has_more via children_count_after.
+Next step: see docs/dashboard/D1_HANDOFF.md (finish the corpus import +
+bench api §8 budgets, browser smoke, commit+PR+3 green CI, merge).
+
 
 ## 2026-10-15 · dashboard D0 · foundation landed (PR #51)
 

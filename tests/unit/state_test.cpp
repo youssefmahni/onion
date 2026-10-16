@@ -746,6 +746,8 @@ std::string normalized_dump(const StateWriter& writer, const onion::store::Db& d
        "ORDER BY path;", "reviews");
   dump("SELECT device_id, version, prev, reason, changed, spec, rules_version, "
        "schema, hlc FROM profiles ORDER BY device_id, version;", "profiles");
+  dump("SELECT layer, nodes FROM stats_levels ORDER BY layer;", "stats_levels");
+  dump("SELECT status, n FROM stats_status ORDER BY status;", "stats_status");
   const auto nodes = db.all_nodes(error);
   out << "merkle: " << onion::store::merkle_root(nodes) << "\n";
   out << "spend: " << db.spend_usd(error) << "\n";
@@ -1438,6 +1440,43 @@ TEST_F(StateWriterTest, AuditItemIsNonBlockingAndClosesOnVerdict) {
   EXPECT_EQ(writer_->audits_sampled("mp1"), 1);  // sampled forever
 }
 
+
+TEST(StateWriterDevImport, PopulatesTheFoldCounters) {
+  // The import path inserts rows directly (no fold), so §6.1's derived
+  // counters must be recomputed at the end of the import command.
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+      ("onion_import_stats_" + std::to_string(::getpid()) + "_" +
+       std::to_string(reinterpret_cast<std::uintptr_t>(&dir)));
+  fs::remove_all(dir);
+
+  onion::state::StateWriter::Options options;
+  options.data_dir = dir;
+  options.origin = "dev0000000000000001";
+  auto writer = std::make_unique<onion::state::StateWriter>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(writer->start(&error)) << error;
+
+  onion::state::DevImport import;
+  import.nodes = {
+      {"P01", "P01", 0, "Planning"},
+      {"IN01", "P01-IN01", 1, "Inventory"},
+      {"T01", "P01-IN01-T01", 2, "Task"},
+  };
+  writer->submit(import);
+  writer->sync();
+
+  const auto counts = writer->db().level_counts(&error);
+  ASSERT_EQ(counts.size(), 3u);
+  EXPECT_EQ(counts[0].first, 0);
+  EXPECT_EQ(counts[0].second, 1);
+  EXPECT_EQ(counts[1].second, 1);
+  EXPECT_EQ(counts[2].second, 1);
+  writer->stop();
+  std::error_code ignored;
+  fs::remove_all(dir, ignored);
+}
+
 TEST_F(StateWriterTest, ProfileRecordFoldsIntoDomainProfiles) {
   // Decision 0027: PROFILE records fold into the content-addressed
   // domain_profiles table; campaigns match on the hash.
@@ -1608,4 +1647,5 @@ TEST_F(StateWriterTest, WriteCheckpointCommandSnapshotsTheFoldedState) {
   writer_->submit(onion::state::WriteCheckpoint{});
   writer_->sync();
   EXPECT_GT(count_checkpoints(), before);
+
 }

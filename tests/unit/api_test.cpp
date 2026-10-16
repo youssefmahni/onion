@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <httplib.h>
@@ -45,7 +46,12 @@ class ApiTest : public ::testing::Test {
   void TearDown() override {
     if (server_) server_->stop();
     if (writer_) writer_->stop();
-    std::filesystem::remove_all(dir_);
+    // The per-thread read-only pool keeps its handles until thread exit,
+    // so the remove can fail on Windows while they drain; the runner's
+    // temp cleanup reclaims the directory (same policy as the state
+    // tests).
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
   }
 
   std::string origin() const {
@@ -382,4 +388,213 @@ TEST_F(ApiDashTest, CspHeaderPresentOnDashboardAndApi) {
   const auto api = client.Get("/api/v1/version");
   ASSERT_TRUE(api);
   EXPECT_EQ(api->get_header_value("Content-Security-Policy"), csp);
+}
+
+// ---------------------------------------------------------------- D1 (§4.1)
+// The tree fixture: a real folded tree + viewcache behind the providers.
+
+#include "api/tree_json.hpp"
+#include "viewcache/viewcache.hpp"
+
+namespace {
+
+void fold_node(onion::state::StateWriter& writer, std::string path,
+               int layer, std::string title, std::uint64_t hlc) {
+  onion::log::Record record;
+  record.type = "ADD_NODE";
+  record.payload = {{"path", path}, {"layer", layer}, {"title", title}};
+  record.hlc = hlc;
+  writer.submit(onion::state::CommitTerminal{{record}});
+  writer.sync();
+}
+
+class ApiTreeTest : public ApiDashTest {
+ protected:
+  void SetUp() override {
+    ApiDashTest::SetUp();
+    fold_node(*writer_, "P01", 0, "Planning", 1);
+    fold_node(*writer_, "P01-IN01", 1, "Inventory", 2);
+    fold_node(*writer_, "P01-IN01-T01", 2, "Task one", 3);
+    fold_node(*writer_, "P01-IN02", 1, "Other branch", 4);
+
+    server_->stop();
+    Server::Options options;
+    options.port = 0;
+    options.token = "test-token";
+    options.writer = writer_.get();
+    options.dashboard_auth = true;
+    options.state_json = []() { return std::string("{}"); };
+    cache_ = std::make_unique<onion::viewcache::Cache>(
+        onion::viewcache::Cache::Options{
+            dir_ / "viewcache.db", dir_ / "onion.db"});
+    std::string error;
+    ASSERT_TRUE(cache_->start(&error)) << error;
+    ASSERT_TRUE(cache_->rebuild(writer_->read_db(), &error)) << error;
+    options.tree_children_json =
+        [this](std::string path, std::string cursor, int limit) {
+          return onion::api::tree_json::children(writer_->read_db(),
+                                                 cache_.get(),
+                                                 std::move(path),
+                                                 std::move(cursor), limit)
+              .dump();
+        };
+    options.tree_node_json = [this](std::string path) {
+      return onion::api::tree_json::node(writer_->read_db(), cache_.get(),
+                                         std::move(path))
+          .dump();
+    };
+    options.tree_search_json =
+        [this](std::string query, std::string levels, std::string status,
+               std::string cursor) {
+          return onion::api::tree_json::search(writer_->read_db(),
+                                               cache_.get(),
+                                               std::move(query),
+                                               std::move(levels),
+                                               std::move(status),
+                                               std::move(cursor))
+              .dump();
+        };
+    options.tree_stats_json = [this]() {
+      return onion::api::tree_json::stats(writer_->read_db()).dump();
+    };
+    options.tree_export_csv = [this](std::string path) {
+      return onion::api::tree_json::export_csv(writer_->read_db(),
+                                               std::move(path));
+    };
+    server_ = std::make_unique<Server>(std::move(options));
+    ASSERT_TRUE(server_->start(&error)) << error;
+    port_ = server_->bound_port();
+  }
+  void TearDown() override {
+    if (cache_) cache_->stop();
+    ApiDashTest::TearDown();
+  }
+  std::unique_ptr<onion::viewcache::Cache> cache_;
+};
+
+}  // namespace
+
+TEST_F(ApiTreeTest, TreeChildrenPagesWithCursor) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+
+  const auto first = client.Get("/api/v1/tree/children?path=P01&limit=1");
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first->status, 200);
+  auto first_body = nlohmann::json::parse(first->body);
+  ASSERT_TRUE(first_body.contains("items"));
+  EXPECT_EQ(first_body["items"].size(), 1u);
+  EXPECT_EQ(first_body["has_more"], true);
+  const std::string cursor = first_body["next_cursor"].get<std::string>();
+
+  const auto second =
+      client.Get("/api/v1/tree/children?path=P01&limit=1&cursor=" + cursor);
+  ASSERT_TRUE(second);
+  auto second_body = nlohmann::json::parse(second->body);
+  EXPECT_EQ(second_body["items"].size(), 1u);
+  EXPECT_EQ(second_body["has_more"], false);
+  EXPECT_TRUE(second_body["next_cursor"].is_null());
+}
+
+TEST_F(ApiTest, TreeChildrenWithoutCredentialsIs401) {
+  httplib::Client client("127.0.0.1", port_);
+  const auto response = client.Get("/api/v1/tree/children?path=P01");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 401);
+}
+
+TEST_F(ApiTreeTest, TreeNodeIncludesSettleAndCounts) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+  const auto response = client.Get("/api/v1/tree/node?path=P01-IN01");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  const auto body = nlohmann::json::parse(response->body);
+  EXPECT_EQ(body["title"], "Inventory");
+  EXPECT_EQ(body["children"], 1);
+  EXPECT_EQ(body["subtree"], 1);
+  EXPECT_TRUE(body["settle"].is_null());
+  EXPECT_EQ(body["status"], "open");
+}
+
+TEST_F(ApiTreeTest, TreeNodeNotFoundReturnsErrorJson) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+  const auto response = client.Get("/api/v1/tree/node?path=NOPE");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  EXPECT_EQ(nlohmann::json::parse(response->body)["error"], "not found");
+}
+
+TEST_F(ApiTreeTest, TreeStatsReadsTheFoldCounters) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+  const auto response = client.Get("/api/v1/tree/stats");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  const auto body = nlohmann::json::parse(response->body);
+  EXPECT_EQ(body["nodes_total"], 4);
+  EXPECT_EQ(body["settled_total"], 0);
+  EXPECT_EQ(body["levels"].size(), 3u);
+}
+
+TEST_F(ApiTreeTest, TreeSearchPrefixAndPathJump) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+  const auto by_title = client.Get("/api/v1/tree/search?q=task");
+  ASSERT_TRUE(by_title);
+  auto title_body = nlohmann::json::parse(by_title->body);
+  ASSERT_EQ(title_body["items"].size(), 1u);
+  EXPECT_EQ(title_body["items"][0]["path"], "P01-IN01-T01");
+
+  const auto jump = client.Get("/api/v1/tree/search?q=P01-IN02");
+  ASSERT_TRUE(jump);
+  auto jump_body = nlohmann::json::parse(jump->body);
+  ASSERT_EQ(jump_body["items"].size(), 1u);
+  EXPECT_EQ(jump_body["items"][0]["path"], "P01-IN02");
+}
+
+TEST_F(ApiTreeTest, TreeExportCsvStreamsSubtree) {
+  const std::string cookie = sign_in();
+  httplib::Client client("127.0.0.1", port_);
+  client.set_default_headers({{"Cookie", cookie}});
+  const auto response = client.Get("/api/v1/tree/export.csv?path=P01");
+  ASSERT_TRUE(response);
+  EXPECT_EQ(response->status, 200);
+  EXPECT_NE(response->get_header_value("Content-Type").find("text/csv"),
+            std::string::npos);
+  // All four nodes of the subtree, header included.
+  EXPECT_EQ(std::count(response->body.begin(), response->body.end(), '\n'),
+            5);
+}
+
+TEST_F(ApiTest, ViewModeServesOpenReadsWithoutAuth) {
+  // A server with no dashboard auth and no token is the `view --db` mode:
+  // reads are open, mutations stay closed.
+  server_->stop();
+  Server::Options options;
+  options.port = 0;
+  options.token = "";
+  options.dashboard_auth = false;
+  options.tree_stats_json = []() {
+    return std::string("{\"nodes_total\":0}");
+  };
+  server_ = std::make_unique<Server>(std::move(options));
+  std::string error;
+  ASSERT_TRUE(server_->start(&error)) << error;
+  port_ = server_->bound_port();
+
+  httplib::Client client("127.0.0.1", port_);
+  const auto stats = client.Get("/api/v1/tree/stats");
+  ASSERT_TRUE(stats);
+  EXPECT_EQ(stats->status, 200);
+
+  const auto version = client.Get("/api/v1/version");
+  ASSERT_TRUE(version);
+  EXPECT_EQ(nlohmann::json::parse(version->body)["read_only"], true);
 }

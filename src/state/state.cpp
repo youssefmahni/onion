@@ -28,6 +28,42 @@ std::int64_t wall_ms() {
 
 // The deterministic fold: one record type, one store mutation. Upserts use
 // the highest (hlc, origin) so a replay after a crash is idempotent.
+
+// §6.1 dashboard counters: folded-state deltas. Both statements are
+// idempotent across replay (the callers only invoke them when their own
+// fold's sqlite3_changes proved the row actually changed).
+void bump_level(store::Db& db, int layer, std::int64_t delta,
+                std::string* error) {
+  auto statement = db.prepare(
+      "INSERT INTO stats_levels(layer, nodes) VALUES (?1, ?2) "
+      "ON CONFLICT(layer) DO UPDATE SET nodes = nodes + excluded.nodes;",
+      error);
+  if (!statement) return;
+  std::string bind_error;
+  if (!statement->bind(1, layer, &bind_error) ||
+      !statement->bind(2, delta, &bind_error)) {
+    if (error) *error = "stats_levels bind failed: " + bind_error;
+    return;
+  }
+  statement->step(&bind_error);
+}
+
+void bump_status(store::Db& db, std::string_view status, std::int64_t delta,
+                 std::string* error) {
+  auto statement = db.prepare(
+      "INSERT INTO stats_status(status, n) VALUES (?1, ?2) "
+      "ON CONFLICT(status) DO UPDATE SET n = n + excluded.n;",
+      error);
+  if (!statement) return;
+  std::string bind_error;
+  if (!statement->bind(1, std::string(status), &bind_error) ||
+      !statement->bind(2, delta, &bind_error)) {
+    if (error) *error = "stats_status bind failed: " + bind_error;
+    return;
+  }
+  statement->step(&bind_error);
+}
+
 // Decision 0027: a PROFILE record folds into the content-addressed
 // domain_profiles table. The payload IS the profile JSON; the hash is
 // recomputed over its canonical form so a tampered record can never
@@ -35,6 +71,7 @@ std::int64_t wall_ms() {
 // hash is what campaigns match against).
 void upsert_domain_profile(store::Db& db, const log::Record& record,
                            std::string_view, std::string* error) {
+
   const auto& payload = record.payload;
   std::string parse_error;
   const auto profile = onion::domain::parse_profile(payload, &parse_error);
@@ -51,7 +88,8 @@ void upsert_domain_profile(store::Db& db, const log::Record& record,
 }
 
 void upsert_node(store::Db& db, const log::Record& record,
-                 std::string_view writer_origin, std::string* error) {  const auto& payload = record.payload;
+                 std::string_view writer_origin, std::string* error) {
+  const auto& payload = record.payload;
   const std::string path = payload.at("path").get<std::string>();
   const std::int64_t layer = payload.at("layer").get<std::int64_t>();
   const std::string title = payload.at("title").get<std::string>();
@@ -61,12 +99,30 @@ void upsert_node(store::Db& db, const log::Record& record,
       dash == std::string::npos ? std::string{} : path.substr(0, dash);
   const std::string origin = payload.value("origin", std::string(writer_origin));
 
-  // Decision 0027: the record carries the node's source; legacy
+
+  // §6.1 counters: the delta is decided by the fold's own hlc-wins upsert
+  // (sqlite3_changes), so replay and shuffles stay idempotent.
+  std::int64_t old_layer = -1;
+  bool existed = false;
+  {
+    auto probe = db.prepare("SELECT layer FROM nodes WHERE path = ?1;",
+                            error);
+    if (probe) {
+      std::string probe_error;
+      probe->bind(1, path, &probe_error);
+      if (probe->step_row(&probe_error)) {
+        old_layer = probe->integer(0);
+        existed = true;
+      }
+    }
+  }
+// Decision 0027: the record carries the node's source; legacy
   // records (no field) default to "engine".
   const std::string source = payload.value("source", std::string{"engine"});
   // Decision 0027: the record carries the node's domain tree; legacy
   // records (no field) default to the planning tree (empty).
   const std::string tree = payload.value("tree", std::string{});
+
   auto statement = db.prepare(
       "INSERT INTO nodes(id, code, path, parent_id, layer, title, origin, "
       "hlc, source, tree) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) "
@@ -93,18 +149,48 @@ void upsert_node(store::Db& db, const log::Record& record,
   }
   if (statement->step(&bind_error) || !bind_error.empty()) {
     if (error) *error = "fold node failed: " + bind_error;
+    return;
+  }
+  if (db.changes() == 1) {
+    if (!existed) {
+      bump_level(db, static_cast<int>(layer), 1, error);
+    } else if (old_layer != layer) {
+      bump_level(db, static_cast<int>(old_layer), -1, error);
+      bump_level(db, static_cast<int>(layer), 1, error);
+    }
   }
 }
 
 void upsert_settle(store::Db& db, const log::Record& record,
                    std::string_view writer_origin, std::string* error) {
   const auto& payload = record.payload;
+  const std::string path = payload.at("path").get<std::string>();
+  const std::string end = payload.value("end", std::string{});
+
+  // §6.1: the ending-kind delta mirrors the fold's hlc-wins upsert so
+  // replay and shuffles stay idempotent.
+  std::string old_end;
+  bool existed = false;
+  {
+    auto probe =
+        db.prepare("SELECT end FROM settles WHERE path = ?1;", error);
+    if (probe) {
+      std::string probe_error;
+      probe->bind(1, path, &probe_error);
+      if (probe->step_row(&probe_error)) {
+        old_end = probe->text(0);
+        existed = true;
+      }
+    }
+  }
+
   auto statement = db.prepare(
       "INSERT INTO settles(path, kept, atomic, attempts, score, campaign, "
-      "hlc, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
+      "end, hlc, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
       "ON CONFLICT(path) DO UPDATE SET kept=excluded.kept, "
       "atomic=excluded.atomic, attempts=excluded.attempts, "
-      "score=excluded.score, campaign=excluded.campaign, hlc=excluded.hlc, "
+      "score=excluded.score, campaign=excluded.campaign, end=excluded.end, "
+      "hlc=excluded.hlc, "
       "origin=excluded.origin "
       "WHERE CAST(excluded.score AS REAL) > CAST(settles.score AS REAL) OR "
       "(CAST(excluded.score AS REAL) = CAST(settles.score AS REAL) AND "
@@ -113,19 +199,26 @@ void upsert_settle(store::Db& db, const log::Record& record,
       error);
   if (!statement) return;
   std::string bind_error;
-  if (!statement->bind(1, payload.at("path").get<std::string>(), &bind_error) ||
+  if (!statement->bind(1, path, &bind_error) ||
       !statement->bind(2, payload.value("kept", std::int64_t{0}), &bind_error) ||
       !statement->bind(3, payload.value("atomic", std::int64_t{0}), &bind_error) ||
       !statement->bind(4, payload.value("attempts", std::int64_t{0}), &bind_error) ||
       !statement->bind(5, payload.value("score", std::string{"0"}), &bind_error) ||
       !statement->bind(6, payload.value("campaign", std::string{}), &bind_error) ||
-      !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error) ||
-      !statement->bind(8, payload.value("origin", std::string(writer_origin)), &bind_error)) {
+      !statement->bind(7, end, &bind_error) ||
+      !statement->bind(8, static_cast<std::int64_t>(record.hlc), &bind_error) ||
+      !statement->bind(9, payload.value("origin", std::string(writer_origin)), &bind_error)) {
     if (error) *error = "fold settle bind failed: " + bind_error;
     return;
   }
   if (statement->step(&bind_error) || !bind_error.empty()) {
     if (error) *error = "fold settle failed: " + bind_error;
+    return;
+  }
+  if (db.changes() == 1 && end != old_end) {
+    if (existed && !old_end.empty())
+      bump_status(db, old_end, -1, error);
+    if (!end.empty()) bump_status(db, end, 1, error);
   }
 }
 
@@ -280,6 +373,11 @@ bool StateWriter::start(std::string* error) {
   if (!segments_->open(error)) return false;
   replay(error);
   if (error && !error->empty()) return false;
+  // §6.1: the counters are derived and rebuildable — recompute them to the
+  // exact folded state at every startup (migrations, torn tails, and any
+  // pre-counter history all collapse to the truth here), then the fold
+  // deltas keep them current for the run.
+  recompute_stats(error);
   last_checkpoint_ = std::chrono::steady_clock::now();
   started_ = true;
   thread_ = std::thread([this] { run(); });
@@ -649,12 +747,29 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
     }
 } else if (type == "TOMBSTONE") {
     const auto& payload = record.payload;
+    const std::string tombstone_path =
+        payload.at("path").get<std::string>();
+    bool live = false;
+    int layer = 0;
+    {
+      auto probe = db_.prepare(
+          "SELECT tombstone, layer FROM nodes WHERE path = ?1;", error);
+      if (probe) {
+        std::string probe_error;
+        probe->bind(1, tombstone_path, &probe_error);
+        if (probe->step_row(&probe_error)) {
+          live = probe->integer_int(0) == 0;
+          layer = probe->integer_int(1);
+        }
+      }
+    }
     auto statement = db_.prepare(
         "UPDATE nodes SET tombstone=1 WHERE path=?1;", error);
     if (statement) {
       std::string bind_error;
-      statement->bind(1, payload.at("path").get<std::string>(), &bind_error);
+      statement->bind(1, tombstone_path, &bind_error);
       statement->step(&bind_error);
+      if (db_.changes() == 1 && live) bump_level(db_, layer, -1, error);
     }
   } else if (type == "RESERVE") {
     const auto& payload = record.payload;
@@ -920,6 +1035,8 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
         spec["loop_budget"].is_number_integer())
       campaign_budgets_[id] = spec["loop_budget"].get<std::int64_t>();
   }
+
+  if (options_.on_folded_record) options_.on_folded_record(record);
 }
 
 bool StateWriter::append_batch(std::vector<log::Record> records,
@@ -948,6 +1065,7 @@ bool StateWriter::append_batch(std::vector<log::Record> records,
   if (options_.crash_hook)
     options_.crash_hook(hook_step_base + 1);  // fold done
   return true;
+
 }
 
 void StateWriter::update_applied(std::string_view origin,
@@ -1381,6 +1499,9 @@ void StateWriter::run() {
           statement->reset(&bind_error);
         }
         import_skipped_.store(skipped);
+        // §6.1: the import path inserts directly (it never calls fold),
+        // so the derived counters are recomputed once at the end.
+        recompute_stats(&error);
         break;
       }
       case Command::Kind::Sync:
@@ -1812,4 +1933,20 @@ std::map<std::string, std::int64_t> StateWriter::reserved_by_origin(
 std::uint64_t StateWriter::next_seq() const { return next_seq_.load(); }
 std::uint64_t StateWriter::next_batch() const { return next_batch_.load(); }
 
+
+void StateWriter::recompute_stats(std::string* error) {
+  db_.exec("DELETE FROM stats_levels; DELETE FROM stats_status;", error);
+  if (error && !error->empty()) return;
+  db_.exec(
+      "INSERT INTO stats_levels(layer, nodes) SELECT layer, COUNT(*) "
+      "FROM nodes WHERE tombstone = 0 GROUP BY layer;",
+      error);
+  if (error && !error->empty()) return;
+  db_.exec(
+      "INSERT INTO stats_status(status, n) SELECT end, COUNT(*) "
+      "FROM settles WHERE end IS NOT NULL AND end != '' GROUP BY end;",
+      error);
+}
+
 }  // namespace onion::state
+

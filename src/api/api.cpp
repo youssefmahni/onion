@@ -74,12 +74,16 @@ std::string session_cookie(const httplib::Request& request) {
 }  // namespace
 
 // §5.2/§5.3: a valid session cookie OR the device token grants access.
+// A server without dashboard auth and without a token (the read-only
+// `view --db` mode) serves open reads: it has no mutating endpoints.
 bool Server::authenticated(const httplib::Request& request) {
   std::string token;
   if (request.has_header("X-Onion-Token"))
     token = request.get_header_value("X-Onion-Token");
   else if (request.has_param("token"))
     token = request.get_param_value("token");
+  if (impl_->options.token.empty() && !impl_->options.dashboard_auth)
+    return true;  // view mode: read-only, nothing to protect
   if (!impl_->options.token.empty() && token == impl_->options.token)
     return true;
   if (!impl_->options.dashboard_auth) return false;
@@ -270,8 +274,162 @@ bool Server::start(std::string* error) {
     body["version"] = "0.1";
     body["phase"] = "d0";
     body["dashboard"] = true;
+    body["read_only"] = !impl_->options.dashboard_auth &&
+                         impl_->options.token.empty();
     response.set_content(body.dump(), "application/json");
   });
+
+  // D1 tree reads (plan §4.1): keyset cursors, bounded pages.
+  const auto tree_guard = [this, guard_api_v1](
+                              const httplib::Request& request,
+                              httplib::Response& response) -> bool {
+    return guard_api_v1(request, response);
+  };
+  impl_->server->Get(
+      "/api/v1/tree/children",
+      [this, tree_guard](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (!tree_guard(request, response)) return;
+        if (!impl_->options.tree_children_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no tree provider\"}",
+                               "application/json");
+          return;
+        }
+        const std::string path = request.get_param_value("path");
+        const std::string cursor = request.get_param_value("cursor");
+        int limit = 50;
+        if (request.has_param("limit")) {
+          try {
+            limit = std::clamp(std::stoi(request.get_param_value("limit")),
+                               1, 200);
+          } catch (const std::exception&) {
+            limit = 50;
+          }
+        }
+        try {
+          response.set_content(
+              impl_->options.tree_children_json(path, cursor, limit),
+              "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/tree/node",
+      [this, tree_guard](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (!tree_guard(request, response)) return;
+        if (!impl_->options.tree_node_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no tree provider\"}",
+                               "application/json");
+          return;
+        }
+        const std::string path = request.get_param_value("path");
+        try {
+          response.set_content(impl_->options.tree_node_json(path),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/tree/search",
+      [this, tree_guard](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (!tree_guard(request, response)) return;
+        if (!impl_->options.tree_search_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no tree provider\"}",
+                               "application/json");
+          return;
+        }
+        const std::string q = request.get_param_value("q");
+        const std::string levels = request.get_param_value("levels");
+        const std::string status = request.get_param_value("status");
+        const std::string cursor = request.get_param_value("cursor");
+        try {
+          response.set_content(
+              impl_->options.tree_search_json(q, levels, status, cursor),
+              "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/tree/stats",
+      [this, tree_guard](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (!tree_guard(request, response)) return;
+        if (!impl_->options.tree_stats_json) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no tree provider\"}",
+                               "application/json");
+          return;
+        }
+        try {
+          response.set_content(impl_->options.tree_stats_json(),
+                               "application/json");
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+        }
+      });
+  impl_->server->Get(
+      "/api/v1/tree/export.csv",
+      [this, tree_guard](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (!tree_guard(request, response)) return;
+        if (!impl_->options.tree_export_csv) {
+          response.status = 404;
+          response.set_content("{\"error\":\"no tree provider\"}",
+                               "application/json");
+          return;
+        }
+        const std::string path = request.get_param_value("path");
+        std::string csv;
+        try {
+          csv = impl_->options.tree_export_csv(path);
+        } catch (const std::exception& exception) {
+          response.status = 500;
+          response.set_content(
+              std::string("{\"error\":\"") + exception.what() + "\"}",
+              "application/json");
+          return;
+        }
+        // Streamed in chunks so a large subtree never sits in one buffer.
+        response.set_header("Content-Type", "text/csv; charset=utf-8");
+        response.set_header(
+            "Content-Disposition",
+            "attachment; filename=\"tree-export.csv\"");
+        std::size_t offset = 0;
+        (void)offset;
+        response.set_chunked_content_provider(
+            "text/csv",
+            [csv = std::move(csv)](std::size_t offset,
+                                   httplib::DataSink& sink) {
+              constexpr std::size_t kChunk = 64 * 1024;
+              const std::size_t remaining = csv.size() - offset;
+              if (remaining == 0) {
+                sink.done();
+                return true;
+              }
+              const std::size_t take = std::min(kChunk, remaining);
+              return sink.write(csv.data() + offset, take);
+            });
+      });
 
   // Sign-in: GET /auth?code=<one-time code> swaps the code for a session
   // cookie and redirects to /.
