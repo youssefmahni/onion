@@ -177,6 +177,15 @@ int genesis_import_cmd(int argc, char** argv) {
     }
   }
 
+  // Decision 0027: the exclusive data-dir lock lives for the whole
+  // command; a running node holds it and writer commands refuse.
+  std::string lock_error;
+  auto data_lock =
+      onion::platform::DataDirLock::acquire(data_dir, &lock_error);
+  if (!data_lock) {
+    std::cerr << lock_error << "\n";
+    return 1;
+  }
   std::string error;
   onion::platform::KeyStore key_store(data_dir + "/keys");
   const auto stored = key_store.get("device-key");

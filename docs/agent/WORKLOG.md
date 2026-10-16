@@ -399,3 +399,113 @@ Next step: owner's three manual steps above; then the first real campaign (one p
 
 **Next step:** same as before (ctest + PR); include the reload_members URL-merge fix in the PR.
 
+## 2026-10-15 — Audit sampling removed (decision 0028, renumbered) + deployed
+
+Owner directive: remove audit sampling from the engine. Committed on
+b3-gate-funnel (58987bc, worktree .build-tmp/wt-audit-removal — the
+dash work in the main working dir untouched): CampaignSpec.audit_rate
+gone (old files still parse, field ignored), sampling emission +
+audit_sampled() + the accept/reject audit shortcuts deleted, /api/state
+audits object removed. StateWriter keeps folding legacy AUDIT records
+(replay compatibility; existing items stay closable). Tests: sched 31,
+state 34, engine 21 green. Decision 0028 + INDEX written (the dashboard record had claimed 0026 first).
+
+Deployed to both Macs (patch applied on #1's sources — checkpoint hook
+preserved via offset-tolerant patch; rebuilt; launchd restarted; binary
+piped to #2 through the #1 jump host). Verified: /api/state has no
+audits field on either machine, campaign p04-first running.
+
+**Next step:** PR b3-gate-funnel → main (carries 0025, 0027, 0028, tree
+viewer, checkpoint endpoint, help/OPERATOR.md); fix reload_members()
+URL wipe; 0026 was renumbered to 0028 (the dashboard record claimed 0026 first).
+
+## 2026-10-15 — PR1(0027) lock, source, collisions, checkpoint done
+
+Worktree .build-tmp/wt-audit-removal on b3-gate-funnel (main working
+dir stays on dash/d0-foundation, untouched). PR1 pieces committed:
+- 434a0e5 data-dir lock (platform DataDirLock flock/LockFileEx at
+  node.lock; node run holds; campaign/review/dev-import/genesis-import/
+  node join acquire; refuses with clear message). platform 11 green.
+- c278cd7 nodes.source ('import' vs 'engine'); 0025 exemption keys on
+  source == "import"; suites at commit green (engine 21, sched 31,
+  state 34, store 10, api 7, platform 11).
+- abb6cb8 WriteCheckpoint command + /api/checkpoint endpoint + CLI
+  checkpoint hook; dev-import collision pre-check (duplicate content,
+  path/code) reporting import-collisions.tsv, fail unless --allow-skip,
+  checkpoint on success; 2 new state tests. state 36, api 7 green.
+
+The earlier state_test "hang" was a bug in my own new tests: they
+omitted writer_->start(), so the writer thread never ran and sync()
+waited forever (one thread in futex). Standalone repro + /proc thread
+inspection isolated it; both new tests pass after adding start().
+
+**Next step:** PR2(0027) domain profiles: signed profile record +
+hash in campaign (device without exact profile can't work campaign);
+style checks move into the profile; expandable_layers ->
+structure_layers; nodes.tree field (codes may repeat across trees);
+planning profile embedded default byte-identical (golden + engine
+tests unchanged). Then RE&CT converter + test import + 12-action pilot.
+
+## 2026-10-15 — PR2(0027) domain profiles: tree, profile module, records
+
+On b3-gate-funnel, worktree .build-tmp/wt-audit-removal:
+- de5be5e nodes.tree (empty = planning): column + fold + dev-import
+  --tree + export-csv --tree + /api/tree node field + CampaignSpec.tree
+  emitted on every ADD_NODE; code collisions scoped per tree. Tests:
+  state 36, sched 32, store 10, api 7.
+- 1f0c5de onion::domain module (header-only): StyleChecks/Profile,
+  embedded planning_profile() with today's rules byte-identical;
+  depot::style_flags delegates to it; gate::run_checks takes the
+  profile's style; FunnelOptions.profile defaults to planning.
+  core 67, gate 42 green.
+- 0527e69 PROFILE records fold into content-addressed domain_profiles
+  (hash = blake2b over canonical JSON); `profile add` CLI publishes a
+  signed record; campaigns carry profile_hash (empty = planning);
+  campaign start refuses unheld profiles; the engine pauses a campaign
+  whose profile is missing; structure gate keys on profile
+  structure_layers (planning = layers 0..2, the L1..L3 rule).
+  state 37, sched 32, gate 42 green.
+
+Byte-identical proof: onion_golden_test 5/5 and the engine structure
+test pass unchanged (the full engine suite is skipped under the
+owner's 1-minute test cap — the 300-node offline campaign alone
+exceeds it).
+
+**Next step:** RE&CT converter (RA codes as node codes, tree react) +
+test import on a copy + 12-action pilot campaign with every result to
+review; then PR b3-gate-funnel → main (carries 0025-0027 + tree
+viewer + checkpoint endpoint + help/OPERATOR.md).
+
+## 2026-10-15 — PR3 done, main merged in, PR #52 open (STOP: save point)
+
+Worktree .build-tmp/wt-audit-removal, branch b3-gate-funnel (worktree
+commits 984125b, 9d47386, merge a4c2320; pushed to origin).
+
+- reactconv module + `react-convert` CLI (RE&CT YAML -> dev-import
+  CSVs, RA codes as node codes, tree react) + react-profile.json (no
+  structure permission, no style checks -> every campaign result goes
+  to review). End-to-end verified on a copy: 216 actions -> 222 nodes
+  imported (tree react), profile published (hash
+  4d3d117bffaa9a33d93aa0dc718d186c2cb0183c7019f11916e10914f2bab07d),
+  p12-react-pilot campaign started with tree+hash in the record, and
+  an unheld profile refuses. Artifacts committed: docs/react/
+  pilot-react.campaign.json + react-profile.json.
+- Fixed reload_members() url wipe (merge, not replace — the members
+  table and swim gossip keep feeding the address book).
+- Merged origin/main (dash PR #51) into b3-gate-funnel (a4c2320):
+  resolved the checkpoint-hook rename (kept `checkpoint`), platform
+  test overlap, decision INDEX: the dashboard record had claimed 0026
+  first, so audit-removal is renumbered to 0028 (file renamed, INDEX
+  next free 0029, WORKLOG references updated).
+- Post-merge local suites green: platform 13, api 19, state 37,
+  sched 32, gate 42, reactconv 5, golden 5.
+- PR #52 opened: https://github.com/youssefmahni/onion/pull/52
+  CI at last poll: Legacy Linux/macOS, macOS x86_64 pass; most "New
+  tree" jobs still running; LLM client (Linux TSan) FAILED in the
+  first run (38767852929, job 116535641045) and was pending in the
+  second run (38767884279). Logs were unavailable while the run was
+  in progress.
+
+**Next step:** poll `gh pr checks 52`; if TSan fails again, pull the
+job log, reproduce locally (build with ONION_ENABLE_TSAN) and fix;
+when every job passes, `gh pr merge 52 --merge`.

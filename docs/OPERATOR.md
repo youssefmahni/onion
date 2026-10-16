@@ -76,7 +76,7 @@ data_depot campaign start campaign.json
 # campaign.json:
 # { "id": "p01-first", "scope": ["P01"], "loop_budget": 1000,
 #   "mode": "breadth-first", "chunk": 25, "model": "deepseek-flash",
-#   "structure": true, "audit_rate": "0.02" }
+#   "structure": true }
 ```
 
 Notes: a campaign record written by the CLI folds at the next **node

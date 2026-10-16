@@ -42,9 +42,11 @@ struct AppendForeign {
   log::Batch batch;
 };
 
-// Operator-forced checkpoint (the dashboard): snapshots the current fully
-// folded state, so a joiner's clone matches the LIVE chain (the 6 h / 100 k
-// record cadence alone can leave stale checkpoints after heavy activity).
+// Operator-forced checkpoint (decision 0027; the dashboard and the CLI
+// both use it): snapshots the current fully folded state on the writer
+// thread, so a joiner's clone (or a fresh import) matches the LIVE
+// chain — the 6 h / 100 k record cadence alone can leave stale
+// checkpoints after heavy activity.
 struct WriteCheckpoint {};
 
 // M8 pre-work: the push handler learns the pusher's sync address without
@@ -61,11 +63,30 @@ struct DevImportedNode {
   std::string path;
   int layer{};
   std::string title;
+  // Decision 0027: the domain tree the node belongs to (empty = the
+  // planning tree).
+  std::string tree;
 };
 
 struct DevImport {
   std::vector<DevImportedNode> nodes;
 };
+
+// Decision 0027: the import collision pre-check, shared by the CLI and
+// the tests. A collision is (a) a path that already exists with
+// DIFFERENT content, or (b) a code already used by another path. Rows
+// identical to an existing node are counted as duplicates and dropped.
+// With allow_skip=false every colliding row is reported and KEPT in
+// `nodes` (the caller refuses the import); with allow_skip=true the
+// colliding rows are reported and DROPPED from `nodes`.
+struct ImportCollisionReport {
+  std::vector<std::string> rows;  // "path	code	reason"
+  std::size_t duplicates{};
+  bool refused{};
+};
+ImportCollisionReport check_import_collisions(
+    const store::Db& db, std::vector<DevImportedNode>& nodes,
+    bool allow_skip, std::string* error);
 
 struct CampaignInfo {
   std::string id;

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gate/gate.hpp"
+#include "domain/domain.hpp"
 #include "llm/llm.hpp"
 #include "sched/sched.hpp"
 #include "state/state.hpp"
@@ -223,6 +224,51 @@ class EngineTest : public ::testing::Test {
   std::filesystem::path dir_;
   std::unique_ptr<StateWriter> writer_;
 };
+
+// Decision 0027: a device without a custom campaign profile must pause the
+// campaign safely. The pause record must retain the full spec so every
+// replica can fold it, and so a later profile arrival can resume it.
+TEST_F(EngineTest, MissingCustomProfilePausesWithoutDiscardingCampaignSpec) {
+  seed_root();
+  Budget budget("10");
+  CampaignSpec campaign = spec();
+  campaign.profile_hash = std::string(64, 'f');
+  Engine engine = make_engine(budget);
+
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_EQ(result.end_reason, "profile missing");
+
+  const auto stored = writer_->campaign(campaign.id);
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->state, "paused");
+  const auto stored_spec = json::parse(stored->spec);
+  EXPECT_EQ(stored_spec["profile_hash"], campaign.profile_hash);
+  EXPECT_EQ(stored_spec["scope"], campaign.scope);
+}
+
+// The embedded planning profile is present on every build. Its hash still
+// binds the campaign to the exact rules, but it must not require a PROFILE
+// record in the local database.
+TEST_F(EngineTest, EmbeddedPlanningProfileHashNeedsNoPublishedProfile) {
+  seed_root();
+  Budget budget("10");
+  CampaignSpec campaign = spec();
+  campaign.profile_hash =
+      onion::domain::profile_hash(onion::domain::planning_profile());
+  const SyncAsk unavailable = [](const Request&) {
+    Result result;
+    result.kind = Kind::Transport;
+    return result;
+  };
+  Engine engine(Engine::Options{*writer_, unavailable, budget, 1,
+                                "dev0000000000000001", "0.001"});
+
+  const Engine::RunResult result = engine.run(campaign, nullptr);
+  EXPECT_EQ(result.end_reason, "provider unavailable");
+  const auto stored = writer_->campaign(campaign.id);
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->state, "running");
+}
 
 // F-GATE-2 at the engine: while the provider is down nothing is settled and
 // no node becomes a leaf; when it recovers the very same node is worked.
@@ -694,36 +740,6 @@ TEST_F(EngineTest, IdleFleetEngineStealsFromTheBusiestLane) {
   EXPECT_GT(resumed.settled, 0);
 }
 
-TEST_F(EngineTest, AuditSamplesCommittedNodesWithoutBlocking) {
-  // Decision 0024: audit_rate 1.0 samples every committed node — an
-  // AUDIT record per settle, an open non-blocking review item, and the
-  // subtree keeps expanding (the children of audited nodes settle too).
-  seed_root();
-  Budget budget("10");
-  Engine engine(Engine::Options{*writer_, funnel_fake(6), budget, 1,
-                                "dev0000000000000001", "0.001"});
-  CampaignSpec campaign = spec();
-  campaign.structure = true;
-  campaign.audit_rate = 1.0;
-  const Engine::RunResult result = engine.run(campaign, nullptr);
-  EXPECT_GT(result.settled, 0);
-  // Every committed node got an audit: sampled == settled.
-  std::string error;
-  const auto open = writer_->db().open_reviews(&error);
-  EXPECT_EQ(static_cast<std::int64_t>(open.size()), result.settled);
-  for (const onion::store::Review& review : open)
-    EXPECT_EQ(review.reason, "audit");
-  EXPECT_EQ(writer_->audits_sampled("c1"), result.settled);
-  EXPECT_EQ(writer_->audits_open("c1"), result.settled);
-  // Non-blocking: nothing in the review-pause set.
-  EXPECT_EQ(writer_->db().open_reviews(&error).size(), open.size());
-
-  // The verdict closes an audit without re-settling or tombstoning.
-  engine.review_accept(open[0].path, campaign);
-  EXPECT_EQ(writer_->audits_open("c1"), result.settled - 1);
-  EXPECT_FALSE(writer_->leaf(open[0].path));
-}
-
 TEST_F(EngineTest, SingleChainUnderAFiftyPercentShareTerminates) {
   // M8 agent-exit criterion (decision 0020): a single chain halves its
   // pool per level, so it ends in an allowance-spent leaf — even though
@@ -869,7 +885,8 @@ TEST_F(EngineTest, ImportedDeepTicketsAreWorkedAndNeverLeafedByAllowance) {
     onion::log::Record record;
     record.type = "ADD_NODE";
     record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
-                      {"title", "Imported " + std::to_string(i)}};
+                      {"title", "Imported " + std::to_string(i)},
+                      {"source", "import"}};
     record.hlc = static_cast<onion::log::Hlc>(i + 1);  // tiny, like the import
     records.push_back(std::move(record));
   }
@@ -920,7 +937,8 @@ TEST_F(EngineTest, RaisingTheBudgetResumesImportedTickets) {
     onion::log::Record record;
     record.type = "ADD_NODE";
     record.payload = {{"path", chain[i]}, {"layer", static_cast<int>(i)},
-                      {"title", "Imported " + std::to_string(i)}};
+                      {"title", "Imported " + std::to_string(i)},
+                      {"source", "import"}};
     record.hlc = static_cast<onion::log::Hlc>(i);
     records.push_back(std::move(record));
   }

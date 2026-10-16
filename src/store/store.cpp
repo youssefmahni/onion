@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   title     TEXT NOT NULL,
   origin    TEXT NOT NULL,
   hlc       INTEGER NOT NULL,
-  tombstone INTEGER NOT NULL DEFAULT 0
+  tombstone INTEGER NOT NULL DEFAULT 0,
+  source    TEXT NOT NULL DEFAULT '',
+  tree      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
 CREATE TABLE IF NOT EXISTS settles   (path TEXT PRIMARY KEY, kept INT, atomic INT, attempts INT, score TEXT,
@@ -75,6 +77,8 @@ CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 -- nodes per layer; stats_status counts settle endings per `end` kind.
 CREATE TABLE IF NOT EXISTS stats_levels(layer INTEGER PRIMARY KEY, nodes INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS stats_status(status TEXT PRIMARY KEY, n INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS domain_profiles (hash TEXT PRIMARY KEY, name TEXT NOT NULL,
+                       tree TEXT NOT NULL, json TEXT NOT NULL);
 )sql";
 
 void set_error(std::string* error, sqlite3* handle, std::string_view prefix) {
@@ -318,6 +322,12 @@ bool Db::open(std::string* error) {
   sqlite3_exec(handle_,
                "ALTER TABLE settles ADD COLUMN end TEXT;",
                nullptr, nullptr, nullptr);
+  // Decision 0027: nodes carry their source ("import" | "engine") and
+  // their domain tree (empty = planning).
+  sqlite3_exec(handle_,
+               "ALTER TABLE nodes ADD COLUMN source TEXT; "
+               "ALTER TABLE nodes ADD COLUMN tree TEXT NOT NULL DEFAULT '';",
+               nullptr, nullptr, nullptr);
   {
     std::optional<Statement> maybe = prepare(
         "INSERT INTO schema_version(version) SELECT ? WHERE NOT EXISTS "
@@ -386,11 +396,14 @@ Node read_node(Statement& stmt) {
   node.origin = stmt.text(6);
   node.hlc = static_cast<std::uint64_t>(stmt.integer(7));
   node.tombstone = stmt.integer_int(8);
+  node.source = stmt.text(9);
+  node.tree = stmt.text(10);
   return node;
 }
 
 constexpr const char* kNodeColumns =
-    "id, code, path, parent_id, layer, title, origin, hlc, tombstone";
+    "id, code, path, parent_id, layer, title, origin, hlc, tombstone, "
+    "source, tree";
 
 }  // namespace
 
@@ -431,14 +444,18 @@ std::vector<Node> Db::nodes_in_subtree(std::string_view path, std::string* error
   return nodes;
 }
 
-std::vector<Node> Db::nodes_at_layer(int layer, std::string* error) const {
+std::vector<Node> Db::nodes_at_layer(int layer, std::string* error,
+                                     std::string_view tree) const {
+  const bool filter_tree = !tree.empty();
   std::optional<Statement> stmt = prepare(
-      std::string("SELECT ") + kNodeColumns +
-          " FROM nodes WHERE layer = ?1 AND tombstone = 0 ORDER BY path;",
+      std::string("SELECT ") + kNodeColumns + " FROM nodes WHERE layer = ?1 "
+          "AND tombstone = 0" + (filter_tree ? " AND tree = ?2" : "") +
+          " ORDER BY path;",
       error);
   if (!stmt) return {};
   std::string step_error;
-  if (!stmt->bind(1, static_cast<std::int64_t>(layer), &step_error)) {
+  if (!stmt->bind(1, static_cast<std::int64_t>(layer), &step_error) ||
+      (filter_tree && !stmt->bind(2, std::string(tree), &step_error))) {
     set_error(error, handle_, "layer bind failed");
     return {};
   }
@@ -753,6 +770,51 @@ std::vector<Campaign> Db::campaigns(std::string* error) const {
   return campaigns;
 }
 
+std::optional<DomainProfile> Db::domain_profile(std::string_view hash,
+                                                std::string* error) const {
+  std::optional<Statement> stmt = prepare(
+      "SELECT hash, name, tree, json FROM domain_profiles WHERE hash = ?1;",
+      error);
+  if (!stmt) return std::nullopt;
+  std::string bind_error;
+  if (!stmt->bind(1, std::string(hash), &bind_error)) {
+    set_error(error, handle_, "domain profile bind failed");
+    return std::nullopt;
+  }
+  std::string step_error;
+  if (!stmt->step_row(&step_error)) return std::nullopt;
+  DomainProfile profile;
+  profile.hash = stmt->text(0);
+  profile.name = stmt->text(1);
+  profile.tree = stmt->text(2);
+  profile.json = stmt->text(3);
+  return profile;
+}
+
+bool Db::store_domain_profile(std::string_view hash, std::string_view name,
+                              std::string_view tree, std::string_view json,
+                              std::string* error) {
+  // Content-addressed: the same hash always folds to the same profile.
+  std::optional<Statement> stmt = prepare(
+      "INSERT OR IGNORE INTO domain_profiles(hash, name, tree, json) "
+      "VALUES (?1, ?2, ?3, ?4);",
+      error);
+  if (!stmt) return false;
+  std::string bind_error;
+  if (!stmt->bind(1, std::string(hash), &bind_error) ||
+      !stmt->bind(2, std::string(name), &bind_error) ||
+      !stmt->bind(3, std::string(tree), &bind_error) ||
+      !stmt->bind(4, std::string(json), &bind_error)) {
+    set_error(error, handle_, "domain profile bind failed: " + bind_error);
+    return false;
+  }
+  if (stmt->step(&bind_error) || !bind_error.empty()) {
+    set_error(error, handle_, "domain profile insert failed: " + bind_error);
+    return false;
+  }
+  return true;
+}
+
 std::vector<Settle> Db::settles(std::string* error) const {
   std::optional<Statement> stmt = prepare(
       "SELECT path, kept, atomic, attempts, score, campaign, end, hlc, "
@@ -858,7 +920,7 @@ std::string Db::spend_rate_usd_per_hour(std::int64_t window_seconds,
 }
 
 bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
-                    std::string* error) const {
+                    std::string* error, std::string_view tree) const {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
@@ -866,7 +928,7 @@ bool Db::export_csv(const std::filesystem::path& dir, int max_layer,
     return false;
   }
   for (int layer = 0; layer <= max_layer && layer <= 9; ++layer) {
-    std::vector<Node> nodes = nodes_at_layer(layer, error);
+    std::vector<Node> nodes = nodes_at_layer(layer, error, tree);
     if (!error->empty()) return false;
     char name[32];
     std::snprintf(name, sizeof(name), "Onion - level_%02d.csv", layer);

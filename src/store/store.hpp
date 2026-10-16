@@ -28,6 +28,15 @@ struct Node {
   std::string origin;
   std::uint64_t hlc{};
   int tombstone{};
+  // Decision 0027: how the node entered the tree — "import" (corpus
+  // import, exempt from the allowance fold per decision 0025) or
+  // "engine" (created by a campaign settle). Empty = engine (legacy).
+  std::string source;
+  // Decision 0027: the domain tree this node belongs to. Empty = the
+  // planning tree (the embedded default profile). Campaigns, exports
+  // and the dashboard filter by tree, and node codes may repeat across
+  // different trees.
+  std::string tree;
 };
 
 struct Settle {
@@ -83,6 +92,16 @@ struct Campaign {
   std::uint64_t hlc{};
   std::string origin;
   std::string reason;  // e.g. "no progress" (the churn guard, decision 0025)
+};
+
+// Decision 0027: a folded domain profile (PROFILE records). Content-
+// addressed: the hash is the profile_hash over the canonical JSON, and
+// campaigns carry it.
+struct DomainProfile {
+  std::string hash;
+  std::string name;
+  std::string tree;
+  std::string json;
 };
 
 // RAII prepared statement: fails hard on misuse in debug, reports errors out.
@@ -152,7 +171,8 @@ class Db {
   // Typed helpers.
   std::optional<Node> node_by_path(std::string_view path, std::string* error) const;
   std::vector<Node> nodes_in_subtree(std::string_view path, std::string* error) const;
-  std::vector<Node> nodes_at_layer(int layer, std::string* error) const;
+  std::vector<Node> nodes_at_layer(int layer, std::string* error,
+                                   std::string_view tree = "") const;
   std::vector<Node> all_nodes(std::string* error) const;
   std::vector<Node> nodes_with_path_prefix(std::string_view prefix,
                                            std::string* error) const;
@@ -204,7 +224,14 @@ class Db {
                                       std::string* error) const;
   // Exports layers 0..max_layer (≤ 9) as "Onion - level_NN.csv" in dir.
   bool export_csv(const std::filesystem::path& dir, int max_layer,
-                  std::string* error) const;
+                  std::string* error, std::string_view tree = "") const;
+
+  // Decision 0027: folded domain profiles, content-addressed by hash.
+  std::optional<DomainProfile> domain_profile(std::string_view hash,
+                                              std::string* error) const;
+  bool store_domain_profile(std::string_view hash, std::string_view name,
+                            std::string_view tree, std::string_view json,
+                            std::string* error);
 
   std::filesystem::path path() const { return path_; }
 

@@ -81,6 +81,8 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
   spec.model = value.value("model", std::string{"deepseek-flash"});
   spec.critic_model = value.value("critic_model", std::string{});
   spec.auto_accept = value.value("auto_accept", false);
+  spec.tree = value.value("tree", std::string{});
+  spec.profile_hash = value.value("profile_hash", std::string{});
   // Decision 0024. critic: "on" | "off" (a boolean is accepted too).
   if (value.contains("critic")) {
     if (value["critic"].is_boolean())
@@ -100,13 +102,10 @@ std::optional<CampaignSpec> parse_campaign(const nlohmann::json& value,
     spec.children_min = static_cast<int>(v);
   }
   try {
-    spec.audit_rate = parse_score("audit_rate", 0.02);
     spec.stop_atomic_share = parse_score("stop_atomic_share", 0.90);
   } catch (const std::exception& e) {
     return fail(e.what());
   }
-  if (spec.audit_rate < 0.0 || spec.audit_rate > 1.0)
-    return fail("audit_rate out of range 0..1");
   if (spec.stop_atomic_share <= 0.0 || spec.stop_atomic_share > 1.0)
     return fail("stop_atomic_share out of range (0, 1]");
   // M8 branch share (decision 0020): a number or an exact decimal string
@@ -213,7 +212,6 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
       {"auto_accept", spec.auto_accept},
       {"critic", spec.critic ? "on" : "off"},
       {"children_min", spec.children_min},
-      {"audit_rate", std::to_string(spec.audit_rate)},
       {"stop_atomic_share", std::to_string(spec.stop_atomic_share)}};
   if (spec.worker_candidates)
     out["worker_candidates"] = *spec.worker_candidates;
@@ -228,6 +226,8 @@ nlohmann::json campaign_spec_json(const CampaignSpec& spec) {
   // M8 branch share (decision 0020): the ratio and the starting pools
   // travel in the record so every replica folds the same numbers.
   out["branch_share"] = std::to_string(spec.branch_share);
+  if (!spec.tree.empty()) out["tree"] = spec.tree;
+  if (!spec.profile_hash.empty()) out["profile_hash"] = spec.profile_hash;
   if (spec.depth_checkpoint_every > 0) {
     out["depth_checkpoint_from"] = spec.depth_checkpoint_from;
     out["depth_checkpoint_every"] = spec.depth_checkpoint_every;
@@ -521,6 +521,44 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
   }
 
   gate::FunnelOptions funnel_options;
+  // Decision 0027: resolve the campaign's domain profile. Empty hash =
+  // the embedded planning profile (byte-identical to the historical
+  // hard-coded rules). A device that does not hold the exact profile
+  // does not run the campaign: pause it with a clear reason.
+  onion::domain::Profile profile = onion::domain::planning_profile();
+  const std::string planning_profile_hash =
+      onion::domain::profile_hash(profile);
+  if (!spec.profile_hash.empty() && spec.profile_hash != planning_profile_hash) {
+    std::string profile_error;
+    const auto held =
+        writer.db().domain_profile(spec.profile_hash, &profile_error);
+    if (!held) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
+                       {"state", "paused"},
+                       {"reason", "profile " + spec.profile_hash +
+                                      " not held"}})}});
+      writer.sync();
+      result.end_reason = "profile missing";
+      return result;
+    }
+    const auto parsed = onion::domain::parse_profile(
+        nlohmann::json::parse(held->json, nullptr, false), &profile_error);
+    if (!parsed) {
+      writer.submit(state::CommitTerminal{{make_record(
+          "CAMPAIGN", {{"id", spec.id},
+                       {"spec", campaign_spec_json(spec)},
+                       {"state", "paused"},
+                       {"reason", "profile parse failed: " +
+                                      profile_error}})}});
+      writer.sync();
+      result.end_reason = "profile invalid";
+      return result;
+    }
+    profile = *parsed;
+  }
+  funnel_options.profile = profile;
   funnel_options.params.max_attempts = spec.max_attempts;
   funnel_options.params.children_min = spec.children_min;
   funnel_options.critic = spec.critic;
@@ -617,29 +655,24 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
     allowances.clear();
     attempt_paths.clear();
     imported_paths.clear();
-    // Decision 0025: imported (pre-campaign) tickets start a fresh chain
-    // and are NEVER leafed as "allowance spent".
-    const auto campaign_info = writer.campaign(spec.id);
-    const std::uint64_t campaign_start_hlc =
-        campaign_info ? campaign_info->hlc : 0;
+    // Decision 0025/0027: imported tickets (nodes with source "import")
+    // start a fresh chain and are NEVER leafed as "allowance spent".
     if (!spec.pools.empty()) {
       std::vector<PoolEvent> events;
       std::string nodes_error;
       if (spec.scope.empty()) {
         for (const store::Node& node : writer.db().all_nodes(&nodes_error)) {
           events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
-                                     node.hlc, node.origin});
-          if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
-            imported_paths.insert(node.path);
+                                     node.hlc, node.origin, node.source});
+          if (node.source == "import") imported_paths.insert(node.path);
         }
       } else {
         for (const std::string& prefix : spec.scope)
           for (const store::Node& node : writer.db().nodes_with_path_prefix(
                    prefix, &nodes_error)) {
             events.push_back(PoolEvent{PoolEvent::Kind::Create, node.path,
-                                       node.hlc, node.origin});
-            if (campaign_start_hlc > 0 && node.hlc < campaign_start_hlc)
-              imported_paths.insert(node.path);
+                                       node.hlc, node.origin, node.source});
+            if (node.source == "import") imported_paths.insert(node.path);
           }
       }
       std::string attempt_error;
@@ -660,8 +693,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
           attempt_paths.push_back(path);
         }
       }
-      allowances = fold_pool_allowances(spec.pools, events,
-                                       campaign_start_hlc);
+      allowances = fold_pool_allowances(spec.pools, events);
     }
     return order_tickets(node_cache,
                          [&](std::string_view path) { return writer.settled(path); },
@@ -1125,7 +1157,9 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
         records.push_back(make_record(
             "ADD_NODE", {{"path", ticket.path + "-" + id},
                          {"layer", ticket.layer + 1},
-                         {"title", child.title}}));
+                         {"title", child.title},
+                         {"source", "engine"}}));
+        if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
       }
       records.push_back(make_record(
           "CRITIQUE", {{"path", ticket.path},
@@ -1171,10 +1205,16 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
       }
       case gate::Decision::Commit: {
         const auto& chosen = funnel_result.attempts[funnel_result.chosen];
-        // Structure (DESIGN › Campaigns › structure): L1..L3 expansion
-        // (layers 0..2) runs only when the campaign allows it; otherwise
-        // the result goes to review.
-        if (!spec.structure && ticket.layer < 3) {
+        // Structure (DESIGN › Campaigns › structure): expansion at the
+        // profile's structure_layers runs only when the campaign allows
+        // it; otherwise the result goes to review. The embedded planning
+        // profile lists layers 0..2 — the historical L1..L3 rule.
+        const bool needs_structure = [&] {
+          for (const int layer : profile.structure_layers)
+            if (layer == ticket.layer) return true;
+          return false;
+        }();
+        if (!spec.structure && needs_structure) {
           emit_needs_review(chosen, "structure disallowed");
           break;
         }
@@ -1190,6 +1230,7 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
               "ADD_NODE", {{"path", ticket.path + "-" + id},
                            {"layer", ticket.layer + 1},
                            {"title", child.title}}));
+          if (!spec.tree.empty()) records.back().payload["tree"] = spec.tree;
           if (child.atomic)
             records.push_back(make_record(
                 "ATOMIC", {{"path", ticket.path + "-" + id},
@@ -1211,17 +1252,6 @@ Engine::RunResult Engine::run(CampaignSpec& spec,
                             {"campaign", spec.id}};
         if (funnel_result.below_target) settle_payload["below_target"] = true;
         records.push_back(make_record("SETTLE", std::move(settle_payload)));
-        // B3 audit sampling (decision 0024): each committed node is
-        // sampled deterministically — BLAKE2b(campaign ‖ path) mod 10^6
-        // below audit_rate x 10^6 — so every replica samples the same
-        // nodes. A sampled node gets an AUDIT record: a NON-blocking
-        // review item (the subtree keeps expanding).
-        if (spec.audit_rate > 0.0 &&
-            audit_sampled(spec.id, ticket.path, spec.audit_rate))
-          records.push_back(make_record(
-              "AUDIT", {{"path", ticket.path},
-                        {"campaign", spec.id},
-                        {"reason", "audit"}}));
         writer.submit(state::CommitTerminal{std::move(records)});
         // Fold the settle before the next refresh: the pool ledger
         // (decision 0020) reads the attempts table, and the parent's
@@ -1326,20 +1356,6 @@ void Engine::review_accept(std::string_view path, const CampaignSpec& spec) {
       impl_->options.writer.sync();
       return;
     }
-  // B3 audit (decision 0024): the audited node is ALREADY committed and
-  // its subtree already expanded — accepting records the verdict only
-  // (the REVIEW decision closes the audit item; nothing settles twice).
-  for (const store::Review& review :
-       impl_->options.writer.db().open_reviews(&error))
-    if (review.path == path && review.reason == "audit") {
-      std::vector<log::Record> records;
-      records.push_back(make_record(
-          "REVIEW", {{"path", std::string(path)}, {"decision", "accept"},
-                     {"note", ""}}));
-      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
-      impl_->options.writer.sync();
-      return;
-    }
   std::vector<store::Node> children =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   int kept = 0;
@@ -1388,20 +1404,6 @@ void Engine::review_retry(std::string_view path, const CampaignSpec& spec,
 
 void Engine::review_reject(std::string_view path, const CampaignSpec& spec) {
   std::string error;
-  // B3 audit (decision 0024): rejecting an audit records the verdict
-  // only — the node stays (a follow-up is the operator's review retry);
-  // nothing is tombstoned.
-  for (const store::Review& review :
-       impl_->options.writer.db().open_reviews(&error))
-    if (review.path == path && review.reason == "audit") {
-      std::vector<log::Record> records;
-      records.push_back(make_record(
-          "REVIEW", {{"path", std::string(path)}, {"decision", "reject"},
-                     {"note", ""}}));
-      impl_->options.writer.submit(state::CommitTerminal{std::move(records)});
-      impl_->options.writer.sync();
-      return;
-    }
   std::vector<store::Node> subtree =
       impl_->options.writer.db().nodes_with_path_prefix(path, &error);
   std::vector<log::Record> records;
@@ -1742,18 +1744,6 @@ std::string plan_report(const CampaignPlan& plan, const PlanParams& params) {
   return out.str();
 }
 
-bool audit_sampled(std::string_view campaign, std::string_view path,
-                   double audit_rate) {
-  const std::string joined = std::string(campaign) + "\n" + std::string(path);
-  const std::string hash = onion::log::blake2b_hex(joined);
-  // The first 6 hex chars (24 bits) as the bucket index: mod 1e6.
-  const std::uint64_t bucket =
-      std::stoull(hash.substr(0, 6), nullptr, 16) % 1000000ULL;
-  const std::int64_t threshold =
-      static_cast<std::int64_t>(audit_rate * 1000000.0);
-  return static_cast<std::int64_t>(bucket) < threshold;
-}
-
 std::map<std::string, std::int64_t> compute_starting_pools(
     state::StateWriter& writer, const CampaignSpec& spec,
     std::string* error) {
@@ -1808,8 +1798,7 @@ std::map<std::string, std::int64_t> compute_starting_pools(
 
 std::map<std::string, std::int64_t> fold_pool_allowances(
     const std::map<std::string, std::int64_t>& root_pools,
-    const std::vector<PoolEvent>& events,
-    std::uint64_t imported_before_hlc) {
+    const std::vector<PoolEvent>& events) {
   // The fold is order-independent by construction: events sort by
   // (hlc, origin), and the allowance of a child is frozen at its
   // creation from the parent's remaining pool AT THAT POINT.
@@ -1850,9 +1839,9 @@ std::map<std::string, std::int64_t> fold_pool_allowances(
         ++spent[event->path];
         break;
       case PoolEvent::Kind::Create: {
-        // Imported (pre-campaign) node: a fresh chain, never halved.
-        if (imported_before_hlc > 0 &&
-            event->hlc < imported_before_hlc) {
+        // Imported node (decision 0025/0027): a fresh chain at the
+        // scope root's remaining pool, never halved.
+        if (event->source == "import") {
           const std::string root = root_of(event->path);
           const auto pool = root_pools.find(root);
           if (pool != root_pools.end())

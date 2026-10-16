@@ -34,6 +34,7 @@
 #include "profile/profile.hpp"
 #include "profile/service.hpp"
 #include "sync/sync.hpp"
+#include "tools/reactconv.hpp"
 #include "store/checkpoint.hpp"
 #include "gate/gate.hpp"
 #include "llm/llm.hpp"
@@ -125,6 +126,17 @@ class JumpClock final : public onion::swim::Clock {
 };
 }  // namespace
 #endif  // ONION_CHAOS_HOOKS
+// Decision 0027: every writer command takes the exclusive data-dir lock
+// first; node run holds it for its whole lifetime. Returns nullopt (with
+// the message printed) when the lock is held.
+std::optional<onion::platform::DataDirLock> lock_data_dir(
+    const std::filesystem::path& dir) {
+  std::string error;
+  auto lock = onion::platform::DataDirLock::acquire(dir, &error);
+  if (!lock) std::cerr << error << "\n";
+  return lock;
+}
+
 std::unique_ptr<onion::state::StateWriter> open_writer(
     const std::filesystem::path& dir, std::string* error,
     std::function<void(const onion::log::Record&)> on_folded_record = {}) {
@@ -223,7 +235,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string error;
   json result = json::object();
   auto children_stmt = read.prepare(
-      "SELECT id, code, path, layer, title, hlc FROM nodes "
+      "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
       "WHERE parent_id = ?1 AND tombstone = 0 ORDER BY layer, id "
       "LIMIT ?2 OFFSET ?3;",
       &error);
@@ -256,12 +268,14 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   };
   std::vector<Frame> frames;
   const auto make_node = [&](std::string_view code, std::string_view path,
-                             int layer, std::string_view title) {
+                             int layer, std::string_view title,
+                             std::string_view tree) {
     json node;
     node["code"] = code;
     node["path"] = path;
     node["layer"] = layer;
     node["title"] = title;
+    if (!tree.empty()) node["tree"] = tree;
     node["children"] = json::array();
     settle_for(path, node);
     return node;
@@ -269,7 +283,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
   std::string bind_error;
   if (root.empty()) {
     auto roots = read.prepare(
-        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
         "WHERE parent_id IS NULL AND tombstone = 0 ORDER BY layer, id "
         "LIMIT ?1;",
         &error);
@@ -285,7 +299,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       const std::int64_t id = roots->integer(0);
       root_ids.push_back(id);
       nodes.push_back(make_node(roots->text(1), roots->text(2),
-                                roots->integer_int(3), roots->text(4)));
+                                roots->integer_int(3), roots->text(4),
+                                roots->text(6)));
     }
     result["nodes"] = std::move(nodes);
     if (depth > 0)
@@ -293,7 +308,7 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
         frames.push_back(Frame{&result["nodes"][i], root_ids[i], depth});
   } else {
     auto node_stmt = read.prepare(
-        "SELECT id, code, path, layer, title, hlc FROM nodes "
+        "SELECT id, code, path, layer, title, hlc, tree FROM nodes "
         "WHERE path = ?1 AND tombstone = 0;",
         &error);
     if (!node_stmt) {
@@ -308,7 +323,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
     }
     const std::int64_t id = node_stmt->integer(0);
     result["node"] = make_node(node_stmt->text(1), node_stmt->text(2),
-                               node_stmt->integer_int(3), node_stmt->text(4));
+                               node_stmt->integer_int(3), node_stmt->text(4),
+                               node_stmt->text(6));
     if (depth > 0) frames.push_back(Frame{&result["node"], id, depth});
   }
   std::size_t cursor = 0;
@@ -331,7 +347,8 @@ json tree_json(const onion::store::Db& read, std::string root, int depth,
       const std::int64_t child_id = children_stmt->integer(0);
       batch.emplace_back(
           make_node(children_stmt->text(1), children_stmt->text(2),
-                    children_stmt->integer_int(3), children_stmt->text(4)),
+                    children_stmt->integer_int(3), children_stmt->text(4),
+                    children_stmt->text(6)),
           child_id);
     }
     // sqlite3_step AUTO-RESETS the statement when it returns DONE, so
@@ -404,9 +421,6 @@ json state_json(onion::state::StateWriter& writer, int api_port,
          writer.reserved_by_origin(campaign.id))
       reserved_by_origin[origin] = total;
     entry["reserved_by_origin"] = std::move(reserved_by_origin);
-    // B3 audit sampling (decision 0024): the per-campaign audit queue.
-    entry["audits"] = {{"open", writer.audits_open(campaign.id)},
-                       {"sampled", writer.audits_sampled(campaign.id)}};
     try {
       entry["spec"] = json::parse(campaign.spec);
     } catch (const std::exception&) {
@@ -648,6 +662,11 @@ int node_cmd(int argc, char** argv) {
     // joiner's members.json, then clone the seed's newest checkpoint
     // (manifest signature, snapshot hash and Merkle root all verified).
     const std::filesystem::path join_dir = data_dir_arg(argc, argv);
+    // Decision 0027: the join writes the data dir — the same exclusive
+    // lock as every writer command (a running node on this dir refuses
+    // the join; the lock dies with this process).
+    auto data_lock = lock_data_dir(join_dir);
+    if (!data_lock) return 1;
     const auto body = json::parse(response->body, nullptr, false);
     if (body.is_object() && body.contains("members")) {
       std::filesystem::create_directories(join_dir);
@@ -1012,6 +1031,11 @@ int node_cmd(int argc, char** argv) {
   const int api_port = std::atoi(flag(argc, argv, "--api-port", "8080").c_str());
 
   std::string error;
+  // The exclusive data-dir lock lives for the whole node run (decision
+  // 0027): writer commands refuse while this process holds it.
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
+
   // viewcache.db (plan §6.2): counts + FTS beside onion.db. The fold hook
   // queues cheap notes; a maintenance thread applies them incrementally and
   // rebuilds on a vector/version mismatch (throttled to 30 s).
@@ -1035,6 +1059,7 @@ int node_cmd(int argc, char** argv) {
             {record.type, record.payload.value("path", std::string{}),
              record.payload.value("title", std::string{})});
       });
+
   if (!writer) {
     std::cerr << "cannot open node state: " << error << "\n";
     return 1;
@@ -1538,7 +1563,7 @@ int node_cmd(int argc, char** argv) {
   // Operator-forced checkpoint (the fleet repair, WORKLOG 2026-10-15):
   // write it on the writer thread, then wait for the queue to drain so
   // the response is true only once durable.
-  api_options.force_checkpoint = [&](std::string, std::string) {
+  api_options.checkpoint = [&](std::string, std::string) {
     writer->submit(onion::state::WriteCheckpoint{});
     writer->sync();
     return true;
@@ -1637,8 +1662,15 @@ int node_cmd(int argc, char** argv) {
       std::lock_guard fleet_lock(fleet_mutex);
       lane_members = std::move(new_lanes);
       sync_members = std::move(new_members);
-      member_urls = std::move(new_urls);
-      member_swim_urls = std::move(new_swim_urls);
+      // Merge, don't replace: the members table (MEMBER_ADDR records)
+      // and swim gossip also feed these maps, and a members.json rewrite
+      // must not wipe a joined device's address that the file lacks
+      // (a real fleet failure: reload wiped urls every round, so the
+      // sync scheduler kept dialling the file's stale/empty addresses).
+      for (const auto& [member_id, url] : new_urls)
+        member_urls[member_id] = url;
+      for (const auto& [member_id, url] : new_swim_urls)
+        member_swim_urls[member_id] = url;
       // Read inside the lock: the scheduler thread may swap these maps
       // concurrently (fleet_mutex is the only gate on them).
       if (std::getenv("ONION_SYNC_DEBUG"))
@@ -2061,6 +2093,8 @@ int campaign_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {
@@ -2193,6 +2227,23 @@ int campaign_cmd(int argc, char** argv) {
       std::string pool_error;
       with_pools.pools = onion::sched::compute_starting_pools(
           *writer, *spec, &pool_error);
+      // Decision 0027: the campaign record carries its profile's hash.
+      // Empty = the embedded planning profile; a custom hash must be
+      // held by this device already (folded from a PROFILE record).
+      if (with_pools.profile_hash.empty()) {
+        with_pools.profile_hash =
+            onion::domain::profile_hash(onion::domain::planning_profile());
+      } else {
+        std::string profile_error;
+        const auto held =
+            writer->db().domain_profile(with_pools.profile_hash,
+                                        &profile_error);
+        if (!held) {
+          std::cerr << "this device does not hold profile "
+                    << with_pools.profile_hash << "\n";
+          return 1;
+        }
+      }
       writer->submit(onion::state::CommitTerminal{{make_record(
           "CAMPAIGN", {{"id", with_pools.id},
                        {"spec", onion::sched::campaign_spec_json(with_pools)},
@@ -2245,6 +2296,8 @@ int review_cmd(int argc, char** argv) {
   }
   const std::string action = argv[2];
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {
@@ -2314,18 +2367,23 @@ int review_cmd(int argc, char** argv) {
 int dev_import_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot dev-import --root <corpus-copy> "
-                 "[--data-dir <dir>]\n"
+                 "[--data-dir <dir>] [--tree <name>] [--allow-skip]\n"
               << "\nimport a development corpus (per-layer CSVs named "
-                 "\"Onion - level_NN.csv\") into the data dir.\n";
+                 "\"Onion - level_NN.csv\") into the data dir. --tree "
+                 "tags every imported node with a domain tree (empty = "
+                 "planning).\n";
     return 0;
   }
   const std::string root = flag(argc, argv, "--root", "");
   if (root.empty()) {
     std::cerr << "usage: data_depot dev-import --root <corpus-copy> "
-                 "[--data-dir <dir>]\n";
+                 "[--data-dir <dir>] [--tree <name>]\n";
     return 2;
   }
+  const std::string tree = flag(argc, argv, "--tree", "");
   const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
   std::string error;
   auto writer = open_writer(dir, &error);
   if (!writer) {
@@ -2356,31 +2414,211 @@ int dev_import_cmd(int argc, char** argv) {
       }
     }
   }
+  for (auto& node : import.nodes) node.tree = tree;
+  // Decision 0027: collisions are a hard stop unless --allow-skip is
+  // given. A collision is (a) a path that already exists with DIFFERENT
+  // content, or (b) a code already used by another path. Every collision
+  // is reported per row to a file.
+  const bool allow_skip = has_flag(argc, argv, "--allow-skip");
+  const std::string report_path = flag(
+      argc, argv, "--collisions", (dir / "import-collisions.tsv").string());
+  std::string collision_error;
+  const onion::state::ImportCollisionReport report =
+      onion::state::check_import_collisions(writer->db(), import.nodes,
+                                            allow_skip, &collision_error);
+  if (report.refused && !collision_error.empty()) {
+    std::cerr << collision_error << "\n";
+    return 1;
+  }
+  if (!report.rows.empty()) {
+    std::ofstream report_file(report_path);
+    if (!report_file) {
+      std::cerr << "cannot write the collision report to " << report_path
+                << "\n";
+      return 1;
+    }
+    report_file << "path\tcode\treason\n";
+    for (const auto& row : report.rows) report_file << row << "\n";
+    if (report.refused) {
+      std::cerr << "import refused: " << report.rows.size()
+                << " collision(s) reported to " << report_path
+                << " (re-run with --allow-skip to import the rest)\n";
+      return 1;
+    }
+    std::cerr << report.rows.size() << " collision(s) skipped and "
+                 "reported to "
+              << report_path << "\n";
+  }
   std::cout << "importing " << import.nodes.size() << " nodes (development, "
                "unsigned)\n";
   writer->submit(std::move(import));
   writer->sync();
-  const std::size_t skipped = writer->last_import_skipped();
   std::cout << "imported\n";
-  if (skipped > 0)
-    std::cout << "skipped " << skipped
+  if (report.duplicates > 0)
+    std::cout << "skipped " << report.duplicates
               << " duplicate-path rows (kept the first row)\n";
+  // The import snapshots its own result (decision 0027): a joiner's
+  // clone includes the new tree without waiting for the 6 h cadence.
+  writer->submit(onion::state::WriteCheckpoint{});
+  writer->sync();
+  return 0;
+}
+
+// Decision 0027: publish a domain profile. The record is signed like any
+// other (the batch signature) and distributed with the log; campaigns
+// carry its hash.
+// Decision 0027, PR3: convert RE&CT YAML action files to the dev-import
+// CSV shape (RA codes as node codes, tree react) plus the react domain
+// profile. Pure conversion lives in onion::reactconv.
+int react_convert_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot react-convert --yaml-dir <dir> "
+                 "--out <dir>\n"
+              << "\nconvert RE&CT response-action YAML files (RA codes as "
+                 "node codes, tree react) into dev-import CSVs plus "
+                 "react-profile.json.\n";
+    return 0;
+  }
+  const std::string yaml_dir = flag(argc, argv, "--yaml-dir", "");
+  const std::string out = flag(argc, argv, "--out", "");
+  if (yaml_dir.empty() || out.empty()) {
+    std::cerr << "usage: data_depot react-convert --yaml-dir <dir> "
+                 "--out <dir>\n";
+    return 2;
+  }
+  std::vector<onion::reactconv::Action> actions;
+  std::error_code ec;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(yaml_dir, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    if (name.size() < 4 || name.compare(name.size() - 4, 4, ".yml") != 0)
+      continue;
+    const auto parsed = onion::reactconv::parse_action_yaml(
+        load_file(entry.path()));
+    if (parsed) actions.push_back(*parsed);
+    else
+      std::cerr << "skipping (no id/title/stage): " << name << "\n";
+  }
+  if (actions.empty()) {
+    std::cerr << "no RE&CT actions found in " << yaml_dir << "\n";
+    return 1;
+  }
+  std::filesystem::create_directories(out, ec);
+  const onion::reactconv::Converted converted =
+      onion::reactconv::convert(actions);
+  const auto quote = [](std::string_view value) {
+    const bool needs_quoting =
+        value.find(',') != std::string_view::npos ||
+        value.find('"') != std::string_view::npos ||
+        value.find('\n') != std::string_view::npos ||
+        value.find('\r') != std::string_view::npos;
+    std::string result;
+    if (needs_quoting) {
+      result.push_back('"');
+      for (const char c : value) {
+        if (c == '"') result.push_back('"');
+        result.push_back(c);
+      }
+      result.push_back('"');
+      return result;
+    }
+    return std::string(value);
+  };
+  {
+    std::ofstream level0(std::filesystem::path(out) /
+                         "Onion - level_00.csv");
+    level0 << "code,title\n";
+    for (const auto& [code, title] : converted.stages)
+      level0 << code << "," << quote(title) << "\n";
+  }
+  {
+    std::ofstream level1(std::filesystem::path(out) /
+                         "Onion - level_01.csv");
+    level1 << "code,path,title\n";
+    for (const auto& [code, path, title] : converted.actions)
+      level1 << code << "," << quote(path) << "," << quote(title) << "\n";
+  }
+  // The react domain profile: no structure permission anywhere (every
+  // campaign result goes to review) and no deterministic style checks.
+  onion::domain::Profile react;
+  react.name = "react";
+  react.tree = "react";
+  {
+    std::ofstream profile(std::filesystem::path(out) /
+                          "react-profile.json");
+    profile << onion::domain::profile_json(react).dump(2) << "\n";
+  }
+  std::cout << "converted " << actions.size() << " actions in "
+            << converted.stages.size() << " stages to " << out << "\n";
+  return 0;
+}
+
+int profile_cmd(int argc, char** argv) {
+  if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+    std::cout << "usage: data_depot profile add --file <profile.json> "
+                 "[--data-dir <dir>]\n"
+              << "\npublish a domain profile as a signed PROFILE record. "
+                 "The printed hash is what a campaign file references as "
+                 "profile_hash.\n";
+    return 0;
+  }
+  const std::string action = argc >= 3 ? argv[2] : "";
+  if (action != "add") {
+    std::cerr << "usage: data_depot profile add --file <profile.json>\n";
+    return 2;
+  }
+  const std::string file = flag(argc, argv, "--file", "");
+  if (file.empty()) {
+    std::cerr << "profile add needs --file <profile.json>\n";
+    return 2;
+  }
+  const nlohmann::json value =
+      nlohmann::json::parse(load_file(file), nullptr, false);
+  if (value.is_discarded()) {
+    std::cerr << "profile file is not valid JSON\n";
+    return 2;
+  }
+  std::string parse_error;
+  const auto profile = onion::domain::parse_profile(value, &parse_error);
+  if (!profile) {
+    std::cerr << parse_error << "\n";
+    return 2;
+  }
+  const std::string hash = onion::domain::profile_hash(*profile);
+  const std::filesystem::path dir = data_dir_arg(argc, argv);
+  auto data_lock = lock_data_dir(dir);
+  if (!data_lock) return 1;
+  std::string error;
+  auto writer = open_writer(dir, &error);
+  if (!writer) {
+    std::cerr << error << "\n";
+    return 1;
+  }
+  writer->submit(onion::state::CommitTerminal{
+      {make_record("PROFILE", onion::domain::profile_json(*profile))}});
+  writer->sync();
+  std::cout << "profile " << profile->name << " tree \"" << profile->tree
+            << "\" hash " << hash << "\n";
   return 0;
 }
 
 int export_csv_cmd(int argc, char** argv) {
   if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
     std::cout << "usage: data_depot export-csv --out <dir> [--data-dir "
-                 "<dir>] [--max-layer 9]\n"
-              << "\nexport the knowledge tree to per-layer CSVs.\n";
+                 "<dir>] [--max-layer 9] [--tree <name>]\n"
+              << "\nexport the knowledge tree to per-layer CSVs. --tree "
+                 "exports only one domain tree.\n";
     return 0;
   }
   const std::string out = flag(argc, argv, "--out", "");
   if (out.empty()) {
     std::cerr << "usage: data_depot export-csv --out <dir> [--data-dir <dir>] "
-                 "[--max-layer 9]\n";
+                 "[--max-layer 9] [--tree <name>]\n";
     return 2;
   }
+  const std::string tree = flag(argc, argv, "--tree", "");
   const std::filesystem::path dir = data_dir_arg(argc, argv);
   const int max_layer =
       std::atoi(flag(argc, argv, "--max-layer", "9").c_str());
@@ -2390,7 +2628,7 @@ int export_csv_cmd(int argc, char** argv) {
     std::cerr << error << "\n";
     return 1;
   }
-  if (!db.export_csv(out, max_layer, &error)) {
+  if (!db.export_csv(out, max_layer, &error, tree)) {
     std::cerr << error << "\n";
     return 1;
   }

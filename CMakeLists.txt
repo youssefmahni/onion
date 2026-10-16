@@ -58,6 +58,7 @@ endfunction()
 
 # Base layer
 onion_add_compiled_module(core src/core/depot_core.cpp)
+target_link_libraries(core PUBLIC onion::domain)
 
 if(ONION_ENABLE_OPENCL)
   find_path(ONION_OPENCL_INCLUDE_DIR CL/cl.h
@@ -139,6 +140,15 @@ target_link_libraries(log PUBLIC onion_monocypher nlohmann_json::nlohmann_json
   libzstd_static)
 target_link_libraries(log PUBLIC onion::core onion::platform)
 onion_add_compiled_module(store src/store/store.cpp src/store/checkpoint.cpp)
+# Decision 0027 PR3: RE&CT YAML -> dev-import CSV converter (pure core).
+onion_add_compiled_module(reactconv src/tools/reactconv.cpp)
+# Decision 0027: domain profiles (header-only). The planning profile is
+# embedded; style checks and structure layers live in the profile. Kept
+# interface-only so the base core layer can use it without pulling log
+# into core (profile_hash/JSON callers must link log themselves).
+onion_add_module(domain)
+target_link_libraries(domain INTERFACE nlohmann_json::nlohmann_json
+  onion::log)
 target_link_libraries(store PUBLIC onion_sqlite onion::log)
 target_link_libraries(store PUBLIC onion::core onion::platform)
 onion_add_compiled_module(viewcache src/viewcache/viewcache.cpp)
@@ -198,13 +208,13 @@ target_link_libraries(profile PUBLIC onion::core onion::gpu onion::platform onio
 # Engine layer
 onion_add_compiled_module(gate src/gate/gate.cpp)
 target_link_libraries(gate PUBLIC nlohmann_json::nlohmann_json)
-target_link_libraries(gate PUBLIC onion::core onion::llm)
+target_link_libraries(gate PUBLIC onion::core onion::llm onion::domain)
 onion_add_compiled_module(sched src/sched/sched.cpp)
 target_link_libraries(sched PUBLIC nlohmann_json::nlohmann_json)
 target_link_libraries(sched PUBLIC onion::core onion::gate onion::state)
 onion_add_compiled_module(state src/state/state.cpp)
 target_include_directories(state PUBLIC "${zstd_SOURCE_DIR}/lib")
-target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static)
+target_link_libraries(state PUBLIC onion::core onion::log onion::store libzstd_static onion::domain)
 
 # Interface layer
 onion_add_compiled_module(api src/api/api.cpp src/api/tree_json.cpp)
@@ -220,7 +230,7 @@ endif()
 target_link_libraries(api PUBLIC onion::state)
 target_link_libraries(api PUBLIC onion::viewcache)
 onion_add_module(cli)
-target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state)
+target_link_libraries(cli INTERFACE onion::api onion::gate onion::sched onion::state onion::reactconv onion::domain)
 
 add_executable(onion_smoke tests/unit/smoke_test.cpp)
 target_link_libraries(onion_smoke PRIVATE onion::cli)
@@ -242,6 +252,11 @@ if(BUILD_TESTING)
   target_link_libraries(onion_core_test PRIVATE onion::core GTest::gtest_main)
   include(GoogleTest)
   gtest_discover_tests(onion_core_test)
+
+  add_executable(onion_reactconv_test tests/unit/reactconv_test.cpp)
+  target_link_libraries(onion_reactconv_test PRIVATE onion::reactconv
+    GTest::gtest_main)
+  gtest_discover_tests(onion_reactconv_test)
 
   add_executable(onion_platform_test tests/unit/platform_test.cpp)
   target_link_libraries(onion_platform_test PRIVATE onion::platform GTest::gtest_main)
@@ -390,7 +405,7 @@ endif()
 
 add_executable(data_depot src/cli/main.cpp src/cli/commands.cpp
   src/cli/genesis_import.cpp)
-target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::viewcache onion::profile onion::sync onion::swim)
+target_link_libraries(data_depot PRIVATE onion::llm onion::api onion::sched onion::state onion::gate onion::store onion::viewcache onion::profile onion::sync onion::swim onion::reactconv)
 target_compile_definitions(data_depot PRIVATE
   ONION_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 if(ONION_CHAOS_HOOKS)

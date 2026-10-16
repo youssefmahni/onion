@@ -14,6 +14,7 @@
 
 #include "log/log.hpp"
 #include "store/checkpoint.hpp"
+#include "domain/domain.hpp"
 
 namespace onion::state {
 namespace {
@@ -27,6 +28,7 @@ std::int64_t wall_ms() {
 
 // The deterministic fold: one record type, one store mutation. Upserts use
 // the highest (hlc, origin) so a replay after a crash is idempotent.
+
 // §6.1 dashboard counters: folded-state deltas. Both statements are
 // idempotent across replay (the callers only invoke them when their own
 // fold's sqlite3_changes proved the row actually changed).
@@ -62,6 +64,29 @@ void bump_status(store::Db& db, std::string_view status, std::int64_t delta,
   statement->step(&bind_error);
 }
 
+// Decision 0027: a PROFILE record folds into the content-addressed
+// domain_profiles table. The payload IS the profile JSON; the hash is
+// recomputed over its canonical form so a tampered record can never
+// impersonate a profile (the chain signature already covers it, but the
+// hash is what campaigns match against).
+void upsert_domain_profile(store::Db& db, const log::Record& record,
+                           std::string_view, std::string* error) {
+
+  const auto& payload = record.payload;
+  std::string parse_error;
+  const auto profile = onion::domain::parse_profile(payload, &parse_error);
+  if (!profile) {
+    if (error) *error = "PROFILE fold: " + parse_error;
+    return;
+  }
+  const std::string hash = onion::domain::profile_hash(*profile);
+  const std::string json = onion::log::canonical_json(payload);
+  if (!db.store_domain_profile(hash, profile->name, profile->tree, json,
+                               error)) {
+    if (error && error->empty()) *error = "PROFILE fold failed";
+  }
+}
+
 void upsert_node(store::Db& db, const log::Record& record,
                  std::string_view writer_origin, std::string* error) {
   const auto& payload = record.payload;
@@ -73,6 +98,7 @@ void upsert_node(store::Db& db, const log::Record& record,
   const std::string parent =
       dash == std::string::npos ? std::string{} : path.substr(0, dash);
   const std::string origin = payload.value("origin", std::string(writer_origin));
+
 
   // §6.1 counters: the delta is decided by the fold's own hlc-wins upsert
   // (sqlite3_changes), so replay and shuffles stay idempotent.
@@ -90,11 +116,19 @@ void upsert_node(store::Db& db, const log::Record& record,
       }
     }
   }
+// Decision 0027: the record carries the node's source; legacy
+  // records (no field) default to "engine".
+  const std::string source = payload.value("source", std::string{"engine"});
+  // Decision 0027: the record carries the node's domain tree; legacy
+  // records (no field) default to the planning tree (empty).
+  const std::string tree = payload.value("tree", std::string{});
 
   auto statement = db.prepare(
       "INSERT INTO nodes(id, code, path, parent_id, layer, title, origin, "
-      "hlc) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) + 1, ?1, ?2, "
-      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7) "
+      "hlc, source, tree) VALUES (COALESCE((SELECT MAX(id) FROM nodes), 0) "
+      "+ 1, ?1, ?2, "
+      "(SELECT n2.id FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, ?6, ?7, ?8, "
+      "?9) "
       "ON CONFLICT(path) DO UPDATE SET title=excluded.title, "
       "layer=excluded.layer WHERE excluded.hlc > nodes.hlc OR "
       "(excluded.hlc = nodes.hlc AND excluded.origin > nodes.origin);",
@@ -107,7 +141,9 @@ void upsert_node(store::Db& db, const log::Record& record,
       !statement->bind(4, layer, &bind_error) ||
       !statement->bind(5, title, &bind_error) ||
       !statement->bind(6, origin, &bind_error) ||
-      !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error)) {
+      !statement->bind(7, static_cast<std::int64_t>(record.hlc), &bind_error) ||
+      !statement->bind(8, source, &bind_error) ||
+      !statement->bind(9, tree, &bind_error)) {
     if (error) *error = "fold node bind failed: " + bind_error;
     return;
   }
@@ -682,6 +718,7 @@ void StateWriter::fold(const log::Record& record, std::string_view batch_origin,
   const std::string& type = record.type;
   const std::string origin(batch_origin);
   if (type == "ADD_NODE") upsert_node(db_, record, origin, error);
+  else if (type == "PROFILE") upsert_domain_profile(db_, record, origin, error);
   else if (type == "SETTLE") {
     upsert_settle(db_, record, origin, error);
     // A settle ends any CLAIM and REEXPAND lock on the path.
@@ -1417,8 +1454,9 @@ void StateWriter::run() {
         // an existence check per row.
         auto statement = db_.prepare(
             "INSERT OR IGNORE INTO nodes(code, path, parent_id, layer, "
-            "title, origin, hlc) VALUES (?1, ?2, (SELECT n2.id FROM nodes n2 "
-            "WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6);",
+            "title, origin, hlc, source, tree) VALUES (?1, ?2, (SELECT n2.id "
+            "FROM nodes n2 WHERE n2.path = ?3), ?4, ?5, 'dev-import', ?6, "
+            "'import', ?7);",
             &error);
         auto exists = db_.prepare(
             "SELECT 1 FROM nodes WHERE path = ?1;", &error);
@@ -1449,7 +1487,8 @@ void StateWriter::run() {
               !statement->bind(3, parent, &bind_error) ||
               !statement->bind(4, static_cast<std::int64_t>(node.layer), &bind_error) ||
               !statement->bind(5, node.title, &bind_error) ||
-              !statement->bind(6, static_cast<std::int64_t>(hlc_.now()), &bind_error)) {
+              !statement->bind(6, static_cast<std::int64_t>(hlc_.now()), &bind_error) ||
+              !statement->bind(7, node.tree, &bind_error)) {
             error = "import bind failed: " + bind_error;
             break;
           }
@@ -1501,6 +1540,56 @@ void StateWriter::submit(CommitTerminal command) {
   queued.records = std::move(command.records);
   queue_.push_back(std::move(queued));
   queue_cv_.notify_one();
+}
+
+ImportCollisionReport check_import_collisions(
+    const store::Db& db, std::vector<DevImportedNode>& nodes,
+    bool allow_skip, std::string* error) {
+  ImportCollisionReport report;
+  auto existing_path =
+      db.prepare("SELECT code, title FROM nodes WHERE path = ?1;", error);
+  // Decision 0027: codes may repeat across different trees, so the code
+  // collision check is scoped to the imported node's tree.
+  auto existing_code = db.prepare(
+      "SELECT path FROM nodes WHERE code = ?1 AND tree = ?2 LIMIT 1;",
+      error);
+  if (!existing_path || !existing_code) {
+    if (error && error->empty()) *error = "cannot prepare collision checks";
+    report.refused = true;
+    return report;
+  }
+  std::vector<DevImportedNode> kept;
+  kept.reserve(nodes.size());
+  for (const auto& node : nodes) {
+    std::string step_error;
+    existing_path->reset(&step_error);
+    existing_path->bind(1, node.path, &step_error);
+    bool collides = false;
+    if (existing_path->step_row(&step_error)) {
+      if (existing_path->text(0) == node.code &&
+          existing_path->text(1) == node.title) {
+        ++report.duplicates;
+        continue;  // identical row: skip silently, like the fold would
+      }
+      collides = true;
+      report.rows.push_back(node.path + "\t" + node.code +
+                            "\tpath exists with different content");
+    }
+    existing_code->reset(&step_error);
+    existing_code->bind(1, node.code, &step_error);
+    existing_code->bind(2, node.tree, &step_error);
+    if (!collides && existing_code->step_row(&step_error)) {
+      collides = true;
+      report.rows.push_back(node.path + "\t" + node.code +
+                            "\tcode already used by " +
+                            existing_code->text(0));
+    }
+    if (collides && allow_skip) continue;  // dropped from the import
+    kept.push_back(node);
+  }
+  nodes = std::move(kept);
+  report.refused = !report.rows.empty() && !allow_skip;
+  return report;
 }
 
 void StateWriter::submit(DevImport command) {
